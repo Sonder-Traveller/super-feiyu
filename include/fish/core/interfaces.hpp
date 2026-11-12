@@ -69,8 +69,22 @@ class ISpeechToText {
 class ITextToSpeech {
  public:
   virtual ~ITextToSpeech() = default;
-  // 返回可下载/可直接发送的音频地址
+  // 返回本地文件路径或可直接发送的地址
   virtual Result<std::string> synthesize(const std::string& text) = 0;
+};
+
+// 网页搜索。被动场景用得少，默认 provider = none 时不构造。
+class IWebSearch {
+ public:
+  struct Hit {
+    std::string title;
+    std::string url;
+    std::string snippet;
+    double score{0.0};
+  };
+
+  virtual ~IWebSearch() = default;
+  virtual Result<std::vector<Hit>> search(const std::string& query, int max_results) = 0;
 };
 
 // ── 职责 3：存储（只落盘，不推理） ───────────────────────

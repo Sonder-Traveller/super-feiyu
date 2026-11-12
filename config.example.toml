@@ -1,0 +1,76 @@
+# super-feiyu 配置示例
+# 复制为 config.toml 后填写。密钥请用 ${ENV_VAR} 引用，不要写明文。
+
+[log]
+level = "info"          # debug | info | warn | error
+
+# ── 通道 ────────────────────────────────────────────────
+[channel.qq_official]
+enabled = false
+app_id = ""
+app_secret = "${QQ_APP_SECRET}"
+
+# QQ 小号：通过 OneBot v11（NapCat / Lagrange / LLOneBot）接入
+# 能用真实 QQ 号收发，不受官方被动回复配额限制
+[channel.qq_onebot]
+enabled = false
+ws_url = "ws://127.0.0.1:3001"
+self_id = ""            # 机器人 QQ 号，用于判定是否被 @
+access_token = "${ONEBOT_TOKEN}"
+
+[channel.wechat]
+enabled = false
+bot_token = "${WECHAT_BOT_TOKEN}"
+
+# ── 能力（换厂商只改 provider/base_url/model）───────────
+[capability.chat]
+provider = "deepseek"                   # deepseek | openai | anthropic | siliconflow | ollama
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+model = "deepseek-flash"
+max_tokens = 512
+temperature = 1.0
+timeout_ms = 30000
+
+[capability.embedding]
+provider = "siliconflow"                # siliconflow | openai | ollama
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "${SILICONFLOW_API_KEY}"
+model = "BAAI/bge-m3"
+dimension = 1024
+
+[capability.stt]
+provider = "siliconflow"                # siliconflow | groq | openai | local
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "${SILICONFLOW_API_KEY}"
+model = "FunAudioLLM/SenseVoiceSmall"
+language = "auto"
+
+[capability.tts]
+provider = "edge"                       # edge | openai | siliconflow
+voice = "zh-CN-XiaoyiNeural"
+format = "mp3"
+group_voice = false                     # 群里不发语音（避免刷屏与占配额）
+
+[capability.search]
+provider = "none"                       # none | deepseek | tavily | bocha
+api_key = "${TAVILY_API_KEY}"
+max_results = 5
+
+# ── 记忆（三层）─────────────────────────────────────────
+[memory]
+working_rounds = 20        # L2 短时记忆保留轮数
+consolidate_every = 20     # 每多少轮触发一次巩固
+recall_top_k = 5           # L3 事实召回条数
+episode_top_k = 3          # L3 情景召回条数
+notes_dir = "data/memory/notes"    # 旁路文件（权威源，人可读）
+db_path = "data/memory/index.db"   # SQLite 索引（可重建）
+
+# ── 编排 ────────────────────────────────────────────────
+[orchestrator]
+max_replies = 4                # 单条入站最多回几条（QQ 官方：单聊 4 / 群 5）
+passive_window_ms = 300000     # 被动回复窗口，超过 80% 放弃
+
+[persona]
+persona_file = "persona/persona.md"
+rules_file = "persona/rules.md"
