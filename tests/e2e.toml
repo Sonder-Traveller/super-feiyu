@@ -1,0 +1,23 @@
+# 端到端测试配置：指向本地 mock API（tests/mock_server.py）
+# 用法：python3 tests/mock_server.py 18080 & 然后 ./build/test_e2e
+
+[capability.chat]
+provider = "openai"
+base_url = "http://127.0.0.1:18080"
+api_key = "test-key"
+model = "deepseek-flash"
+
+[capability.embedding]
+provider = "siliconflow"
+base_url = "http://127.0.0.1:18080/v1"
+api_key = "test-key"
+model = "BAAI/bge-m3"
+dimension = 1024
+
+[memory]
+working_rounds = 20
+consolidate_every = 2
+recall_top_k = 5
+episode_top_k = 3
+notes_dir = "/tmp/fish_e2e/notes"
+db_path = "/tmp/fish_e2e/i.db"

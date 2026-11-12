@@ -34,7 +34,7 @@ int g_fail = 0;
 int main(int argc, char** argv) {
   fish::log::Logger::instance().set_level(fish::log::LogLevel::kWarn);
 
-  const std::string cfg_path = argc > 1 ? argv[1] : "/tmp/mock_e2e.toml";
+  const std::string cfg_path = argc > 1 ? argv[1] : "tests/e2e.toml";
   auto loaded = fish::config::Config::load(cfg_path);
   if (!loaded.ok()) {
     std::printf("cannot load config %s: %s\n", cfg_path.c_str(), loaded.error.detail.c_str());
@@ -129,3 +129,4 @@ int main(int argc, char** argv) {
   std::printf("E2E PASSED\n");
   return 0;
 }
+
