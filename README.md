@@ -132,6 +132,9 @@ base_url = "https://api.groq.com/openai/v1"
 | 向量 | `siliconflow/BAAI/bge-m3`（免费） | openai / ollama |
 | 语音识别 | `siliconflow/SenseVoiceSmall`（免费） | groq / openai / local |
 | 语音合成 | `edge`（**无需 key**） | openai / siliconflow |
+
+**也可以通过桥接层用 WorkBuddy**：见 [bridge/README.md](bridge/README.md)。
+桥接是独立进程，本体零改动，只需把 provider 改成 `openai` 指向它。
 | 搜索 | `none` | deepseek / tavily / bocha |
 
 **注意：DeepSeek 没有 embeddings 接口**，向量必须用别家。
@@ -263,6 +266,9 @@ tests/
   test_all.cpp            单元测试
   test_e2e.cpp            端到端
   mock_server.py          本地模拟 API
+bridge/
+  workbuddy_bridge.py    WorkBuddy 桥接层（独立进程）
+  README.md              桥接层说明
 persona/
   persona.md              人格正文
   rules.md                行为红线
@@ -273,3 +279,4 @@ build.sh verify.sh deploy.sh
 ## 许可
 
 MIT
+

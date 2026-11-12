@@ -1,0 +1,43 @@
+# 通过 WorkBuddy 桥接层（provider = openai 兼容）
+# 桥接层是独立进程：python3 bridge/workbuddy_bridge.py --port 18081
+
+[log]
+level = "info"
+
+[capability.chat]
+provider = "openai"
+base_url = "http://127.0.0.1:18081/v1"
+api_key = "bridge-local"          # 桥接层不校验，非空即可
+model = "fast-model"
+max_tokens = 256
+temperature = 1.0
+timeout_ms = 90000                # 上游流式聚合，给足时间
+
+# 向量仍走硅基流动（DeepSeek/WorkBuddy 都没有 embeddings 接口）
+[capability.embedding]
+provider = "siliconflow"
+base_url = "https://api.siliconflow.cn/v1"
+api_key = "${SILICONFLOW_API_KEY}"
+model = "BAAI/bge-m3"
+dimension = 1024
+
+[capability.tts]
+provider = "edge"
+voice = "zh-CN-XiaoyiNeural"
+group_voice = false
+
+[memory]
+working_rounds = 20
+consolidate_every = 20
+recall_top_k = 5
+episode_top_k = 3
+notes_dir = "data/memory/notes"
+db_path = "data/memory/index.db"
+
+[orchestrator]
+max_replies = 4
+passive_window_ms = 300000
+
+[persona]
+persona_file = "persona/persona.md"
+rules_file = "persona/rules.md"

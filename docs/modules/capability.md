@@ -428,3 +428,29 @@ embedding 挂了 → 无法召回 L3 → **但仍可用 L2 短时记忆**。
 | 429 退避序列 | Mock 连续 429，验证退避 |
 
 **均 Mock HTTP，不打真实 API。**
+
+---
+
+## 12. WorkBuddy 接入（桥接层模式）
+
+WorkBuddy 桌面端的模型通过**独立桥接进程**接入，不在本模块内实现。
+详见 [bridge/README.md](../bridge/README.md)。
+
+配置：
+
+``toml
+[capability.chat]
+provider = "openai"                      # 走 OpenAI 兼容
+base_url = "http://127.0.0.1:18081/v1"   # 桥接层地址
+api_key  = "bridge-local"
+model    = "fast-model"
+timeout_ms = 90000
+``
+
+**为什么不在 capability 里直接实现**：
+
+1. 凭据管理与刷新是独立关注点，本体不应持有第三方凭据
+2. 上游强制流式（SSE），与"一次请求一次响应"的接口不匹配，转换属于桥接职责
+3. 可替换性：停掉桥接、provider 改回 deepseek，本体零改动
+
+这是「职责分离」在**进程边界**上的体现。
