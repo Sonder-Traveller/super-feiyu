@@ -12,7 +12,8 @@
 import fish.core;
 import fish.log;
 import fish.memory;
-import fish.transport;
+import fish.onebot_ws;
+import fish.channels;
 import fish.orchestrator;
 
 namespace fs = std::filesystem;
@@ -304,60 +305,71 @@ void test_gather() {
 // ── 传输层 ──────────────────────────────────────────────
 void test_onebot_parsing() {
   std::printf("\n=== onebot parsing ===\n");
-  fish::transport::OneBotConfig cfg;
+  fish::onebot_ws::Config cfg;
   cfg.self_id = "10086";
-  fish::transport::QQOneBotChannel ch(cfg);
+  fish::onebot_ws::Client client(cfg);
 
   const std::string raw = R"({
     "post_type":"message","message_type":"group","group_id":123456,
     "user_id":999,"message_id":555,"sender":{"nickname":"张三"},
     "message":[{"type":"at","data":{"qq":"10086"}},{"type":"text","data":{"text":" 在吗"}}]
   })";
-  auto r = ch.parse_event(raw);
+  auto r = client.parse_event(raw);
   CHECK(r.ok(), "group message parsed");
-  CHECK(r.ok() && r.value->kind == fish::core::ChatKind::kGroup, "kind group");
-  CHECK(r.ok() && r.value->mentioned_me, "@ self detected");
-  CHECK(r.ok() && r.value->conversation_id == "g:123456", "conv id prefixed");
-  CHECK(r.ok() && r.value->sender_name == "张三", "sender name");
+  CHECK(r.ok() && r.value->is_group, "is group");
+  CHECK(r.ok() && r.value->mentioned, "@ self detected");
+  CHECK(r.ok() && r.value->group_id == "123456", "group id");
+  CHECK(r.ok() && r.value->nickname == "张三", "sender name");
 
   const std::string no_at = R"({
     "post_type":"message","message_type":"group","group_id":1,
     "user_id":2,"message_id":3,"sender":{"nickname":"A"},
     "message":[{"type":"text","data":{"text":"随便聊聊"}}]
   })";
-  auto r2 = ch.parse_event(no_at);
-  CHECK(r2.ok() && !r2.value->mentioned_me, "no @ not mentioned");
+  auto r2 = client.parse_event(no_at);
+  CHECK(r2.ok() && !r2.value->mentioned, "no @ not mentioned");
 
   const std::string at_other = R"({
     "post_type":"message","message_type":"group","group_id":1,
     "user_id":2,"message_id":3,"sender":{"nickname":"A"},
     "message":[{"type":"at","data":{"qq":"99999"}},{"type":"text","data":{"text":" hi"}}]
   })";
-  auto r3 = ch.parse_event(at_other);
-  CHECK(r3.ok() && !r3.value->mentioned_me, "@ others is not mention");
+  auto r3 = client.parse_event(at_other);
+  CHECK(r3.ok() && !r3.value->mentioned, "@ others is not mention");
 
   const std::string priv = R"({
     "post_type":"message","message_type":"private","user_id":777,
     "message_id":888,"sender":{"nickname":"B"},
     "message":[{"type":"text","data":{"text":"你好"}}]
   })";
-  auto r4 = ch.parse_event(priv);
-  CHECK(r4.ok() && r4.value->kind == fish::core::ChatKind::kPrivate, "private parsed");
+  auto r4 = client.parse_event(priv);
+  CHECK(r4.ok() && !r4.value->is_group, "private parsed");
 
-  CHECK(!ch.parse_event(R"({"post_type":"notice"})").ok(), "non-message rejected");
-  CHECK(!ch.parse_event("{bad").ok(), "bad json rejected");
+  const std::string img = R"({
+    "post_type":"message","message_type":"group","group_id":1,
+    "user_id":2,"message_id":3,"sender":{"nickname":"A"},
+    "message":[{"type":"image","data":{"url":"https://x/y.jpg"}}]
+  })";
+  auto r5 = client.parse_event(img);
+  bool has_image = false;
+  if (r5.ok()) {
+    for (const auto& s : r5.value->segments) if (s.type == "image") has_image = true;
+  }
+  CHECK(has_image, "image segment parsed");
+
+  CHECK(!client.parse_event(R"({"post_type":"notice"})").ok(), "non-message rejected");
+  CHECK(!client.parse_event("{bad").ok(), "bad json rejected");
 }
-
 void test_capability_decl() {
   std::printf("\n=== capability declarations ===\n");
-  fish::transport::OneBotConfig oc;
-  fish::transport::QQOneBotChannel onebot(oc);
+  fish::channels::OneBotConfig oc;
+  fish::channels::QQOneBotChannel onebot(oc);
   const auto cap = onebot.capability();
   CHECK(cap.supports_group, "onebot supports group");
   CHECK(cap.supports_voice_out, "onebot supports voice");
   CHECK(cap.max_replies_per_message > 5, "onebot loose budget");
 
-  fish::transport::LocalChannel local;
+  fish::channels::LocalChannel local;
   CHECK(local.capability().supports_private, "local supports private");
 }
 
@@ -387,4 +399,7 @@ int main() {
   std::printf("All %s tests passed.\n", "suites");
   return 0;
 }
+
+
+
 

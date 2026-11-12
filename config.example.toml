@@ -1,30 +1,37 @@
 # super-feiyu 配置示例
-# 复制为 config.toml 后填写。密钥请用 ${ENV_VAR} 引用，不要写明文。
+# 复制为 config.toml 后填写。密钥用 ${ENV_VAR} 引用，不要写明文。
 
 [log]
 level = "info"          # debug | info | warn | error
 
-# ── 通道 ────────────────────────────────────────────────
+# ══════════ 通道（至少启用一个）══════════
+
+# QQ 官方机器人：零封号风险，但受被动回复配额限制
 [channel.qq_official]
 enabled = false
-app_id = ""
+app_id = "${QQ_APP_ID}"
 app_secret = "${QQ_APP_SECRET}"
 
-# QQ 小号：通过 OneBot v11（NapCat / Lagrange / LLOneBot）接入
-# 能用真实 QQ 号收发，不受官方被动回复配额限制
+# QQ 小号：走 OneBot v11（NapCat / Lagrange / LLOneBot）
+# 能用真实 QQ 号收发，无官方配额，但有封号风险，务必用小号
 [channel.qq_onebot]
 enabled = false
-ws_url = "ws://127.0.0.1:3001"
-self_id = ""            # 机器人 QQ 号，用于判定是否被 @
-access_token = "${ONEBOT_TOKEN}"
+ws_url = "ws://127.0.0.1:3001"          # OneBot 的 WS 地址
+http_url = "http://127.0.0.1:3000"      # OneBot 的 HTTP API 地址（与 WS 端口通常不同）
+self_id = "${BOT_QQ}"                   # 机器人 QQ 号，用于判定是否被 @
+access_token = "${ONEBOT_TOKEN}"        # 可选
 
+# 微信 iLink：仅单聊、仅文本
 [channel.wechat]
 enabled = false
 bot_token = "${WECHAT_BOT_TOKEN}"
 
-# ── 能力（换厂商只改 provider/base_url/model）───────────
+# ══════════ 能力（换厂商只改 provider/base_url/model）══════════
+
+# 对话。可选 provider: deepseek | openai | anthropic | siliconflow | ollama
+# 想把 WorkBuddy 桥接层接进来：provider="openai", base_url="http://127.0.0.1:18081/v1"
 [capability.chat]
-provider = "deepseek"                   # deepseek | openai | anthropic | siliconflow | ollama
+provider = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-flash"
@@ -32,44 +39,51 @@ max_tokens = 512
 temperature = 1.0
 timeout_ms = 30000
 
+# 向量。DeepSeek 没有 embeddings 接口，必须另配。
+# 免费选项：siliconflow 的 BAAI/bge-m3（需实名）
 [capability.embedding]
-provider = "siliconflow"                # siliconflow | openai | ollama
+provider = "siliconflow"
 base_url = "https://api.siliconflow.cn/v1"
 api_key = "${SILICONFLOW_API_KEY}"
 model = "BAAI/bge-m3"
 dimension = 1024
 
+# 语音识别。免费：siliconflow 的 FunAudioLLM/SenseVoiceSmall（需实名）
 [capability.stt]
-provider = "siliconflow"                # siliconflow | groq | openai | local
+provider = "siliconflow"
 base_url = "https://api.siliconflow.cn/v1"
 api_key = "${SILICONFLOW_API_KEY}"
 model = "FunAudioLLM/SenseVoiceSmall"
 language = "auto"
 
+# 语音合成。edge 无需 key，但依赖系统装有 edge-tts
 [capability.tts]
-provider = "edge"                       # edge | openai | siliconflow
+provider = "edge"
 voice = "zh-CN-XiaoyiNeural"
 format = "mp3"
-group_voice = false                     # 群里不发语音（避免刷屏与占配额）
+group_voice = false     # 群里不发语音（避免刷屏与占配额）
 
+# 网页搜索（被动对话场景用得少，默认关闭）
 [capability.search]
-provider = "none"                       # none | deepseek | tavily | bocha
+provider = "none"       # none | deepseek | tavily | bocha
 api_key = "${TAVILY_API_KEY}"
 max_results = 5
 
-# ── 记忆（三层）─────────────────────────────────────────
+# ══════════ 记忆（三层）══════════
+
 [memory]
 working_rounds = 20        # L2 短时记忆保留轮数
 consolidate_every = 20     # 每多少轮触发一次巩固
 recall_top_k = 5           # L3 事实召回条数
 episode_top_k = 3          # L3 情景召回条数
-notes_dir = "data/memory/notes"    # 旁路文件（权威源，人可读）
-db_path = "data/memory/index.db"   # SQLite 索引（可重建）
+notes_dir = "data/memory/notes"    # 旁路文件（权威源，人可读、可手改）
+db_path = "data/memory/index.db"   # SQLite 索引（可随时从文件重建）
 
-# ── 编排 ────────────────────────────────────────────────
+# ══════════ 编排 ══════════
+
 [orchestrator]
 max_replies = 4                # 单条入站最多回几条（QQ 官方：单聊 4 / 群 5）
-passive_window_ms = 300000     # 被动回复窗口，超过 80% 放弃
+passive_window_ms = 300000     # 被动回复窗口；超过 80% 放弃，避免白发
 
 [persona]
 persona_file = "persona/persona.md"

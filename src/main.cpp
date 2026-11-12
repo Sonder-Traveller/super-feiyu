@@ -1,9 +1,10 @@
 // src/main.cpp
-// runtime：装配所有模块，跑主循环。
+// runtime：装配所有模块，按配置启动通道线程，跑主循环。
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -14,7 +15,7 @@ import fish.log;
 import fish.config;
 import fish.capability;
 import fish.memory;
-import fish.transport;
+import fish.channels;
 import fish.orchestrator;
 
 namespace {
@@ -22,7 +23,7 @@ namespace {
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop = true; }
 
-// 确定性桩：无 API key 时用于验收，保证流程可跑通
+// ── 桩：无 key 时保证流程可跑通 ─────────────────────────
 class EchoChat final : public fish::core::IChatModel {
  public:
   fish::core::Result<Response> complete(const Request& req) override {
@@ -60,8 +61,8 @@ class ZeroEmbedding final : public fish::core::IEmbeddingModel {
 struct Options {
   std::string config_path{"config.toml"};
   bool self_test{false};
-  bool stub{false};
   bool live_test{false};
+  bool stub{false};
 };
 
 Options parse_args(int argc, char** argv) {
@@ -72,14 +73,21 @@ Options parse_args(int argc, char** argv) {
       opt.config_path = argv[++i];
     } else if (a == "--self-test") {
       opt.self_test = true;
-    } else if (a == "--stub") {
-      opt.stub = true;
     } else if (a == "--live-test") {
       opt.live_test = true;
+    } else if (a == "--stub") {
+      opt.stub = true;
     }
   }
   return opt;
 }
+
+// 统计每通道的收发计数（观测用）
+struct ChannelStats {
+  std::atomic<std::uint64_t> polled{0};
+  std::atomic<std::uint64_t> handled{0};
+  std::atomic<std::uint64_t> errors{0};
+};
 
 }  // namespace
 
@@ -89,6 +97,7 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  std::signal(SIGPIPE, SIG_IGN);
 
   fish::capability::HttpClient::global_init();
   struct Guard {
@@ -106,13 +115,74 @@ int main(int argc, char** argv) {
           .field("detail", loaded.error.detail);
       return 1;
     } else {
-      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime",
-                          "config_missing_using_defaults");
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "config_missing");
     }
   }
 
-  // ── 能力 ──
+  // 日志级别
+  {
+    const auto lv = cfg.get_or("log.level", "info");
+    if (lv == "debug") fish::log::Logger::instance().set_level(fish::log::LogLevel::kDebug);
+    else if (lv == "warn") fish::log::Logger::instance().set_level(fish::log::LogLevel::kWarn);
+    else if (lv == "error") fish::log::Logger::instance().set_level(fish::log::LogLevel::kError);
+  }
+
+  const bool stub_mode = opt.stub || (opt.self_test && !opt.live_test);
   const auto chat_cfg = fish::capability::load_chat_config(cfg);
+
+  // ── 启动校验：配置有错就立即失败，不允许静默运行 ──
+  {
+    std::vector<std::string> problems;
+
+    const bool qq_on = cfg.get_bool_or("channel.qq_official.enabled", false);
+    const bool ob_on = cfg.get_bool_or("channel.qq_onebot.enabled", false);
+    const bool wx_on = cfg.get_bool_or("channel.wechat.enabled", false);
+
+    if (qq_on) {
+      if (cfg.get_or("channel.qq_official.app_id", "").empty()) {
+        problems.push_back("channel.qq_official.app_id 为空");
+      }
+      if (cfg.get_or("channel.qq_official.app_secret", "").empty()) {
+        problems.push_back("channel.qq_official.app_secret 为空（检查 QQ_APP_SECRET 环境变量）");
+      }
+    }
+    if (ob_on) {
+      if (cfg.get_or("channel.qq_onebot.ws_url", "").empty()) {
+        problems.push_back("channel.qq_onebot.ws_url 为空");
+      }
+      if (cfg.get_or("channel.qq_onebot.self_id", "").empty()) {
+        problems.push_back("channel.qq_onebot.self_id 为空（否则无法判定是否被 @）");
+      }
+    }
+    if (wx_on && cfg.get_or("channel.wechat.bot_token", "").empty()) {
+      problems.push_back("channel.wechat.bot_token 为空");
+    }
+
+    // 人格文件必须存在
+    {
+      const auto pp = cfg.get_or("persona.persona_file", "persona/persona.md");
+      const auto rp = cfg.get_or("persona.rules_file", "persona/rules.md");
+      if (!std::ifstream(pp)) problems.push_back("人格文件不存在: " + pp);
+      if (!std::ifstream(rp)) problems.push_back("约束文件不存在: " + rp);
+    }
+
+    // 用了真实 provider 就必须有 key
+    if (!stub_mode) {
+      if (chat_cfg.api_key.empty() && chat_cfg.provider != "ollama") {
+        problems.push_back("capability.chat.api_key 为空（检查 DEEPSEEK_API_KEY 环境变量）");
+      }
+      if (!problems.empty()) {
+        for (const auto& p : problems) {
+          fish::log::log_line(fish::log::LogLevel::kError, "runtime", "config_invalid")
+              .field("problem", p);
+        }
+        std::fprintf(stderr, "\n启动失败：%zu 个配置问题，见上方日志。\n", problems.size());
+        return 1;
+      }
+    }
+  }
+  // ── 能力 ──
+  // (chat_cfg 已前移)
   const auto emb_cfg = fish::capability::load_embedding_config(cfg);
   const auto stt_cfg = fish::capability::load_stt_config(cfg);
   const auto tts_cfg = fish::capability::load_tts_config(cfg);
@@ -121,8 +191,6 @@ int main(int argc, char** argv) {
   std::unique_ptr<fish::core::IEmbeddingModel> embedding;
   std::unique_ptr<fish::core::ISpeechToText> stt;
   std::unique_ptr<fish::core::ITextToSpeech> tts;
-
-  const bool stub_mode = opt.stub || (opt.self_test && !opt.live_test);
 
   if (!stub_mode && !chat_cfg.api_key.empty()) {
     auto c = fish::capability::make_chat(chat_cfg);
@@ -142,7 +210,11 @@ int main(int argc, char** argv) {
     if (e.ok()) {
       embedding = std::move(*e.value);
       fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "embedding_provider")
-          .field("provider", emb_cfg.provider);
+          .field("provider", emb_cfg.provider)
+          .field("model", emb_cfg.model);
+    } else {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "embedding_init_failed")
+          .field("detail", e.error.detail);
     }
   }
   if (!stub_mode && tts_cfg.provider != "none") {
@@ -170,8 +242,8 @@ int main(int argc, char** argv) {
         cfg.get_or("persona.persona_file", "persona/persona.md"),
         cfg.get_or("persona.rules_file", "persona/rules.md"));
     if (pr.ok()) {
-      persona_holder = std::make_unique<fish::orchestrator::LayeredPersona>(
-          std::move(*pr.value));
+      persona_holder =
+          std::make_unique<fish::orchestrator::LayeredPersona>(std::move(*pr.value));
     } else {
       fish::log::log_line(fish::log::LogLevel::kError, "runtime", "persona_load_failed")
           .field("detail", pr.error.detail);
@@ -184,8 +256,7 @@ int main(int argc, char** argv) {
   // ── 记忆 ──
   fish::memory::MemorySystem::Config mem_cfg;
   mem_cfg.working_rounds = static_cast<int>(cfg.get_int_or("memory.working_rounds", 20));
-  mem_cfg.consolidate_every =
-      static_cast<int>(cfg.get_int_or("memory.consolidate_every", 20));
+  mem_cfg.consolidate_every = static_cast<int>(cfg.get_int_or("memory.consolidate_every", 20));
   mem_cfg.recall_top_k = static_cast<int>(cfg.get_int_or("memory.recall_top_k", 5));
   mem_cfg.episode_top_k = static_cast<int>(cfg.get_int_or("memory.episode_top_k", 3));
   mem_cfg.notes_dir = cfg.get_or("memory.notes_dir", "data/memory/notes");
@@ -204,7 +275,6 @@ int main(int argc, char** argv) {
   fish::memory::Consolidator consolidator(chat.get(), &memory_sys.notes(),
                                           &memory_sys.index(), embedding.get());
 
-  // ── 预算与管线 ──
   fish::orchestrator::ReplyBudget budget(
       static_cast<int>(cfg.get_int_or("orchestrator.max_replies", 4)));
 
@@ -225,7 +295,7 @@ int main(int argc, char** argv) {
 
   // ── 自检 ──
   if (opt.self_test || opt.live_test) {
-    fish::transport::LocalChannel ch;
+    fish::channels::LocalChannel ch;
     ch.inject_text("self-test-group", "在吗", true, false);
     ch.inject_text("self-test-group", "@大肥鱼 在吗", true, true);
     ch.inject_text("self-test-private", "你好", false, true);
@@ -247,7 +317,6 @@ int main(int argc, char** argv) {
     for (const auto& s : sent) std::printf("  -> %s\n", s.c_str());
     std::printf("working memory rounds(group): %d\n",
                 memory_sys.round_count("self-test-group"));
-
     if (sent.size() != 2) {
       std::printf("FAIL: expected 2 replies\n");
       return 1;
@@ -256,25 +325,140 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  // ── 主循环 ──
-  fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "started")
-      .field("config", opt.config_path);
+  // ── 按配置装配通道 ──
+  std::vector<std::unique_ptr<fish::core::IChannel>> channels;
+  std::vector<std::string> channel_names;
 
-  fish::transport::LocalChannel channel;
-  while (!g_stop) {
-    auto msg = channel.poll();
-    if (!msg.ok()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-      continue;
-    }
-    auto r = pipeline.handle(channel, *msg.value);
-    if (!r.ok()) {
-      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "handle_failed")
-          .field("detail", r.error.detail);
+  if (cfg.get_bool_or("channel.qq_official.enabled", false)) {
+    fish::channels::QQOfficialConfig qc;
+    qc.app_id = cfg.get_or("channel.qq_official.app_id", "");
+    qc.app_secret = cfg.get_or("channel.qq_official.app_secret", "");
+    auto ch = std::make_unique<fish::channels::QQOfficialChannel>(qc);
+    auto e = ch->connect();
+    if (e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "channel_enabled")
+          .field("channel", "qq_official");
+      channels.push_back(std::move(ch));
+      channel_names.push_back("qq_official");
+    } else {
+      fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
+          .field("channel", "qq_official")
+          .field("detail", e.detail);
     }
   }
+
+  if (cfg.get_bool_or("channel.qq_onebot.enabled", false)) {
+    fish::channels::OneBotConfig oc;
+    oc.ws_url = cfg.get_or("channel.qq_onebot.ws_url", "ws://127.0.0.1:3001");
+    oc.access_token = cfg.get_or("channel.qq_onebot.access_token", "");
+    oc.self_id = cfg.get_or("channel.qq_onebot.self_id", "");
+    oc.http_url = cfg.get_or("channel.qq_onebot.http_url", "");
+    auto ch = std::make_unique<fish::channels::QQOneBotChannel>(oc);
+    auto e = ch->connect();
+    if (e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "channel_enabled")
+          .field("channel", "qq_onebot");
+      channels.push_back(std::move(ch));
+      channel_names.push_back("qq_onebot");
+    } else {
+      fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
+          .field("channel", "qq_onebot")
+          .field("detail", e.detail);
+    }
+  }
+
+  if (cfg.get_bool_or("channel.wechat.enabled", false)) {
+    fish::channels::WeChatConfig wc;
+    wc.bot_token = cfg.get_or("channel.wechat.bot_token", "");
+    auto ch = std::make_unique<fish::channels::WeChatIlinkChannel>(wc);
+    auto e = ch->connect();
+    if (e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "channel_enabled")
+          .field("channel", "wechat");
+      channels.push_back(std::move(ch));
+      channel_names.push_back("wechat");
+    } else {
+      fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
+          .field("channel", "wechat")
+          .field("detail", e.detail);
+    }
+  }
+
+  if (channels.empty()) {
+    fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "no_channel_enabled")
+        .field("hint", std::string("在 config.toml 里启用 channel.qq_official / channel.qq_onebot / channel.wechat"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    return 0;
+  }
+
+  fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "started")
+      .field("config", opt.config_path)
+      .field("channels", static_cast<long long>(channels.size()));
+
+  // ── 每通道一个线程 ──
+  std::vector<std::thread> workers;
+  std::vector<std::unique_ptr<ChannelStats>> stats;
+  stats.reserve(channels.size());
+
+  for (std::size_t i = 0; i < channels.size(); ++i) {
+    auto st = std::make_unique<ChannelStats>();
+    auto* st_ptr = st.get();
+    stats.push_back(std::move(st));
+
+    fish::core::IChannel* raw = channels[i].get();
+    const std::string name = channel_names[i];
+
+    workers.emplace_back([raw, st_ptr, &pipeline, name] {
+      while (!g_stop.load()) {
+        auto msg = raw->poll();
+        if (!msg.ok()) {
+          // timeout 是正常情况，其他错误记录
+          if (msg.error.code != fish::core::ErrorCode::kTimeout) {
+            st_ptr->errors.fetch_add(1);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+        st_ptr->polled.fetch_add(1);
+        auto r = pipeline.handle(*raw, *msg.value);
+        if (r.ok()) {
+          st_ptr->handled.fetch_add(1);
+        } else {
+          st_ptr->errors.fetch_add(1);
+        }
+      }
+    });
+  }
+
+  // ── 主线程：等信号 + 定期打指标 ──
+  int tick = 0;
+  while (!g_stop.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (++tick % 300 == 0) {  // 每 60 秒
+      std::uint64_t polled = 0;
+      std::uint64_t handled = 0;
+      std::uint64_t errors = 0;
+      for (const auto& s : stats) {
+        polled += s->polled.load();
+        handled += s->handled.load();
+        errors += s->errors.load();
+      }
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "metrics")
+          .field("polled", static_cast<long long>(polled))
+          .field("handled", static_cast<long long>(handled))
+          .field("errors", static_cast<long long>(errors));
+    }
+  }
+
+  fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "stopping");
+  for (auto& t : workers) {
+    if (t.joinable()) t.join();
+  }
+  channels.clear();
 
   fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "shutdown");
   return 0;
 }
+
+
 

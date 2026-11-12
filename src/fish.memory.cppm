@@ -39,6 +39,7 @@ struct Fact {
   double confidence{0.9};
   std::string created;
   std::string superseded_by;
+  std::string batch_id;   // 产生它的巩固批次，用于幂等去重
 };
 
 struct Episode {
@@ -749,14 +750,33 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
   ConsolidateReport report;
   std::size_t idx = 0;
 
+  auto content_hash = [](const std::string& s) {
+    std::size_t h = 1469598103934665603ULL;
+    for (const char c : s) {
+      h ^= static_cast<unsigned char>(c);
+      h *= 1099511628211ULL;
+    }
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
+  };
+  std::vector<Episode> existing_eps;
+  if (notes != nullptr) {
+    auto ee = notes->load_episodes();
+    if (ee.ok()) existing_eps = std::move(*ee.value);
+  }
   for (const auto& e : body.value("episodes", nlohmann::json::array())) {
     Episode ep;
-    ep.id = "e" + today + "_" + std::to_string(++idx);
     ep.summary = e.value("summary", "");
     ep.importance = e.value("importance", 0.5);
     ep.created = today;
     if (ep.summary.empty()) continue;
+    ep.id = "e" + content_hash(ep.summary).substr(0, 12);
+    const bool dup_ep = std::any_of(existing_eps.begin(), existing_eps.end(),
+                                    [&](const Episode& x) { return x.summary == ep.summary; });
+    if (dup_ep) continue;
     if (notes != nullptr) notes->append_episode(ep);
+    existing_eps.push_back(ep);
     if (index != nullptr && embedding != nullptr) {
       auto vec = embedding->embed(ep.summary);
       if (vec.ok()) index->upsert_item("episode", ep.id, ep.summary, *vec.value);
@@ -765,15 +785,26 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
   }
 
   idx = 0;
+
+  // 幂等：同内容不重复写入；id 用内容哈希，保证跨批次稳定
+  std::vector<Fact> existing_facts;
+  if (notes != nullptr) {
+    auto ef = notes->load_facts();
+    if (ef.ok()) existing_facts = std::move(*ef.value);
+  }
   for (const auto& f : body.value("facts", nlohmann::json::array())) {
     Fact fact;
-    fact.id = "f" + today + "_" + std::to_string(++idx);
     fact.subject = f.value("subject", "用户");
     fact.content = f.value("content", "");
     fact.confidence = f.value("confidence", 0.8);
     fact.created = today;
     if (fact.content.empty()) continue;
+    fact.id = "f" + content_hash(fact.content).substr(0, 12);
+    const bool dup = std::any_of(existing_facts.begin(), existing_facts.end(),
+                                 [&](const Fact& x) { return x.content == fact.content; });
+    if (dup) continue;
     if (notes != nullptr) notes->append_fact(fact);
+    existing_facts.push_back(fact);
     if (index != nullptr && embedding != nullptr) {
       auto vec = embedding->embed(fact.content);
       if (vec.ok()) index->upsert_item("fact", fact.id, fact.content, *vec.value);
@@ -1047,3 +1078,4 @@ Result<ConsolidateReport> MemorySystem::force_consolidate(const std::string& con
 }
 
 }  // namespace fish::memory
+

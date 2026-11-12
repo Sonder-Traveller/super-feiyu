@@ -1,0 +1,53 @@
+[Unit]
+Description=super-feiyu (DeepSeek 拟人化机器人)
+Documentation=https://github.com/Sonder-Traveller/super-feiyu
+After=network-online.target
+Wants=network-online.target
+# 崩溃后无限重启，但要避免疯狂重启
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/super-feiyu
+EnvironmentFile=/home/%i/super-feiyu/.env
+Environment=LD_LIBRARY_PATH=/home/%i/local/lib
+ExecStart=/home/%i/super-feiyu/build/super-feiyu --config /home/%i/super-feiyu/config.toml
+Restart=always
+RestartSec=5
+# 优雅退出：先 SIGTERM，给 20 秒收尾
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# ── 资源限制（1G 机器的兜底）──
+# 目标 < 100MB，超了说明有泄漏；这里给到 512M 让 systemd 直接重启它
+MemoryMax=512M
+MemoryHigh=384M
+# 避免 fd 泄漏
+LimitNOFILE=4096
+
+# ── 安全加固 ──
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/%i/super-feiyu/data /tmp
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+# ── 日志：交给 journald ──
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=super-feiyu
+
+[Install]
+# 用户实例用 default.target；系统实例才用 multi-user.target
+WantedBy=default.target
+

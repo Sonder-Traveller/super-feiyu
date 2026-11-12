@@ -11,20 +11,27 @@ PREFIX="${PREFIX:-$HOME/local}"
 OUT="${OUT:-build}"
 
 INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc)
-MODULES=(core log config memory capability transport orchestrator)
+# 编译顺序：依赖在前
+MODULES=(core log config memory capability ws qq_ws onebot_ws channels orchestrator)
 
 if [[ "${1:-}" == "--clean" ]]; then
-  rm -rf "$OUT" build_obj build_pcm
+  rm -rf "$OUT"
 fi
 
 mkdir -p "$OUT/pcm" "$OUT/obj"
 
-echo "==> 1/4 预编译模块接口"
+echo "==> 1/4 预编译模块接口 (${#MODULES[@]} 个)"
 FM=()
 for m in "${MODULES[@]}"; do
-  echo "    fish.$m"
-  "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" \
-    --precompile "src/fish.$m.cppm" -o "$OUT/pcm/fish.$m.pcm"
+  printf "    fish.%-14s" "$m"
+  if "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" \
+      --precompile "src/fish.$m.cppm" -o "$OUT/pcm/fish.$m.pcm" 2>"$OUT/pcm/fish.$m.err"; then
+    echo "ok"
+  else
+    echo "FAILED"
+    head -20 "$OUT/pcm/fish.$m.err"
+    exit 1
+  fi
   FM+=("-fmodule-file=fish.$m=$OUT/pcm/fish.$m.pcm")
 done
 
@@ -39,15 +46,21 @@ echo "==> 3/4 编译主程序与测试"
 "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c src/main.cpp -o "$OUT/obj/main.o"
 "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c tests/test_all.cpp -o "$OUT/obj/test_all.o"
 "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c tests/test_e2e.cpp -o "$OUT/obj/test_e2e.o"
+if [ -f tests/test_protocol.cpp ]; then
+  "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c tests/test_protocol.cpp -o "$OUT/obj/test_protocol.o"
+fi
 
 echo "==> 4/4 链接"
-LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -Wl,-rpath,"$PREFIX/lib")
+LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -lpthread -Wl,-rpath,"$PREFIX/lib")
 "$CXX" "$OUT/obj/main.o" "$OUT"/obj/fish.*.o -o "$OUT/super-feiyu" "${LIBS[@]}"
 "$CXX" "$OUT/obj/test_all.o" "$OUT"/obj/fish.*.o -o "$OUT/test_all" "${LIBS[@]}"
 "$CXX" "$OUT/obj/test_e2e.o" "$OUT"/obj/fish.*.o -o "$OUT/test_e2e" "${LIBS[@]}"
+if [ -f "$OUT/obj/test_protocol.o" ]; then
+  "$CXX" "$OUT/obj/test_protocol.o" "$OUT"/obj/fish.*.o -o "$OUT/test_protocol" "${LIBS[@]}"
+fi
 
 echo
 echo "构建完成:"
-echo "  $OUT/super-feiyu"
-echo "  $OUT/test_all"
-echo "  $OUT/test_e2e"
+for b in super-feiyu test_all test_e2e test_protocol; do
+  [ -x "$OUT/$b" ] && echo "  $OUT/$b  ($(du -h "$OUT/$b" | cut -f1))"
+done
