@@ -1,0 +1,29 @@
+新增控制面 API：对外暴露人格管理接口，带鉴权
+
+新增 fish.api 模块（最小 HTTP 服务端，无第三方依赖）：
+- 裸 socket 实现，只监听 127.0.0.1
+- Bearer token 鉴权，token 从 FEIYU_API_TOKEN 环境变量读
+- token 比较用常量时间，避免计时攻击
+- 开鉴权但没设 token 时拒绝启动，不静默降级成裸奔
+
+端点：
+  GET    /healthz                        探活，免鉴权
+  GET    /v1/persona/default             读全局人格
+  PUT    /v1/persona/default             写全局人格
+  GET    /v1/persona/session?conv_id=X   读会话人格
+  PUT    /v1/persona/session?conv_id=X   设会话人格
+  DELETE /v1/persona/session?conv_id=X   清除覆盖
+
+默认 port=0 不启动，要开在配置里写 [api] port=8765。
+
+人格切换不做成模型工具：改人格是控制面的事，
+不该让模型自己改自己（提示注入能一路改到系统提示词层）。
+
+修的两个 bug（都是测试抓到的）：
+- /healthz 被鉴权拦在前面，监控进程永远只能拿到 401
+- 会话人格的 JSON 漏了收尾大括号
+
+测试新增 32 项：常量时间比较、请求解析、响应序列化，
+以及用 curl 打真实端口的鉴权/增删改/错误码往返。
+
+文档：docs/API.md

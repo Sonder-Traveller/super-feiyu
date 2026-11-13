@@ -93,8 +93,26 @@ max_replies = 4                # 单条入站最多回几条（QQ 官方：单�
 passive_window_ms = 300000     # 被动回复窗口；超过 80% 放弃，避免白发
 
 [persona]
-# 人格文件：写你的角色是什么样。改成自己喜欢的样子，重启生效。
-# 参考 persona/persona.example.md 里的写法说明。
+# 人格文件：首次启动会播种到 data/persona/default.md，
+# 之后直接改那个文件即可（热加载，不用重启）。
 persona_file = "persona/persona.md"
-# 可选的额外约束文件。留空或删掉这一行都可以。
-# rules_file = "persona/rules.md"
+# 人格存储目录
+store_dir = "data/persona"
+
+# ── 控制面 API ──
+# 只暴露 HTTP API，不带界面，供另一个进程管理人格。
+#
+# 鉴权：token 从环境变量 FEIYU_API_TOKEN 读，不写在这里。
+# 开着鉴权又没设 token 时，服务不会启动（不会静默降级成无鉴权）。
+#
+# 端点：
+#   GET    /healthz                          探活（免鉴权）
+#   GET    /v1/persona/default               读全局默认人格
+#   PUT    /v1/persona/default               写全局默认  {"persona":"..."}
+#   GET    /v1/persona/session?conv_id=X     读某会话人格
+#   PUT    /v1/persona/session?conv_id=X     设某会话人格 {"persona":"..."}
+#   DELETE /v1/persona/session?conv_id=X     清除会话覆盖
+[api]
+port = 0                 # 0 = 不启动
+bind = "127.0.0.1"       # 只监听本机；要对外改成 0.0.0.0 并自己加防火墙
+auth = true              # 必须配合 FEIYU_API_TOKEN 使用

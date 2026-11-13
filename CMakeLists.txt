@@ -47,6 +47,7 @@ add_library(fish_modules OBJECT
   src/fish.image.cppm
   src/fish.meme.cppm
   src/fish.persona.cppm
+  src/fish.api.cppm
   src/fish.session.cppm
   src/fish.tool.cppm
   src/fish.guard.cppm

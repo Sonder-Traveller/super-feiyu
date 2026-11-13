@@ -4,6 +4,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -24,6 +25,7 @@ import fish.tool;
 import fish.guard;
 import fish.meme;
 import fish.persona;
+import fish.api;
 import fish.channels;
 import fish.dispatcher;
 import fish.orchestrator;
@@ -669,6 +671,42 @@ int main(int argc, char** argv) {
   fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "started")
       .field("config", opt.config_path)
       .field("channels", static_cast<long long>(channels.size()));
+
+  // ── 控制面 API ──
+  //
+  // 只暴露 API，不带 UI，供另一个进程管理人格。
+  // 默认不启动（port=0），要开就在配置里写：
+  //   [api] port = 8765
+  // token 从环境变量读（FEIYU_API_TOKEN），不写进配置和代码。
+  std::unique_ptr<fish::api::Server> api_server;
+  {
+    const auto port = static_cast<int>(cfg.get_int_or("api.port", 0));
+    if (port > 0) {
+      fish::api::Server::Config ac;
+      ac.bind_addr = cfg.get_or("api.bind", "127.0.0.1");
+      ac.port = port;
+
+      // 鉴权：默认开。token 必须从环境变量来。
+      ac.auth.enabled = cfg.get_bool_or("api.auth", true);
+      if (const char* tok = std::getenv("FEIYU_API_TOKEN"); tok != nullptr) {
+        ac.auth.token = tok;
+      }
+      if (ac.auth.enabled && ac.auth.token.empty()) {
+        fish::log::log_line(fish::log::LogLevel::kError, "api", "token_missing")
+            .field("hint", "设置 FEIYU_API_TOKEN 或把 api.auth 设为 false");
+        // 不静默降级成无鉴权：宁可不起，也不能裸奔
+        api_server.reset();
+      } else {
+        api_server = std::make_unique<fish::api::Server>(ac, persona_store.get());
+        auto ae = api_server->start();
+        if (!ae.ok()) {
+          fish::log::log_line(fish::log::LogLevel::kError, "api", "start_failed")
+              .field("detail", ae.detail);
+          api_server.reset();
+        }
+      }
+    }
+  }
 
   // ── 调度器：通道线程只 poll，处理在线程池里跑 ──
   // 这样慢的模型调用不会阻塞收消息，多会话可真正并行。

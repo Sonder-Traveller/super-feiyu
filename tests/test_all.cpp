@@ -19,6 +19,7 @@ import fish.guard;
 import fish.tool;
 import fish.session;
 import fish.persona;
+import fish.api;
 
 namespace fs = std::filesystem;
 
@@ -681,6 +682,170 @@ void test_persona_store() {
   fs::remove_all(dir);
 }
 
+// 控制面 API：解析、鉴权、真实 HTTP 往返
+void test_api() {
+  std::printf("\n=== api ===\n");
+
+  // ── 纯函数：常量时间比较 ──
+  CHECK(fish::api::constant_time_equal("abc", "abc"), "ct equal");
+  CHECK(!fish::api::constant_time_equal("abc", "abd"), "ct differ");
+  CHECK(!fish::api::constant_time_equal("abc", "abcd"), "ct length differ");
+  CHECK(fish::api::constant_time_equal("", ""), "ct empty");
+
+  // ── 请求解析 ──
+  {
+    fish::api::Request r;
+    const std::string raw =
+        "PUT /v1/persona/default HTTP/1.1\r\n"
+        "Content-Length: 16\r\n"
+        "Authorization: Bearer tok\r\n"
+        "\r\n"
+        "{\"persona\":\"hi\"}";
+    CHECK(fish::api::parse_request(raw, &r), "parse ok");
+    CHECK(r.method == "PUT", "method parsed");
+    CHECK(r.path == "/v1/persona/default", "path parsed");
+    CHECK(r.headers["authorization"] == "Bearer tok", "header lowercased");
+    CHECK(r.body == "{\"persona\":\"hi\"}", "body parsed");
+  }
+
+  // 坏请求
+  {
+    fish::api::Request r;
+    CHECK(!fish::api::parse_request("garbage", &r), "garbage rejected");
+  }
+
+  // ── 响应序列化 ──
+  {
+    fish::api::Response resp;
+    resp.status = 401;
+    resp.body = R"({"error":"unauthorized"})";
+    const auto wire = fish::api::build_response(resp);
+    CHECK(wire.rfind("HTTP/1.1 401", 0) == 0, "status line");
+    CHECK(wire.find("Content-Length: ") != std::string::npos, "has content-length");
+    CHECK(wire.find("\r\n\r\n") != std::string::npos, "has header separator");
+  }
+
+  // ── 真实 HTTP 往返（含鉴权）──
+  const auto dir = fs::temp_directory_path() / "fish_api_test";
+  fs::remove_all(dir);
+
+  fish::persona::PersonaStore::Config pc;
+  pc.dir = (dir / "persona").string();
+  fish::persona::PersonaStore store(pc);
+  CHECK(store.init().ok(), "store init");
+  CHECK(store.set_default_persona("DEFAULT").ok(), "seed default");
+
+  fish::api::Server::Config ac;
+  ac.bind_addr = "127.0.0.1";
+  ac.port = 0;   // 让系统分配端口，避免和真实服务冲突
+  ac.auth.enabled = true;
+  ac.auth.token = "secret-token";
+
+  // port=0 在本实现里表示「不启动」，所以用一个高位端口试探
+  ac.port = 18765;
+  ac.bind_addr = "127.0.0.1";
+
+  fish::api::Server server(ac, &store);
+  auto se = server.start();
+  CHECK(se.ok(), "server started");
+  if (!se.ok()) {
+    fs::remove_all(dir);
+    return;
+  }
+
+  const auto http_put = [](const std::string& path, const std::string& body,
+                           const std::string& token) -> std::string {
+    std::ostringstream cmd;
+    cmd << "curl -s -o - -w '\\n%{http_code}' -X PUT "
+        << "-H 'Content-Type: application/json' ";
+    if (!token.empty()) cmd << "-H 'Authorization: Bearer " << token << "' ";
+    cmd << "-d '" << body << "' http://127.0.0.1:18765" << path << " 2>/dev/null";
+    std::string out;
+    FILE* p = ::popen(cmd.str().c_str(), "r");
+    if (p == nullptr) return out;
+    char buf[512];
+    while (::fgets(buf, sizeof(buf), p) != nullptr) out += buf;
+    ::pclose(p);
+    return out;
+  };
+
+  const auto http_get = [](const std::string& path,
+                           const std::string& token) -> std::string {
+    std::ostringstream cmd;
+    cmd << "curl -s -o - -w '\\n%{http_code}' ";
+    if (!token.empty()) cmd << "-H 'Authorization: Bearer " << token << "' ";
+    cmd << "http://127.0.0.1:18765" << path << " 2>/dev/null";
+    std::string out;
+    FILE* p = ::popen(cmd.str().c_str(), "r");
+    if (p == nullptr) return out;
+    char buf[512];
+    while (::fgets(buf, sizeof(buf), p) != nullptr) out += buf;
+    ::pclose(p);
+    return out;
+  };
+
+  // 无 token → 401
+  {
+    const auto r = http_get("/v1/persona/default", "");
+    CHECK(r.find("401") != std::string::npos, "no token rejected");
+  }
+  // 错 token → 401
+  {
+    const auto r = http_get("/v1/persona/default", "wrong");
+    CHECK(r.find("401") != std::string::npos, "wrong token rejected");
+  }
+  // 正确 token → 200 且能读到内容
+  {
+    const auto r = http_get("/v1/persona/default", "secret-token");
+    CHECK(r.find("200") != std::string::npos, "right token accepted");
+    CHECK(r.find("DEFAULT") != std::string::npos, "persona returned");
+  }
+  // healthz 免鉴权
+  {
+    const auto r = http_get("/healthz", "");
+    CHECK(r.find("200") != std::string::npos, "healthz open");
+    CHECK(r.find("\"ok\":true") != std::string::npos, "healthz body");
+  }
+  // PUT 全局人格
+  {
+    const auto r = http_put("/v1/persona/default", R"({"persona":"NEW"})", "secret-token");
+    CHECK(r.find("200") != std::string::npos, "put default ok");
+    auto cur = store.default_persona();
+    CHECK(cur.ok() && *cur.value == "NEW", "put persisted");
+  }
+  // PUT 会话人格，不影响全局
+  {
+    const auto r = http_put("/v1/persona/session?conv_id=abc",
+                            R"({"persona":"SESSION"})", "secret-token");
+    CHECK(r.find("200") != std::string::npos, "put session ok");
+    auto s = store.persona_for("abc");
+    CHECK(s.ok() && *s.value == "SESSION", "session persona set");
+    auto d = store.default_persona();
+    CHECK(d.ok() && *d.value == "NEW", "default untouched");
+  }
+  // 会话人格的 JSON 必须是闭合的（曾漏过收尾大括号）
+  {
+    const auto r = http_get("/v1/persona/session?conv_id=abc", "secret-token");
+    CHECK(r.find(R"("}"})") != std::string::npos ||
+              r.find("SESSION\"}") != std::string::npos,
+          "session json closed");
+  }
+  // 缺 conv_id → 400
+  {
+    const auto r = http_get("/v1/persona/session", "secret-token");
+    CHECK(r.find("400") != std::string::npos, "missing conv_id rejected");
+  }
+  // 未知路径 → 404
+  {
+    const auto r = http_get("/v1/nope", "secret-token");
+    CHECK(r.find("404") != std::string::npos, "unknown path 404");
+  }
+
+  server.stop();
+  CHECK(!server.running(), "server stopped");
+  fs::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -707,6 +872,7 @@ int main() {
   test_session_registry();
   test_photo_markers();
   test_persona_store();
+  test_api();
 
   std::printf("\n");
   if (g_failures != 0) {

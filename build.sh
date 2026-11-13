@@ -13,8 +13,8 @@ OUT="${OUT:-build}"
 INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc \
      -Ithird_party/thread-pool/pool/include)
 # 编译顺序：依赖在前（media 依赖 capability，session 只依赖 core）
-# 编译顺序：依赖在前（persona 只依赖 core/log，orchestrator 依赖它）
-MODULES=(core log config memory capability probe media image meme persona session tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
+# 编译顺序：依赖在前（persona/api 只依赖 core/log）
+MODULES=(core log config memory capability probe media image meme persona api session tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
 
 if [[ "${1:-}" == "--clean" ]]; then
   rm -rf "$OUT"
