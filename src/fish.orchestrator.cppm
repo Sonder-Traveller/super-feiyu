@@ -142,6 +142,17 @@ class Pipeline {
   mutable std::array<std::mutex, kShards> shards_{};
 };
 
+// 解析回复里的图片标记，**支持多个**。
+//   [PHOTO]           → spec 为空（用形象库现成图）
+//   [PHOTO: 描述]      → spec 为描述（现场生成）
+// 一次回复里可以写多行，按出现顺序全部收集，并把标记从正文里删掉。
+//
+// 早期只取第一个标记，等于「一次只能发一张」；用户明确要求去掉这个限制，
+// 双向都要：出站能发多张，入站能收多张（入站本来就是 vector，不受限）。
+//
+// 导出是为了可测：这是纯函数，测试直接喂字符串断言结果。
+std::vector<std::string> extract_photo_markers(std::string& text);
+
 }  // namespace fish::orchestrator
 
 // ═══ 实现 ═══════════════════════════════════════════════
@@ -314,34 +325,51 @@ void Pipeline::maintenance() {
   }
 }
 
-// 解析回复里的图片标记。
-//   [PHOTO]          → 返回 true，spec 为空（用形象库现成图）
-//   [PHOTO: 描述]     → 返回 true，spec 为描述（现场生成）
-// 同时把标记从 reply_text 里删掉，避免被当成正文发出去。
-bool extract_photo_marker(std::string& text, std::string* spec) {
+// 解析回复里的图片标记，**支持多个**（声明处有完整说明）。
+std::vector<std::string> extract_photo_markers(std::string& text) {
+  std::vector<std::string> specs;
   const std::string open = "[PHOTO";
-  const auto pos = text.find(open);
-  if (pos == std::string::npos) return false;
 
-  const auto close = text.find(']', pos);
-  if (close == std::string::npos) return false;
+  std::size_t search_from = 0;
+  while (true) {
+    const auto pos = text.find(open, search_from);
+    if (pos == std::string::npos) break;
 
-  const std::string inner = text.substr(pos + open.size(), close - pos - open.size());
-  // inner 形如 "" 或 ": 描述"
-  if (!inner.empty()) {
-    if (inner[0] != ':') return false;
-    std::string s = inner.substr(1);
-    const auto b = s.find_first_not_of(" \t");
-    if (b != std::string::npos) s = s.substr(b);
-    *spec = s;
+    const auto close = text.find(']', pos);
+    if (close == std::string::npos) break;
+
+    const std::string inner = text.substr(pos + open.size(), close - pos - open.size());
+    // inner 形如 "" 或 ": 描述"；不是这两种就说明不是标记，跳过继续找
+    if (!inner.empty() && inner[0] != ':') {
+      search_from = pos + open.size();
+      continue;
+    }
+
+    std::string spec;
+    if (!inner.empty()) {
+      std::string s = inner.substr(1);
+      const auto b = s.find_first_not_of(" \t");
+      if (b != std::string::npos) spec = s.substr(b);
+    }
+    specs.push_back(std::move(spec));
+
+    // 删掉标记本身（含其后紧跟的一个换行，避免留下空行）
+    std::size_t erase_len = close - pos + 1;
+    while (close + erase_len < text.size() &&
+           (text[close + erase_len] == '\n' || text[close + erase_len] == ' ')) {
+      ++erase_len;
+    }
+    text.erase(pos, erase_len);
+    search_from = pos;   // 删除后原位置继续找，可能有连续标记
   }
 
-  // 删掉标记本身，并清理残留空行
-  text.erase(pos, close - pos + 1);
+  // 清理首尾空行
   while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
   const auto nb = text.find_first_not_of(" \t\n");
   if (nb != std::string::npos) text = text.substr(nb);
-  return true;
+  else text.clear();
+
+  return specs;
 }
 
 // 把时间戳转成人类可读的相对/绝对描述，用于提示词。
@@ -631,9 +659,30 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
   // 9. 模型调用（带降级 + 工具循环）
   fish::core::IChatModel::Request req;
+  // system 只放稳定前缀：它必须逐字节不变，否则前缀缓存全失效（成本差 50 倍）。
   req.system_prompt = deps_.persona->stable_prefix();
+
   req.user_blocks = std::move(*input.value);
   req.history = std::move(history);
+
+  // 动态后缀：本轮上下文（时间/场景/对方）+ 本轮红线。
+  //
+  // 这段原来只定义了、从未调用，等于模型不知道现在几点、是群聊还是私聊，
+  // 末尾那句红线也从未生效。
+  //
+  // 放进 system 会污染前缀缓存，所以作为 history 的**最后一条 user 消息**注入：
+  // 它跟着本轮输入走，不改变前面的稳定前缀。
+  //
+  // 注意：dynamic_suffix 还预留了【相关记忆】参数，但 MemoryContext 目前
+  // 没有召回条目字段，传空串——不编造不存在的数据。
+  const std::string suffix = deps_.persona->dynamic_suffix(msg, "");
+  if (!suffix.empty()) {
+    fish::core::ContentBlock ctx_block;
+    ctx_block.kind = fish::core::BlockKind::kText;
+    ctx_block.text = suffix;
+    ctx_block.role = "user";
+    req.user_blocks.insert(req.user_blocks.begin(), std::move(ctx_block));
+  }
 
   // 工具声明：只在注册表非空时带上
   if (deps_.tools != nullptr && !deps_.tools->empty()) {
@@ -702,8 +751,9 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   }
 
   // 9.5 解析图片标记：[PHOTO] 取库存图，[PHOTO: 描述] 现场生成
-  std::string photo_spec;
-  const bool wants_photo = extract_photo_marker(reply_text, &photo_spec);
+  // 支持多个标记，按出现顺序逐张发送。
+  const std::vector<std::string> photo_specs = extract_photo_markers(reply_text);
+  const bool wants_photo = !photo_specs.empty();
 
   // 记忆里要记「实际发出去的东西」，而不是模型原始输出。
   // 模型输出 "[PHOTO]" 时，用户实际看到的是「喏」+ 一张图；
@@ -717,9 +767,12 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   std::string remembered_reply = reply_text;
   if (wants_photo) {
     if (remembered_reply.empty()) remembered_reply = "喏";
-    remembered_reply += photo_spec.empty()
-                            ? "（系统附了一张图）"
-                            : "（系统附了一张图：" + photo_spec + "）";
+    // 多张时逐张记，别把 N 张压成一句
+    for (const auto& spec : photo_specs) {
+      remembered_reply += spec.empty()
+                              ? "（系统附了一张图）"
+                              : "（系统附了一张图：" + spec + "）";
+    }
   }
 
   // 出站图片的本地路径，稍后一起写进记忆。
@@ -739,8 +792,9 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   if (text_block.text.empty() && wants_photo) text_block.text = "喏";
   if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
 
-  // 图片：先查形象库（零成本、形象稳定），没有再现场生成
-  if (wants_photo) {
+  // 图片：先查形象库（零成本、形象稳定），没有再现场生成。
+  // 支持多张：每个 [PHOTO] 标记对应一张，按顺序发送。
+  for (const auto& photo_spec : photo_specs) {
     std::string photo_url;
     std::string photo_src;
 
@@ -814,8 +868,18 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
+  // 出站条数上限。
+  //
+  // 注意：这是**平台被动回复配额**（QQ 官方单聊 4 / 群 5），
+  // 不是我们自己设的「一次只能发一张图」。
+  // 图片按张各占一条，所以多图会吃掉配额；配额耗尽时后面的发不出去，
+  // 这属于平台硬约束，日志里会显式记 quota_truncated，不做静默截断。
   const int allow = cap.max_replies_per_message;
-  if (static_cast<int>(outgoing.size()) > allow) {
+  if (allow > 0 && static_cast<int>(outgoing.size()) > allow) {
+    ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "quota_truncated")
+        .field("wanted", static_cast<long long>(outgoing.size()))
+        .field("allow", static_cast<long long>(allow))
+        .field("dropped", static_cast<long long>(outgoing.size() - allow));
     outgoing.resize(static_cast<std::size_t>(allow));
   }
 

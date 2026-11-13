@@ -552,6 +552,71 @@ void test_session_registry() {
   CHECK(reg.size() == 2, "two sessions");
 }
 
+// 图片标记解析：必须支持多张，且不能把正文里的方括号误当标记。
+void test_photo_markers() {
+  std::printf("\n=== pipeline: photo markers ===\n");
+
+  {
+    // 单个无描述标记
+    std::string text = "喏\n[PHOTO]";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.size() == 1, "single marker found");
+    CHECK(specs[0].empty(), "single marker has empty spec");
+    CHECK(text == "喏", "marker stripped from text");
+  }
+
+  {
+    // 多个标记：这是「一次只能发一张」被去掉后的核心行为
+    std::string text = "给你看\n[PHOTO]\n[PHOTO: 在吃泡面]\n[PHOTO]";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.size() == 3, "three markers found");
+    CHECK(specs[0].empty(), "first spec empty");
+    CHECK(specs[1] == "在吃泡面", "second spec parsed");
+    CHECK(specs[2].empty(), "third spec empty");
+    CHECK(text == "给你看", "all markers stripped");
+  }
+
+  {
+    // 同一行连续多个
+    std::string text = "[PHOTO][PHOTO]";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.size() == 2, "adjacent markers both found");
+    CHECK(text.empty(), "adjacent markers leave empty text");
+  }
+
+  {
+    // 不是标记的方括号不能误判
+    std::string text = "这是 [PHOTOS] 和 [PHOTO-X]，不是标记";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.empty(), "non-marker brackets ignored");
+    CHECK(text == "这是 [PHOTOS] 和 [PHOTO-X]，不是标记", "text untouched");
+  }
+
+  {
+    // 没有标记
+    std::string text = "普通回复";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.empty(), "no marker");
+    CHECK(text == "普通回复", "text unchanged");
+  }
+
+  {
+    // 只有标记没有正文
+    std::string text = "[PHOTO]";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.size() == 1, "marker only");
+    CHECK(text.empty(), "text empty after strip");
+  }
+
+  {
+    // 带空格的描述
+    std::string text = "[PHOTO:   在窗边发呆  ]";
+    auto specs = fish::orchestrator::extract_photo_markers(text);
+    CHECK(specs.size() == 1, "spaced spec found");
+    CHECK(specs[0] == "在窗边发呆  ", "leading spaces trimmed");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -576,6 +641,7 @@ int main() {
   test_tool_truncate();
   test_session_key();
   test_session_registry();
+  test_photo_markers();
 
   std::printf("\n");
   if (g_failures != 0) {
