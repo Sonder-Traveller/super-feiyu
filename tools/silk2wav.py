@@ -2,11 +2,21 @@
 """SILK → WAV 转换器。
 
 QQ 的语音消息是腾讯自有 SILK 格式，STT 服务（SiliconFlow 等）不支持，
-必须先转成 PCM/WAV。优先用 ffmpeg（快），没有则用纯 Python 的 pilk。
+必须先转成 PCM/WAV。
+
+决策序列（按优先级，第一个成功的就用）：
+  1. ffmpeg —— 最快最稳，但需要系统安装（apt install ffmpeg）
+  2. pilk   —— 纯 Python，pip 可装，无需 sudo，速度稍慢
+  3. 失败   —— 明确报错，让上层降级为「[语音消息转写失败]」
+
+为什么这个顺序：
+  ffmpeg 是成熟 C 实现，对各种 SILK 变体兼容性最好；
+  pilk 是纯 Python 兜底，保证没有 sudo 权限时也能工作。
 
 用法:
     python3 tools/silk2wav.py input.silk output.wav
     python3 tools/silk2wav.py input.silk output.wav --rate 16000
+    python3 tools/silk2wav.py --check          # 只检查可用后端
 
 退出码: 0 成功；1 失败
 """
@@ -18,13 +28,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 采样率选择说明：
+#   STT 模型通常按 16kHz 训练，采样率过高无益且文件更大
+DEFAULT_RATE = 16000
+
 
 def has_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def has_pilk() -> bool:
+    try:
+        import pilk  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def convert_ffmpeg(src: Path, dst: Path, rate: int) -> bool:
-    """用 ffmpeg 转。ffmpeg 原生支持 SILK。"""
+    """用 ffmpeg 转。ffmpeg 原生支持 SILK 容器。"""
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(src),
@@ -118,23 +140,42 @@ def wrap_wav(pcm: Path, wav: Path, rate: int) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="SILK → WAV")
-    ap.add_argument("src", type=Path)
-    ap.add_argument("dst", type=Path)
-    ap.add_argument("--rate", type=int, default=16000, help="采样率，默认 16000")
+    ap.add_argument("src", type=Path, nargs="?")
+    ap.add_argument("dst", type=Path, nargs="?")
+    ap.add_argument("--rate", type=int, default=DEFAULT_RATE, help="采样率，默认 16000")
+    ap.add_argument("--check", action="store_true", help="只检查可用后端")
     args = ap.parse_args()
+
+    # --check：报告后端可用性，供运维排查
+    if args.check:
+        ff = has_ffmpeg()
+        pk = has_pilk()
+        print(f"ffmpeg: {'可用' if ff else '缺失'}")
+        print(f"pilk:   {'可用' if pk else '缺失'}")
+        if ff or pk:
+            print("SILK 转换可用")
+            return 0
+        print("SILK 转换不可用（需要 ffmpeg 或 pip install pilk）")
+        return 1
+
+    if args.src is None or args.dst is None:
+        ap.error("需要 src 和 dst 参数（或用 --check）")
 
     if not args.src.exists():
         print(f"[x] 源文件不存在: {args.src}", file=sys.stderr)
         return 1
 
     head = args.src.read_bytes()[:10]
-    is_silk = head.startswith(b"#!SILK") or (len(head) > 1 and head[0] == 0x02 and b"#!SILK" in head)
+    is_silk = head.startswith(b"#!SILK") or (
+        len(head) > 1 and head[0] == 0x02 and b"#!SILK" in head
+    )
     if not is_silk:
         # 不是 SILK，直接复制（可能已经是 wav/mp3）
         args.dst.write_bytes(args.src.read_bytes())
         print(f"[i] 非 SILK 格式，直接复制到 {args.dst}")
         return 0
 
+    # 决策序列：ffmpeg → pilk
     if has_ffmpeg() and convert_ffmpeg(args.src, args.dst, args.rate):
         print(f"[✓] ffmpeg 转换成功: {args.dst}")
         return 0
@@ -144,6 +185,7 @@ def main() -> int:
         return 0
 
     print("[x] 转换失败：既没有可用的 ffmpeg，pilk 也解不了", file=sys.stderr)
+    print("    装其一即可：apt install ffmpeg 或 pip install pilk", file=sys.stderr)
     return 1
 
 
