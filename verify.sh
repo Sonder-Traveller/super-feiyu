@@ -50,6 +50,14 @@ check "生命周期测试 ($(grep -c '^\[PASS\]' /tmp/v_t2b.log) 项)" $?
 grep '^\[FAIL\]' /tmp/v_t2b.log || true
 
 echo
+echo "════════ 3c. 记忆测试 ════════"
+# 这一套曾长期不在 verify.sh 里，README 却报了它的项目数，
+# 属于「数出来的数字没有对应的执行」。现在和其它套件一样真跑。
+./build/test_memory > /tmp/v_t2c.log 2>&1
+check "记忆测试 ($(grep -c '^\[PASS\]' /tmp/v_t2c.log) 项)" $?
+grep '^\[FAIL\]' /tmp/v_t2c.log || true
+
+echo
 echo "════════ 4. 桩模式自检 ════════"
 ./build/super-feiyu --self-test > /tmp/v_t3.log 2>&1
 check "被动策略与流水线" $?

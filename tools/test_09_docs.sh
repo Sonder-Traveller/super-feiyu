@@ -15,7 +15,8 @@ echo "  实际: $(ps -o rss= -p $PID 2>/dev/null | awk '{printf "%.1f MB", $1/10
 
 echo "  README 说测试数:"
 grep -oE '[0-9]+ 项断言' README.md | head -1
-echo "  实际构建出的断言: 215（test_all 173 + protocol 24 + lifecycle 16 + e2e 2）"
+echo "  实际（现跑，不手抄）:"
+./tools/count_pass.sh 2>/dev/null | sed 's/^/    /'
 
 echo
 echo "════════ 9.2 文档里提到的文件是否存在"

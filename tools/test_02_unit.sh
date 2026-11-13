@@ -8,7 +8,9 @@ TOTAL_PASS=0
 TOTAL_FAIL=0
 FAILED_SUITES=()
 
-for t in test_all test_protocol test_lifecycle test_memory test_policy test_transport; do
+# 只跑不需要外部服务的套件；e2e 要 mock API，单独在 test_02b_e2e.sh 里跑。
+# 原列表含 test_policy / test_transport，两个文件早已删除，只剩「未构建」噪音。
+for t in test_all test_protocol test_lifecycle test_memory; do
   if [ ! -x "build/$t" ]; then
     echo "  $t: 未构建"
     FAILED_SUITES+=("$t(未构建)")
@@ -37,7 +39,7 @@ echo "  失败套件: ${FAILED_SUITES[*]:-无}"
 
 echo
 echo "════════ 2.3 每个套件的断言主题"
-for t in test_all test_protocol test_lifecycle test_memory test_policy test_transport; do
+for t in test_all test_protocol test_lifecycle test_memory; do
   [ -f "/tmp/t2_$t.log" ] || continue
   echo "  --- $t"
   grep -E '^=== ' "/tmp/t2_$t.log" | sed 's/^/      /' | head -20

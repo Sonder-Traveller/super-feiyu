@@ -31,7 +31,8 @@ done
 echo
 echo "════════ 1. 清理并按 build.sh 重新构建"
 rm -f build/test_all build/test_e2e build/test_protocol build/test_lifecycle
-rm -f build/test_memory build/test_policy build/test_transport  # 清掉残留
+rm -f build/test_memory
+rm -f build/test_policy build/test_transport  # 源文件已删，清掉历史残留
 ./build.sh > /tmp/build2.log 2>&1
 echo "  构建退出码: $?"
 ls build/test_* 2>/dev/null | sed 's/^/    /'
@@ -39,7 +40,7 @@ ls build/test_* 2>/dev/null | sed 's/^/    /'
 echo
 echo "════════ 2. 只跑实际构建出来的测试"
 TOTAL=0; FAILS=0
-for bin in build/test_all build/test_e2e build/test_protocol build/test_lifecycle; do
+for bin in build/test_all build/test_e2e build/test_protocol build/test_lifecycle build/test_memory; do
   [ -x "$bin" ] || { echo "  $bin 不存在"; continue; }
   name=$(basename "$bin")
   ./"$bin" > "/tmp/r_$name.log" 2>&1
