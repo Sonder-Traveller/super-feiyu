@@ -99,6 +99,7 @@ class StubEmbedding final : public fish::core::IEmbeddingModel {
 
 void test_working_memory() {
   std::printf("\n=== working memory ===\n");
+  // keep_rounds = 0 → 不限制，全部保留（按数量窗口由上层 token 预算控制）
   fish::memory::WorkingMemory wm(2);
   for (int i = 0; i < 5; ++i) {
     fish::memory::Message u, a;
@@ -110,37 +111,10 @@ void test_working_memory() {
     a.at = fish::core::Clock::now();
     wm.push(u, a);
   }
-  CHECK(wm.round_count() == 2, "keeps only max_rounds");
+  CHECK(wm.round_count() == 2, "keep_rounds=2 时只留最近 2 轮");
   auto snap = wm.snapshot();
   CHECK(snap.size() == 4, "2 rounds = 4 messages");
   CHECK(snap.front().text == "u3", "oldest evicted");
-}
-
-void test_decay_and_eviction() {
-  std::printf("\n=== forgetting ===\n");
-  const double w = fish::memory::Forgetting::decay(1.0, 30.0, 30.0);
-  CHECK(w > 0.49 && w < 0.51, "one half-life halves weight");
-  CHECK(fish::memory::Forgetting::decay(1.0, 0.0, 30.0) == 1.0, "no decay at zero");
-
-  fish::memory::Forgetting f(fish::memory::Forgetting::Params{30.0, 0.05});
-  std::vector<fish::memory::Fact> facts;
-  auto mk = [](const std::string& id, double conf, const std::string& sup) {
-    fish::memory::Fact x;
-    x.id = id;
-    x.content = id;
-    x.confidence = conf;
-    x.superseded_by = sup;
-    return x;
-  };
-  facts.push_back(mk("high", 0.95, ""));
-  facts.push_back(mk("done", 0.9, "other"));
-  auto evict = f.select_evictions(facts, 400.0);
-  CHECK(!evict.empty(), "very old facts evicted");
-  bool done_evicted = false;
-  for (const auto& id : evict) {
-    if (id == "done") done_evicted = true;
-  }
-  CHECK(!done_evicted, "superseded facts skip eviction");
 }
 
 void test_notes_roundtrip() {
@@ -296,8 +270,9 @@ void test_gather() {
 
   auto ctx = ms.gather("conv1", "猫");
   CHECK(ctx.ok(), "gather ok");
-  CHECK(ctx.ok() && !ctx.value->working.empty(), "includes working memory");
-  CHECK(ctx.ok() && !ctx.value->facts.empty(), "includes long-term facts");
+  CHECK(ctx.ok() && !ctx.value->working.empty(), "包含预算内的原文");
+  // 长时记忆不再预注入（模型用工具自检索），gather 只带原文 + 摘要
+  CHECK(ctx.ok() && ctx.value->summary.empty(), "初始无摘要");
 
   fs::remove_all(base);
 }
@@ -382,7 +357,6 @@ int main() {
   test_reply_budget();
   test_dedup();
   test_working_memory();
-  test_decay_and_eviction();
   test_notes_roundtrip();
   test_index_store();
   test_consolidation();

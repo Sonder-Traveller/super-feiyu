@@ -392,40 +392,36 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   }
 
   // 7. 记忆召回
+  // 7. 若原始对话超出 token 预算 → 把最早的压缩成摘要 + 落盘
+  //    触发条件是「超预算」，不是轮数。
+  if (deps_.memory != nullptr && deps_.consolidator != nullptr) {
+    if (deps_.memory->needs_compaction(msg.conversation_id)) {
+      auto c = deps_.memory->compact(msg.conversation_id, *deps_.consolidator);
+      if (!c.ok()) {
+        ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "compact_failed")
+            .field("detail", c.error.detail);
+      }
+    }
+  }
+
   fish::memory::MemoryContext mem_ctx;
   if (deps_.memory != nullptr) {
     auto g = deps_.memory->gather(msg.conversation_id, query);
     if (g.ok()) mem_ctx = std::move(*g.value);
   }
 
-  // 8. 提示词分层：历史 + 召回记忆
+  // 8. 提示词分层：摘要 + 预算内全量原文
   std::vector<fish::core::ContentBlock> history;
+  if (!mem_ctx.summary.empty()) {
+    fish::core::ContentBlock b;
+    b.kind = fish::core::BlockKind::kText;
+    b.text = "【更早的对话摘要】\n" + mem_ctx.summary;
+    history.push_back(std::move(b));
+  }
   for (const auto& m : mem_ctx.working) {
     fish::core::ContentBlock b;
     b.kind = fish::core::BlockKind::kText;
     b.text = (m.role == "user" ? "对方: " : "我: ") + m.text;
-    history.push_back(std::move(b));
-  }
-  if (!mem_ctx.traits_text.empty()) {
-    fish::core::ContentBlock b;
-    b.kind = fish::core::BlockKind::kText;
-    b.text = "【行为偏好】\n" + mem_ctx.traits_text;
-    history.push_back(std::move(b));
-  }
-  if (!mem_ctx.facts.empty()) {
-    std::string joined = "【记住的事】\n";
-    for (const auto& f : mem_ctx.facts) joined += "- " + f.content + "\n";
-    fish::core::ContentBlock b;
-    b.kind = fish::core::BlockKind::kText;
-    b.text = std::move(joined);
-    history.push_back(std::move(b));
-  }
-  if (!mem_ctx.episodes.empty()) {
-    std::string joined = "【相关往事】\n";
-    for (const auto& e : mem_ctx.episodes) joined += "- " + e.summary + "\n";
-    fish::core::ContentBlock b;
-    b.kind = fish::core::BlockKind::kText;
-    b.text = std::move(joined);
     history.push_back(std::move(b));
   }
 
@@ -457,13 +453,7 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     bot_msg.at = fish::core::Clock::now();
     deps_.memory->record(msg.conversation_id, user_msg, bot_msg);
 
-    if (deps_.consolidator != nullptr) {
-      auto c = deps_.memory->maybe_consolidate(msg.conversation_id, *deps_.consolidator);
-      if (!c.ok()) {
-        ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "consolidate_failed")
-            .field("detail", c.error.detail);
-      }
-    }
+    // 记忆压缩已在 gather 前由 needs_compaction()/compact() 处理
   }
 
   // 11-12. 组装出站，按预算逐条发送

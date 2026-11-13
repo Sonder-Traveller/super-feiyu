@@ -55,11 +55,24 @@ struct Trait {
 };
 
 struct MemoryContext {
-  std::vector<Message> working;
-  std::vector<Fact> facts;
-  std::vector<Episode> episodes;
-  std::string traits_text;
+  std::vector<Message> working;   // 预算内全量的最近原文
+  std::string summary;            // 更早内容的滚动摘要
+  std::size_t estimated_tokens{0};
 };
+
+// 估算 token：中文按 1 字≈1，英文按 4 字符≈1。粗略但够分配预算用。
+std::size_t estimate_tokens(const std::string& text);
+
+// 上下文预算：按模型窗口的百分比切分，取代固定轮数
+struct TokenBudget {
+  std::size_t total{0};
+  std::size_t raw_budget{0};      // 原文可用
+  std::size_t summary_budget{0};  // 摘要可用
+  std::size_t reserve{0};         // 留给回复与工具定义
+
+  static TokenBudget make(int model_context_tokens, double raw_ratio, double summary_ratio);
+};
+
 
 struct ConsolidateReport {
   int episodes_written{0};
@@ -145,6 +158,8 @@ class Consolidator {
   Consolidator(fish::core::IChatModel* chat, NotesStore* notes, IndexStore* index,
                fish::core::IEmbeddingModel* embedding);
   fish::core::Result<ConsolidateReport> consolidate(const std::vector<Message>& transcript);
+  // 把一段较早的对话压成摘要文本
+  fish::core::Result<std::string> summarize(const std::vector<Message>& transcript);
   static fish::core::Result<ConsolidateReport> apply_json(
       const std::string& json_text, const std::string& today, NotesStore* notes,
       IndexStore* index, fish::core::IEmbeddingModel* embedding);
@@ -156,34 +171,17 @@ class Consolidator {
   fish::core::IEmbeddingModel* embedding_;
 };
 
-// ── 遗忘 ────────────────────────────────────────────────
-class Forgetting {
- public:
-  struct Params {
-    double half_life_days{30.0};
-    double min_weight{0.05};
-  };
-  explicit Forgetting(Params p) : p_(p) {}
-  [[nodiscard]] static double decay(double importance, double days_since_use,
-                                    double half_life_days);
-  [[nodiscard]] std::vector<std::string> select_evictions(
-      const std::vector<Fact>& facts, double days_since_use) const;
-
- private:
-  Params p_;
-};
-
 // ── 统一门面 ────────────────────────────────────────────
 class MemorySystem {
  public:
   struct Config {
-    int working_rounds{20};
-    int consolidate_every{20};
-    int recall_top_k{5};
-    int episode_top_k{3};
+
+    // ── 上下文预算（按百分比分配，取代固定轮数）──
+    int model_context_tokens{131072};   // 模型窗口大小
+    double raw_context_ratio{0.40};     // 原文可占比例
+    double summary_ratio{0.25};         // 摘要可占余下部分的比例
     // 容量上限：超过就按权重淘汰（不是按时间）
-    int max_facts{2000};
-    int max_episodes{5000};
+
     std::string notes_dir{"data/memory/notes"};
     std::string db_path{"data/memory/index.db"};
   };
@@ -201,22 +199,23 @@ class MemorySystem {
   [[nodiscard]] int round_count(const std::string& conv_id) const;
   // 当前本地日期 yyyy-mm-dd（供外部做日期比较，也便于测试）
   [[nodiscard]] std::string today_public() const { return today(); }
-  [[nodiscard]] NotesStore& notes() { return notes_; }
+  void set_summary(const std::string& conv_id, std::string summary);
 
-  // 周期维护：按衰减权重淘汰旧记忆。由 runtime 定时调用（建议每天一次）。
-  struct MaintainReport {
-    int facts_before{0};
-    int facts_after{0};
-    int episodes_before{0};
-    int episodes_after{0};
-    int evicted_facts{0};
-    int evicted_episodes{0};
-    bool skipped{false};
+  // 是否超预算（按 token，不按轮数）
+  [[nodiscard]] bool needs_compaction(const std::string& conv_id) const;
+  // 超预算时：最早部分 → 摘要 + 落盘
+  core::Result<ConsolidateReport> compact(const std::string& conv_id,
+                                          Consolidator& consolidator);
+  // ── 供模型工具调用的检索 ──
+  // 模型自己决定查什么；返回命中的历史片段。
+  struct SearchHit {
+    std::string kind;     // "fact" / "episode"
+    std::string text;
+    double score{0.0};
   };
-  // 按容量淘汰：总量超过配额时，保留权重最高的 max_facts / max_episodes 条。
-  // 权重 = confidence × 时间衰减（越新越重要），所以不是单纯删最旧，
-  // 而是"又旧又不重要"的先走。
-  core::Result<MaintainReport> maintain(int max_facts, int max_episodes);
+  core::Result<std::vector<SearchHit>> search(const std::string& query, int limit);
+
+  [[nodiscard]] NotesStore& notes() { return notes_; }
   [[nodiscard]] IndexStore& index() { return index_; }
 
  private:
@@ -228,13 +227,60 @@ class MemorySystem {
   IndexStore index_;
   mutable std::mutex mu_;
   std::unordered_map<std::string, std::unique_ptr<WorkingMemory>> working_;
-  std::unordered_map<std::string, int> rounds_since_consolidate_;
+  std::unordered_map<std::string, std::string> summaries_;  // 滚动摘要
 };
 
 }  // namespace fish::memory
 
 // ═══ 实现 ═══════════════════════════════════════════════
 module :private;
+
+namespace fish::memory {
+
+std::size_t estimate_tokens(const std::string& text) {
+  if (text.empty()) return 0;
+  std::size_t ascii = 0;
+  std::size_t wide = 0;
+  for (std::size_t i = 0; i < text.size();) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    if (c < 0x80) {
+      ++ascii;
+      ++i;
+    } else {
+      std::size_t len = 1;
+      if ((c & 0xE0) == 0xC0) len = 2;
+      else if ((c & 0xF0) == 0xE0) len = 3;
+      else if ((c & 0xF8) == 0xF0) len = 4;
+      i += len;
+      ++wide;
+    }
+  }
+  const std::size_t ascii_tokens = ascii / 4 + (ascii % 4 ? 1 : 0);
+  return wide + ascii_tokens;
+}
+
+TokenBudget TokenBudget::make(int model_context_tokens, double raw_ratio,
+                              double summary_ratio) {
+  TokenBudget b;
+  if (model_context_tokens <= 0) return b;
+  b.total = static_cast<std::size_t>(model_context_tokens);
+
+  double rr = raw_ratio;
+  if (!(rr > 0.0)) rr = 0.40;
+  if (rr > 0.95) rr = 0.95;
+  b.raw_budget = static_cast<std::size_t>(static_cast<double>(b.total) * rr);
+
+  const std::size_t rest = b.total > b.raw_budget ? b.total - b.raw_budget : 0;
+  double sr = summary_ratio;
+  if (!(sr > 0.0)) sr = 0.0;
+  if (sr > 0.9) sr = 0.9;
+  b.summary_budget = static_cast<std::size_t>(static_cast<double>(rest) * sr);
+  b.reserve = rest > b.summary_budget ? rest - b.summary_budget : 0;
+  return b;
+}
+
+}  // namespace fish::memory
+
 
 namespace fs = std::filesystem;
 
@@ -339,14 +385,16 @@ constexpr const char* kConsolidatePrompt =
 
 // ── WorkingMemory ───────────────────────────────────────
 WorkingMemory::WorkingMemory(int max_rounds)
-    : max_rounds_(max_rounds <= 0 ? 1 : max_rounds) {}
+    : max_rounds_(max_rounds) {}   // <=0 表示不按轮数截断
 
 void WorkingMemory::push(const Message& user, const Message& assistant) {
   std::lock_guard<std::mutex> lock(mu_);
   msgs_.push_back(user);
   msgs_.push_back(assistant);
-  const std::size_t limit = static_cast<std::size_t>(max_rounds_) * 2;
-  while (msgs_.size() > limit) msgs_.pop_front();
+  if (max_rounds_ > 0) {
+    const std::size_t limit = static_cast<std::size_t>(max_rounds_) * 2;
+    while (msgs_.size() > limit) msgs_.pop_front();
+  }
 }
 
 std::vector<Message> WorkingMemory::snapshot() const {
@@ -374,8 +422,10 @@ void WorkingMemory::clear() {
 void WorkingMemory::restore(const std::vector<Message>& msgs) {
   std::lock_guard<std::mutex> lock(mu_);
   msgs_.assign(msgs.begin(), msgs.end());
-  const std::size_t limit = static_cast<std::size_t>(max_rounds_) * 2;
-  while (msgs_.size() > limit) msgs_.pop_front();
+  if (max_rounds_ > 0) {
+    const std::size_t limit = static_cast<std::size_t>(max_rounds_) * 2;
+    while (msgs_.size() > limit) msgs_.pop_front();
+  }
 }
 
 // ── NotesStore ──────────────────────────────────────────
@@ -839,6 +889,30 @@ Result<ConsolidateReport> Consolidator::consolidate(const std::vector<Message>& 
   return apply_json(json_extract(resp.value->text), date, notes_, index_, embedding_);
 }
 
+Result<std::string> Consolidator::summarize(const std::vector<Message>& transcript) {
+  if (transcript.empty()) return Result<std::string>::ok(std::string{});
+  if (chat_ == nullptr) {
+    return Result<std::string>::fail(ErrorCode::kInternal, "no_model");
+  }
+  std::ostringstream oss;
+  for (const auto& m : transcript) {
+    oss << (m.role == "user" ? "对方: " : "我: ") << m.text << "\n";
+  }
+  fish::core::IChatModel::Request req;
+  req.system_prompt =
+      "你把一段较早的聊天压成摘要，供之后接续对话时回忆。只保留聊过的话题、"
+      "对方透露的事实、约定或未完成的事。条目式中文，不超过 200 字。";
+  fish::core::ContentBlock b;
+  b.kind = fish::core::BlockKind::kText;
+  b.text = oss.str();
+  req.user_blocks.push_back(std::move(b));
+  req.max_tokens = 400;
+  req.temperature = 0.2;
+  auto r = chat_->complete(req);
+  if (!r.ok()) return Result<std::string>::fail(r.error.code, r.error.detail);
+  return Result<std::string>::ok(r.value->text);
+}
+
 Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
                                                    const std::string& today,
                                                    NotesStore* notes, IndexStore* index,
@@ -943,26 +1017,6 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
   return Result<ConsolidateReport>::ok(report);
 }
 
-// ── Forgetting ──────────────────────────────────────────
-double Forgetting::decay(double importance, double days_since_use, double half_life_days) {
-  if (half_life_days <= 0.0) return importance;
-  return importance * std::pow(0.5, days_since_use / half_life_days);
-}
-
-std::vector<std::string> Forgetting::select_evictions(const std::vector<Fact>& facts,
-                                                      double days_since_use) const {
-  std::vector<std::pair<double, std::string>> scored;
-  for (const auto& f : facts) {
-    if (!f.superseded_by.empty()) continue;
-    const double w = decay(f.confidence, days_since_use, p_.half_life_days);
-    if (w < p_.min_weight) scored.emplace_back(w, f.id);
-  }
-  std::sort(scored.begin(), scored.end());
-  std::vector<std::string> ids;
-  for (const auto& pr : scored) ids.push_back(pr.second);
-  return ids;
-}
-
 // ── MemorySystem ────────────────────────────────────────
 MemorySystem::MemorySystem(Config cfg, fish::core::IEmbeddingModel* embedding)
     : cfg_(std::move(cfg)),
@@ -1017,135 +1071,6 @@ Error MemorySystem::init() {
   return Error::none();
 }
 
-Result<MemorySystem::MaintainReport> MemorySystem::maintain(int max_facts,
-                                                         int max_episodes) {
-  MaintainReport rep;
-
-  // 权重 = confidence × 0.5^(age_days / half_life)
-  // 为什么不是单纯按时间删：一条三个月前但置信度很高的事实，
-  // 比一条昨天随口说的更该留下。时间衰减只作为排序因子，不单独构成删除条件。
-  constexpr double kHalfLifeDays = 30.0;
-  const std::string now_day = today();
-
-  auto day_diff = [](const std::string& from, const std::string& to) -> double {
-    std::tm a{}, b{};
-    if (std::sscanf(from.c_str(), "%d-%d-%d", &a.tm_year, &a.tm_mon, &a.tm_mday) != 3) {
-      return 0.0;
-    }
-    if (std::sscanf(to.c_str(), "%d-%d-%d", &b.tm_year, &b.tm_mon, &b.tm_mday) != 3) {
-      return 0.0;
-    }
-    a.tm_year -= 1900;
-    a.tm_mon -= 1;
-    b.tm_year -= 1900;
-    b.tm_mon -= 1;
-    const std::time_t ta = std::mktime(&a);
-    const std::time_t tb = std::mktime(&b);
-    if (ta < 0 || tb < 0) return 0.0;
-    const double d = std::difftime(tb, ta) / 86400.0;
-    return d < 0.0 ? 0.0 : d;  // 未来日期按 0 处理
-  };
-
-  // ── 事实 ──
-  auto facts_r = notes_.load_facts();
-  if (!facts_r.ok()) {
-    return Result<MaintainReport>::fail(facts_r.error.code, facts_r.error.detail);
-  }
-  std::vector<Fact> facts = std::move(*facts_r.value);
-  rep.facts_before = static_cast<int>(facts.size());
-
-  if (max_facts > 0 && static_cast<int>(facts.size()) > max_facts) {
-    // 已被取代的条目单独处理：不参与权重竞争，直接随其替代者去留
-    std::vector<std::pair<double, std::size_t>> ranked;
-    ranked.reserve(facts.size());
-    for (std::size_t i = 0; i < facts.size(); ++i) {
-      const double age = day_diff(facts[i].created, now_day);
-      const double w = facts[i].confidence * std::pow(0.5, age / kHalfLifeDays);
-      ranked.emplace_back(w, i);
-    }
-    // 权重高的在前
-    std::sort(ranked.begin(), ranked.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    std::vector<bool> keep(facts.size(), false);
-    for (int i = 0; i < max_facts && i < static_cast<int>(ranked.size()); ++i) {
-      keep[ranked[static_cast<std::size_t>(i)].second] = true;
-    }
-
-    std::vector<Fact> kept;
-    kept.reserve(static_cast<std::size_t>(max_facts));
-    for (std::size_t i = 0; i < facts.size(); ++i) {
-      if (keep[i]) {
-        kept.push_back(std::move(facts[i]));
-      } else {
-        index_.remove_item("fact", facts[i].id);
-        ++rep.evicted_facts;
-      }
-    }
-    if (!kept.empty() || rep.evicted_facts > 0) {
-      auto e = notes_.rewrite_facts(kept);
-      if (!e.ok()) {
-        return Result<MaintainReport>::fail(e.code, e.detail);
-      }
-    }
-    facts = std::move(kept);
-  }
-  rep.facts_after = static_cast<int>(facts.size());
-
-  // ── 情景 ──
-  auto eps_r = notes_.load_episodes(240);
-  if (eps_r.ok()) {
-    std::vector<Episode> eps = std::move(*eps_r.value);
-    rep.episodes_before = static_cast<int>(eps.size());
-
-    if (max_episodes > 0 && static_cast<int>(eps.size()) > max_episodes) {
-      std::vector<std::pair<double, std::size_t>> ranked;
-      ranked.reserve(eps.size());
-      for (std::size_t i = 0; i < eps.size(); ++i) {
-        const double age = day_diff(eps[i].created, now_day);
-        const double w = eps[i].importance * std::pow(0.5, age / kHalfLifeDays);
-        ranked.emplace_back(w, i);
-      }
-      std::sort(ranked.begin(), ranked.end(),
-                [](const auto& a, const auto& b) { return a.first > b.first; });
-
-      std::vector<bool> keep(eps.size(), false);
-      for (int i = 0; i < max_episodes && i < static_cast<int>(ranked.size()); ++i) {
-        keep[ranked[static_cast<std::size_t>(i)].second] = true;
-      }
-
-      std::vector<Episode> kept;
-      kept.reserve(static_cast<std::size_t>(max_episodes));
-      for (std::size_t i = 0; i < eps.size(); ++i) {
-        if (keep[i]) {
-          kept.push_back(std::move(eps[i]));
-        } else {
-          index_.remove_item("episode", eps[i].id);
-          ++rep.evicted_episodes;
-        }
-      }
-      if (rep.evicted_episodes > 0) {
-        notes_.rewrite_episodes(kept);
-      }
-      eps = std::move(kept);
-    }
-    rep.episodes_after = static_cast<int>(eps.size());
-  }
-
-  if (rep.evicted_facts > 0 || rep.evicted_episodes > 0) {
-    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "capacity_evicted")
-        .field("facts_before", rep.facts_before)
-        .field("facts_after", rep.facts_after)
-        .field("episodes_before", rep.episodes_before)
-        .field("episodes_after", rep.episodes_after)
-        .field("evicted_facts", rep.evicted_facts)
-        .field("evicted_episodes", rep.evicted_episodes);
-  } else {
-    rep.skipped = true;
-  }
-
-  return Result<MaintainReport>::ok(rep);
-}
 
 std::string MemorySystem::today() const {
   const auto t = fish::core::Clock::to_time_t(fish::core::Clock::now());
@@ -1161,10 +1086,167 @@ Error MemorySystem::record(const std::string& conv_id, const Message& user,
                            const Message& assistant) {
   std::lock_guard<std::mutex> lock(mu_);
   auto& wm = working_[conv_id];
-  if (!wm) wm = std::make_unique<WorkingMemory>(cfg_.working_rounds);
+  if (!wm) wm = std::make_unique<WorkingMemory>(0);   // 0 = 不按轮数截断
   wm->push(user, assistant);
-  ++rounds_since_consolidate_[conv_id];
   return Error::none();
+}
+
+bool MemorySystem::needs_compaction(const std::string& conv_id) const {
+  std::vector<Message> all;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = working_.find(conv_id);
+    if (it == working_.end()) return false;
+    all = it->second->snapshot();
+  }
+  const auto budget = TokenBudget::make(cfg_.model_context_tokens, cfg_.raw_context_ratio,
+                                        cfg_.summary_ratio);
+  if (budget.raw_budget == 0) return false;
+
+  std::size_t total = 0;
+  for (const auto& m : all) total += estimate_tokens(m.text) + 8;
+  return total > budget.raw_budget;
+}
+
+Result<ConsolidateReport> MemorySystem::compact(const std::string& conv_id,
+                                                Consolidator& consolidator) {
+  std::vector<Message> all;
+  std::string old_summary;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = working_.find(conv_id);
+    if (it == working_.end() || it->second->round_count() == 0) {
+      ConsolidateReport r;
+      r.skipped = true;
+      r.reason = "no_working_memory";
+      return Result<ConsolidateReport>::ok(r);
+    }
+    all = it->second->snapshot();
+    auto sit = summaries_.find(conv_id);
+    if (sit != summaries_.end()) old_summary = sit->second;
+  }
+
+  const auto budget = TokenBudget::make(cfg_.model_context_tokens, cfg_.raw_context_ratio,
+                                        cfg_.summary_ratio);
+
+  // 从最新往回收，留下能放进预算的部分；更早的进入压缩集合
+  std::size_t used = 0;
+  std::size_t keep_from = all.size();
+  for (std::size_t i = all.size(); i > 0; --i) {
+    const std::size_t t = estimate_tokens(all[i - 1].text) + 8;
+    if (budget.raw_budget > 0 && used + t > budget.raw_budget && keep_from < all.size()) break;
+    used += t;
+    keep_from = i - 1;
+  }
+
+  if (keep_from == 0) {
+    ConsolidateReport r;
+    r.skipped = true;
+    r.reason = "under_budget";
+    return Result<ConsolidateReport>::ok(r);
+  }
+
+  std::vector<Message> to_compact(all.begin(),
+                                  all.begin() + static_cast<std::ptrdiff_t>(keep_from));
+  std::vector<Message> to_keep(all.begin() + static_cast<std::ptrdiff_t>(keep_from),
+                               all.end());
+
+  // 生成滚动摘要（把旧摘要一起喂进去，保证连贯）
+  std::vector<Message> sum_input;
+  if (!old_summary.empty()) {
+    Message prev;
+    prev.role = "assistant";
+    prev.text = "[更早的摘要] " + old_summary;
+    sum_input.push_back(std::move(prev));
+  }
+  sum_input.insert(sum_input.end(), to_compact.begin(), to_compact.end());
+
+  std::string new_summary = old_summary;
+  if (auto sr = consolidator.summarize(sum_input); sr.ok() && !sr.value->empty()) {
+    new_summary = std::move(*sr.value);
+  } else {
+    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory", "summarize_failed");
+  }
+
+  // 原文落盘为情景记忆（不丢），并建索引供将来检索
+  std::string transcript_text;
+  for (const auto& m : to_compact) {
+    transcript_text += (m.role == "user" ? "对方: " : "我: ") + m.text + "\n";
+  }
+  if (!transcript_text.empty()) {
+    Episode ep;
+    ep.id = "e" + std::to_string(
+                      std::hash<std::string>{}(transcript_text) & 0xFFFFFFFFFFFFULL);
+    ep.summary = transcript_text;
+    ep.created = today();
+    notes_.append_episode(ep);
+    if (embedding_ != nullptr) {
+      if (auto v = embedding_->embed(transcript_text); v.ok()) {
+        index_.upsert_item("episode", ep.id, transcript_text, *v.value);
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    summaries_[conv_id] = new_summary;
+    auto it = working_.find(conv_id);
+    if (it != working_.end() && it->second) it->second->restore(to_keep);
+  }
+
+  ConsolidateReport rep;
+  rep.episodes_written = 1;
+  ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "compacted")
+      .field("compacted_msgs", static_cast<long long>(to_compact.size()))
+      .field("kept_msgs", static_cast<long long>(to_keep.size()));
+  return Result<ConsolidateReport>::ok(rep);
+}
+
+Result<std::vector<MemorySystem::SearchHit>> MemorySystem::search(const std::string& query,
+                                                                 int limit) {
+  std::vector<SearchHit> out;
+  if (query.empty()) return Result<std::vector<SearchHit>>::ok(std::move(out));
+
+  const std::size_t cap = limit > 0 ? static_cast<std::size_t>(limit) : std::numeric_limits<std::size_t>::max();
+
+  // 向量路（若配了 embedding）
+  if (embedding_ != nullptr) {
+    if (auto v = embedding_->embed(query); v.ok()) {
+      if (auto hits = index_.search(*v.value, static_cast<int>(cap)); hits.ok()) {
+        for (const auto& h : *hits.value) {
+          SearchHit sh;
+          sh.kind = h.kind;
+          sh.text = h.text;
+          sh.score = h.score;
+          out.push_back(std::move(sh));
+        }
+      }
+    }
+  }
+
+  // 关键词路补足（向量不可用时也能用）
+  if (out.size() < cap) {
+    if (auto kw = index_.search_text(query, static_cast<int>(cap)); kw.ok()) {
+      for (const auto& h : *kw.value) {
+        if (out.size() >= cap) break;
+        const bool dup = std::any_of(out.begin(), out.end(),
+                                     [&](const SearchHit& x) { return x.text == h.text; });
+        if (dup) continue;
+        SearchHit sh;
+        sh.kind = h.kind;
+        sh.text = h.text;
+        sh.score = 0.0;
+        out.push_back(std::move(sh));
+      }
+    }
+  }
+
+  return Result<std::vector<SearchHit>>::ok(std::move(out));
+}
+
+void MemorySystem::set_summary(const std::string& conv_id, std::string summary) {
+  std::lock_guard<std::mutex> lock(mu_);
+  summaries_[conv_id] = std::move(summary);
 }
 
 int MemorySystem::round_count(const std::string& conv_id) const {
@@ -1175,109 +1257,39 @@ int MemorySystem::round_count(const std::string& conv_id) const {
 }
 
 Result<MemoryContext> MemorySystem::gather(const std::string& conv_id,
-                                           const std::string& query) {
+                                           const std::string& /*query*/) {
   MemoryContext ctx;
 
+  std::vector<Message> all;
+  std::string summary;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = working_.find(conv_id);
-    if (it != working_.end()) ctx.working = it->second->snapshot();
+    if (it != working_.end()) all = it->second->snapshot();
+    auto sit = summaries_.find(conv_id);
+    if (sit != summaries_.end()) summary = sit->second;
   }
 
-  // L3c 程序记忆：证据 >= 3 才注入
-  auto traits = notes_.load_traits();
-  if (traits.ok()) {
-    std::string text;
-    for (const auto& t : *traits.value) {
-      if (t.evidence < 3) continue;
-      text += "- " + t.pattern + "\n";
-    }
-    ctx.traits_text = text;
+  if (all.empty() && summary.empty()) return Result<MemoryContext>::ok(std::move(ctx));
+
+  // 按 token 预算决定最近多少原文能全量放进去（从最新往回收）
+  const auto budget = TokenBudget::make(cfg_.model_context_tokens, cfg_.raw_context_ratio,
+                                        cfg_.summary_ratio);
+
+  std::vector<Message> picked;
+  std::size_t used = 0;
+  for (auto it = all.rbegin(); it != all.rend(); ++it) {
+    const std::size_t t = estimate_tokens(it->text) + 8;
+    if (budget.raw_budget > 0 && used + t > budget.raw_budget && !picked.empty()) break;
+    used += t;
+    picked.push_back(*it);
   }
+  std::reverse(picked.begin(), picked.end());
 
-  if (embedding_ == nullptr || query.empty()) {
-    return Result<MemoryContext>::ok(std::move(ctx));
-  }
-
-  const std::string kw_query = query.substr(0, std::min<std::size_t>(query.size(), 20));
-
-  auto query_vec = embedding_->embed(query);
-  if (!query_vec.ok()) {
-    // 向量失败 → 退化关键词召回，不阻断
-    auto kw = index_.search_text(kw_query, 8);
-    if (kw.ok()) {
-      for (const auto& h : *kw.value) {
-        if (h.kind == "fact" && static_cast<int>(ctx.facts.size()) < cfg_.recall_top_k) {
-          Fact f;
-          f.id = h.id;
-          f.content = h.text;
-          ctx.facts.push_back(std::move(f));
-        }
-      }
-    }
-    return Result<MemoryContext>::ok(std::move(ctx));
-  }
-
-  // 三路：向量 + 关键词，RRF 融合
-  auto vec_hits = index_.search(*query_vec.value, 20);
-  auto kw_hits = index_.search_text(kw_query, 20);
-
-  constexpr double kRrf = 60.0;
-  std::unordered_map<std::string, std::pair<double, IndexStore::Hit>> fused;
-  auto accumulate = [&](const std::vector<IndexStore::Hit>& hits) {
-    for (std::size_t r = 0; r < hits.size(); ++r) {
-      const std::string key = hits[r].kind + "/" + hits[r].id;
-      fused[key].first += 1.0 / (kRrf + static_cast<double>(r + 1));
-      fused[key].second = hits[r];
-    }
-  };
-  if (vec_hits.ok()) accumulate(*vec_hits.value);
-  if (kw_hits.ok()) accumulate(*kw_hits.value);
-
-  std::vector<std::pair<double, IndexStore::Hit>> ranked;
-  ranked.reserve(fused.size());
-  for (auto& pr : fused) ranked.emplace_back(pr.second.first, pr.second.second);
-  std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.first > b.first; });
-
-  for (const auto& pr : ranked) {
-    const auto& hit = pr.second;
-    if (hit.kind == "fact" && static_cast<int>(ctx.facts.size()) < cfg_.recall_top_k) {
-      Fact f;
-      f.id = hit.id;
-      f.content = hit.text;
-      ctx.facts.push_back(std::move(f));
-    } else if (hit.kind == "episode" &&
-               static_cast<int>(ctx.episodes.size()) < cfg_.episode_top_k) {
-      Episode e;
-      e.id = hit.id;
-      e.summary = hit.text;
-      ctx.episodes.push_back(std::move(e));
-    }
-    if (static_cast<int>(ctx.facts.size()) >= cfg_.recall_top_k &&
-        static_cast<int>(ctx.episodes.size()) >= cfg_.episode_top_k) {
-      break;
-    }
-  }
-
+  ctx.working = std::move(picked);
+  ctx.summary = std::move(summary);
+  ctx.estimated_tokens = used + estimate_tokens(ctx.summary);
   return Result<MemoryContext>::ok(std::move(ctx));
-}
-
-Result<ConsolidateReport> MemorySystem::maybe_consolidate(const std::string& conv_id,
-                                                          Consolidator& consolidator) {
-  bool should = false;
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    auto it = rounds_since_consolidate_.find(conv_id);
-    should = it != rounds_since_consolidate_.end() && it->second >= cfg_.consolidate_every;
-  }
-  if (!should) {
-    ConsolidateReport r;
-    r.skipped = true;
-    r.reason = "not_due";
-    return Result<ConsolidateReport>::ok(r);
-  }
-  return force_consolidate(conv_id, consolidator);
 }
 
 Result<ConsolidateReport> MemorySystem::force_consolidate(const std::string& conv_id,
@@ -1293,7 +1305,6 @@ Result<ConsolidateReport> MemorySystem::force_consolidate(const std::string& con
       return Result<ConsolidateReport>::ok(r);
     }
     transcript = it->second->take_all();
-    rounds_since_consolidate_[conv_id] = 0;
   }
 
   auto result = consolidator.consolidate(transcript);
@@ -1301,9 +1312,8 @@ Result<ConsolidateReport> MemorySystem::force_consolidate(const std::string& con
     // 失败恢复，避免丢记忆；下轮立即重试
     std::lock_guard<std::mutex> lock(mu_);
     auto& wm = working_[conv_id];
-    if (!wm) wm = std::make_unique<WorkingMemory>(cfg_.working_rounds);
+    if (!wm) wm = std::make_unique<WorkingMemory>(0);
     wm->restore(transcript);
-    rounds_since_consolidate_[conv_id] = cfg_.consolidate_every;
     ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory",
                           "consolidate_failed_restored")
         .field("detail", result.error.detail);

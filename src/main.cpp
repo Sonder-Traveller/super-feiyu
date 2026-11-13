@@ -255,12 +255,10 @@ int main(int argc, char** argv) {
 
   // ── 记忆 ──
   fish::memory::MemorySystem::Config mem_cfg;
-  mem_cfg.working_rounds = static_cast<int>(cfg.get_int_or("memory.working_rounds", 20));
-  mem_cfg.consolidate_every = static_cast<int>(cfg.get_int_or("memory.consolidate_every", 20));
-  mem_cfg.recall_top_k = static_cast<int>(cfg.get_int_or("memory.recall_top_k", 5));
-  mem_cfg.episode_top_k = static_cast<int>(cfg.get_int_or("memory.episode_top_k", 3));
-  mem_cfg.max_facts = static_cast<int>(cfg.get_int_or("memory.max_facts", 2000));
-  mem_cfg.max_episodes = static_cast<int>(cfg.get_int_or("memory.max_episodes", 5000));
+  mem_cfg.model_context_tokens =
+      static_cast<int>(cfg.get_int_or("memory.model_context_tokens", 131072));
+  mem_cfg.raw_context_ratio = cfg.get_double_or("memory.raw_context_ratio", 0.40);
+  mem_cfg.summary_ratio = cfg.get_double_or("memory.summary_ratio", 0.25);
   mem_cfg.notes_dir = cfg.get_or("memory.notes_dir", "data/memory/notes");
   mem_cfg.db_path = cfg.get_or("memory.db_path", "data/memory/index.db");
 
@@ -441,16 +439,6 @@ int main(int argc, char** argv) {
     // 每 60 秒：清理预算/去重表（否则长期运行会缓慢增长）
     if (++tick % 300 == 0) {
       pipeline.maintenance();
-    }
-
-    // 每 5 分钟检查一次容量：超配额就按权重淘汰到配额内
-    if (++mem_ticks % 1500 == 0 && mem_ticks > 0) {
-      auto mr = memory_sys.maintain(mem_cfg.max_facts, mem_cfg.max_episodes);
-      if (mr.ok() && !mr.value->skipped) {
-        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "memory_evicted")
-            .field("facts", static_cast<long long>(mr.value->facts_after))
-            .field("episodes", static_cast<long long>(mr.value->episodes_after));
-      }
     }
 
     if (tick % 300 == 0) {  // 每 60 秒

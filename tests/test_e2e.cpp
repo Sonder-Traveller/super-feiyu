@@ -53,8 +53,6 @@ int main(int argc, char** argv) {
   auto emb = std::move(*emb_r.value);
 
   fish::memory::MemorySystem::Config mc;
-  mc.working_rounds = 20;
-  mc.consolidate_every = 2;  // 低阈值，便于测试
   mc.notes_dir = cfg.get_or("memory.notes_dir", "/tmp/fish_e2e/notes");
   mc.db_path = cfg.get_or("memory.db_path", "/tmp/fish_e2e/i.db");
 
@@ -84,13 +82,14 @@ int main(int argc, char** argv) {
     a.at = fish::core::Clock::now();
     mem.record(conv, u, a);
 
-    auto c = mem.maybe_consolidate(conv, consolidator);
-    if (!c.ok()) {
-      std::printf("[warn] consolidate failed: %s\n", c.error.detail.c_str());
-    } else if (!c.value->skipped) {
-      std::printf("  巩固触发: episodes=%d facts=%d traits=%d\n",
-                  c.value->episodes_written, c.value->facts_written,
-                  c.value->traits_updated);
+    // 超预算时压缩（按 token，不按轮数）
+    if (mem.needs_compaction(conv)) {
+      auto c = mem.compact(conv, consolidator);
+      if (!c.ok()) {
+        std::printf("[warn] compact failed: %s\n", c.error.detail.c_str());
+      } else if (!c.value->skipped) {
+        std::printf("  压缩触发: episodes=%d\n", c.value->episodes_written);
+      }
     }
   }
 
