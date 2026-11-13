@@ -103,9 +103,13 @@ class AccountPool:
                 name = (data.get("account") or {}).get("nickname") or f.stem[:8]
                 accounts.append(Account(region, name, token, domain))
 
-        # 区域优先级排序
+        # 区域过滤：指定 cn / global 时只保留该区域的账号。
+        # 早期版本只做「排序偏好」，轮询仍会轮到 global，导致
+        # 11128 request illegal（设备指纹拦截）污染整个请求。
         if self.prefer_region in ("cn", "global"):
-            accounts.sort(key=lambda a: 0 if a.region == self.prefer_region else 1)
+            only = [a for a in accounts if a.region == self.prefer_region]
+            if only:
+                accounts = only
 
         with self._lock:
             self.accounts = accounts

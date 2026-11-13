@@ -1,0 +1,55 @@
+FROM ubuntu:24.04
+
+# super-feiyu 构建环境（与线上服务器 ABI 一致：Ubuntu 24.04 / glibc 2.39）
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+      clang lld libsqlite3-dev nlohmann-json3-dev \
+      libssl-dev zlib1g-dev libzstd-dev libnghttp2-dev libidn2-dev \
+      libpsl-dev libbrotli-dev libunistring-dev libgnutls28-dev libgmp-dev \
+      libsasl2-dev libkrb5-dev libp11-kit-dev libtasn1-6-dev \
+      libkeyutils-dev libgssapi-krb5-2 libffi-dev \
+      ca-certificates pkg-config curl git make && \
+    rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 自带的 libcurl 是 8.5.0，**不支持 WebSocket**（需要 8.10+）。
+# 项目用 libcurl 的原生 WS（CURLOPT_CONNECT_ONLY=2 + curl_ws_send/recv），
+# 所以必须在容器里自己编一个带 WS 支持的 libcurl。
+# 用 --disable-everything 精简，只留项目实际需要的：HTTP(S) + WS。
+RUN cd /tmp && \
+    curl -sSL https://curl.se/download/curl-8.11.1.tar.gz -o curl.tar.gz && \
+    tar xzf curl.tar.gz && cd curl-8.11.1 && \
+    ./configure \
+      --prefix=/usr/local \
+      --with-openssl \
+      --with-zlib \
+      --with-zstd \
+      --with-nghttp2 \
+      --with-brotli \
+      --disable-ldap \
+      --disable-ldaps \
+      --disable-rtsp \
+      --disable-dict \
+      --disable-telnet \
+      --disable-tftp \
+      --disable-pop3 \
+      --disable-imap \
+      --disable-smb \
+      --disable-smtp \
+      --disable-gopher \
+      --disable-mqtt \
+      --disable-manual \
+      --enable-shared \
+      --enable-static \
+      >/dev/null && \
+    make -j"$(nproc)" >/dev/null && \
+    make install >/dev/null && \
+    ldconfig && \
+    cd /tmp && rm -rf curl-8.11.1 curl.tar.gz && \
+    /usr/local/bin/curl --version | head -2
+
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+WORKDIR /src

@@ -1,8 +1,17 @@
 # 构建产物
 build/
 build-*/
+build-docker/
 out/
 cmake-build-*/
+
+# 二维码 / 绑定日志（含临时凭据痕迹）
+.qq_*.png
+.qq_*.log
+.qq_*.err
+.bridge.log
+.bridge.err
+*.live.log
 
 # 编译中间文件
 *.o
