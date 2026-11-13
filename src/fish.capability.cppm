@@ -88,8 +88,14 @@ struct ChatConfig {
   std::string base_url{"https://api.deepseek.com"};
   std::string api_key;
   std::string model{"deepseek-flash"};
-  int max_tokens{512};
-  double temperature{1.0};
+  // 0 / 负数 = 不发送该字段，让上游用自己的默认值。
+  // 不主动设上限：模型该输出多长、多随机，交给上游和提示词决定。
+  int max_tokens{0};
+  double temperature{-1.0};
+  // 思考强度：low / medium / high / xhigh / max。
+  // 空字符串 = 不发 reasoning_effort，用上游默认档。
+  // 上游若不支持这个字段会直接忽略，不会报错。
+  std::string reasoning_effort;
   int timeout_ms{30000};
 
   // 上游是否支持「assistant 角色消息里带图片」。
@@ -379,8 +385,17 @@ class HttpChat final : public fish::core::IChatModel {
   Result<Response> complete(const Request& req) override {
     json payload;
     payload["model"] = cfg_.model;
-    payload["max_tokens"] = req.max_tokens > 0 ? req.max_tokens : cfg_.max_tokens;
-    payload["temperature"] = req.temperature >= 0 ? req.temperature : cfg_.temperature;
+    // max_tokens / temperature：配置里没写就不发，让上游用默认值。
+    // 早期无条件发 512，等于替上游设了一个它没要求的输出上限。
+    const int want_max = req.max_tokens > 0 ? req.max_tokens : cfg_.max_tokens;
+    if (want_max > 0) payload["max_tokens"] = want_max;
+    const double want_temp =
+        req.temperature >= 0 ? req.temperature : cfg_.temperature;
+    if (want_temp >= 0) payload["temperature"] = want_temp;
+    // 思考强度：配置里写了才发。上游不认这个字段会忽略，不会 400。
+    if (!cfg_.reasoning_effort.empty()) {
+      payload["reasoning_effort"] = cfg_.reasoning_effort;
+    }
 
     json msgs = json::array();
     if (dial_ == Dialect::kOpenAI) {
@@ -1684,8 +1699,10 @@ ChatConfig load_chat_config(const fish::config::Config& c) {
   cfg.base_url = c.get_or("capability.chat.base_url", "https://api.deepseek.com");
   cfg.api_key = c.get_or("capability.chat.api_key", "");
   cfg.model = c.get_or("capability.chat.model", "deepseek-flash");
-  cfg.max_tokens = static_cast<int>(c.get_int_or("capability.chat.max_tokens", 512));
-  cfg.temperature = c.get_double_or("capability.chat.temperature", 1.0);
+  // 0 / 负数 = 不发该字段，用上游默认值
+  cfg.max_tokens = static_cast<int>(c.get_int_or("capability.chat.max_tokens", 0));
+  cfg.temperature = c.get_double_or("capability.chat.temperature", -1.0);
+  cfg.reasoning_effort = c.get_or("capability.chat.reasoning_effort", "");
   cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.chat.timeout_ms", 30000));
   // supports_assistant_image 不在这里读配置：
   // 由 fish.probe 探测后由 main 注入，避免配置过时。

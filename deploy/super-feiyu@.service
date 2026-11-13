@@ -12,7 +12,10 @@ Type=simple
 User=%i
 Group=%i
 WorkingDirectory=/home/%i/super-feiyu
-EnvironmentFile=/home/%i/super-feiyu/.env
+# 密钥文件。实际密钥放 .env.local（已在 .gitignore 里）；
+# .env 只是模板，变量默认全被注释掉，读它会导致缺 key 启动失败。
+EnvironmentFile=-/home/%i/super-feiyu/.env.local
+EnvironmentFile=-/home/%i/super-feiyu/.env
 Environment=LD_LIBRARY_PATH=/home/%i/local/lib
 ExecStart=/home/%i/super-feiyu/build/super-feiyu --config /home/%i/super-feiyu/config.toml
 Restart=always

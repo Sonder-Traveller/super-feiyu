@@ -709,12 +709,17 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   // 模型输出 "[PHOTO]" 时，用户实际看到的是「喏」+ 一张图；
   // 若把剥离后的空 reply_text 存进去，下一轮模型就不知道自己发过图，
   // 会说出「我看不到自己发出去的东西」这种话。
+  //
+  // 标记格式必须让模型**无法当成台词模仿**：
+  // 早期用 "[发了一张自己的照片]"，结果模型把它当输出格式照抄，
+  // 在正文里写出「再试一次。[发了一张自己的照片]」这种动作描写。
+  // 改成「（附了一张图）」这种圆括号旁注 + 明确「这不是台词」的措辞。
   std::string remembered_reply = reply_text;
   if (wants_photo) {
     if (remembered_reply.empty()) remembered_reply = "喏";
     remembered_reply += photo_spec.empty()
-                            ? " [发了一张自己的照片]"
-                            : " [发了一张照片：" + photo_spec + "]";
+                            ? "（系统附了一张图）"
+                            : "（系统附了一张图：" + photo_spec + "）";
   }
 
   // 出站图片的本地路径，稍后一起写进记忆。

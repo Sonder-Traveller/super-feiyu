@@ -274,9 +274,24 @@ class Handler(BaseHTTPRequestHandler):
             "model": req.get("model") or DEFAULT_MODEL,
             "messages": req.get("messages") or [],
         }
-        for key in ("temperature", "top_p", "max_tokens"):
+        # 透传采样与推理相关字段。
+        # reasoning_effort 曾经被丢在这里，导致上游永远用默认档位，
+        # 调用方设 high 也毫无效果。
+        for key in (
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "reasoning_effort",
+            "thinking",
+            "tool_choice",
+            "stop",
+        ):
             if key in req:
                 payload[key] = req[key]
+        # tools 单独处理：上游要求有 tools 时必须显式给 tool_choice
+        if req.get("tools"):
+            payload["tools"] = req["tools"]
+            payload.setdefault("tool_choice", "auto")
 
         # 多账号重试：失败就换下一个
         tried: set[str] = set()

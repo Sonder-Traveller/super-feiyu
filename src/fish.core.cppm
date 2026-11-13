@@ -159,8 +159,9 @@ class IChatModel {
     std::string system_prompt;
     std::vector<ContentBlock> history;
     std::vector<ContentBlock> user_blocks;
-    int max_tokens{512};
-    double temperature{1.0};
+    // 0 / 负数 = 不发送该字段，由 provider 配置或上游默认值决定
+    int max_tokens{0};
+    double temperature{-1.0};
     // 可用工具的 OpenAI tools JSON 数组（空 = 不启用工具）
     std::string tools_json;
   };
