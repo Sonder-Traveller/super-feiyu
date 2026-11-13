@@ -39,6 +39,8 @@ build.ninja
 .env.*
 !.env.example
 config.local.json
+# 本地实际配置（含部署地址等环境信息），示例见 config.example.toml
+config.toml
 secrets*.json
 
 # 运行时数据

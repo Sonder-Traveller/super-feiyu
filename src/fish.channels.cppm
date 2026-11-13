@@ -402,6 +402,11 @@ Error QQOfficialChannel::connect() {
 
   auto ws = std::make_unique<fish::qq_ws::Client>(wc);
   ws->on_event([this](const fish::qq_ws::Event& ev) {
+    ::fish::log::log_line(::fish::log::LogLevel::kDebug, "qq", "event_in")
+        .field("type", ev.type)
+        .field("content_len", static_cast<long long>(ev.content.size()))
+        .field("attachments", static_cast<long long>(ev.attachments.size()));
+
     fish::core::InboundMessage msg;
     msg.channel = fish::core::Channel::kQQ;
     msg.kind = ev.is_group ? fish::core::ChatKind::kGroup : fish::core::ChatKind::kPrivate;

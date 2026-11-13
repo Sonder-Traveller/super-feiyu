@@ -6,6 +6,7 @@ module;
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -90,6 +91,15 @@ struct ChatConfig {
   int max_tokens{512};
   double temperature{1.0};
   int timeout_ms{30000};
+
+  // 上游是否支持「assistant 角色消息里带图片」。
+  //
+  // 这个值**不由配置文件决定**，而是由 fish.probe 自动探测后注入：
+  //   - 启动时读缓存（默认 30 天有效），过期则重探
+  //   - 上游行为会静默变更（如 WorkBuddy 会在 HTTP 200 下丢弃
+  //     assistant 图片），靠人工配置必然过时
+  // 见 fish.probe::Capabilities::assistant_image。
+  bool supports_assistant_image{false};
 };
 
 struct EmbeddingConfig {
@@ -221,6 +231,85 @@ std::size_t header_cb(char* ptr, std::size_t size, std::size_t nmemb, void* user
 
 bool is_retryable(int status) { return status == 429 || (status >= 500 && status < 600); }
 
+// assistant 发图在「上游不支持」时的降级归属标签。
+//
+// 用结构化 XML 风格而非自然语言：
+//   - 不会被模型误读成用户说的话
+//   - 与正文明显区分，便于模型解析
+//   - 换回支持 assistant 图的上游时，这段不会出现
+constexpr const char* kAssistantImageTag =
+    "<assistant_attachment role=\"assistant\" type=\"image\">"
+    "这条消息的图片是 assistant 发送的，不是 user 发的。"
+    "描述图片内容时，请明确这是 assistant 自己发过的图。"
+    "</assistant_attachment>";
+
+// 本地文件 → data URI（base64）。
+// 模型只接受 http(s) URL 或 data URI，不认本地路径。
+// 读不到或超过上限时返回空串，调用方跳过该块。
+std::string local_file_to_data_uri(const std::string& path,
+                                   const std::string& mime_hint = "") {
+  constexpr std::size_t kMaxBytes = 8u << 20;   // 单图 8MB 上限
+
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) return {};
+  const auto size = in.tellg();
+  if (size <= 0 || static_cast<std::size_t>(size) > kMaxBytes) return {};
+  in.seekg(0);
+  std::string bytes(static_cast<std::size_t>(size), '\0');
+  in.read(bytes.data(), size);
+
+  std::string mime = mime_hint;
+  if (mime.empty() || mime == "image/png") {
+    // 按扩展名纠正：缓存里存的是 .png/.jpg，但 mime 可能没带上
+    const auto dot = path.find_last_of('.');
+    const std::string ext =
+        (dot == std::string::npos) ? "" : path.substr(dot);
+    if (ext == ".jpg" || ext == ".jpeg") {
+      mime = "image/jpeg";
+    } else if (ext == ".png") {
+      mime = "image/png";
+    } else if (ext == ".gif") {
+      mime = "image/gif";
+    } else if (ext == ".webp") {
+      mime = "image/webp";
+    } else if (mime.empty()) {
+      mime = "image/png";
+    }
+  }
+
+  // 极简 base64（注意 unsigned char 转换，避免符号扩展）
+  static constexpr char kTable[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string b64;
+  b64.reserve(((bytes.size() + 2) / 3) * 4);
+  const auto at = [&bytes](std::size_t i) -> unsigned {
+    return static_cast<unsigned>(static_cast<unsigned char>(bytes[i]));
+  };
+  std::size_t i = 0;
+  while (i + 2 < bytes.size()) {
+    const unsigned n = (at(i) << 16) | (at(i + 1) << 8) | at(i + 2);
+    b64 += kTable[(n >> 18) & 0x3F];
+    b64 += kTable[(n >> 12) & 0x3F];
+    b64 += kTable[(n >> 6) & 0x3F];
+    b64 += kTable[n & 0x3F];
+    i += 3;
+  }
+  const std::size_t rest = bytes.size() - i;
+  if (rest == 1) {
+    const unsigned n = at(i) << 16;
+    b64 += kTable[(n >> 18) & 0x3F];
+    b64 += kTable[(n >> 12) & 0x3F];
+    b64 += "==";
+  } else if (rest == 2) {
+    const unsigned n = (at(i) << 16) | (at(i + 1) << 8);
+    b64 += kTable[(n >> 18) & 0x3F];
+    b64 += kTable[(n >> 12) & 0x3F];
+    b64 += kTable[(n >> 6) & 0x3F];
+    b64 += '=';
+  }
+  return "data:" + mime + ";base64," + b64;
+}
+
 json to_blocks(const std::vector<fish::core::ContentBlock>& blocks) {
   json arr = json::array();
   for (const auto& b : blocks) {
@@ -274,14 +363,94 @@ class HttpChat final : public fish::core::IChatModel {
     } else {
       payload["system"] = req.system_prompt;
     }
+    // 历史消息按「相邻同角色合并」的方式组装。
+    //
+    // 关于 assistant 的图片：
+    //   上游支持（supports_assistant_image=true）时按正常语义走，
+    //   assistant 消息里直接带 image_url。
+    //   不支持时（如 WorkBuddy /v2/chat/completions 会静默丢弃），
+    //   仅在该图片位置插入一条独立的 user 消息，内容只有归属标签 + 图。
+    //   文字消息仍然走原本的 role，不做任何改变。
+    std::string cur_role;
+    json cur_parts = json::array();
+    bool cur_has_parts = false;
+
+    auto flush_history = [&]() {
+      if (!cur_has_parts) return;
+      // 只有一个 text 块时用纯字符串，兼容性最好
+      if (cur_parts.size() == 1 && cur_parts[0].value("type", "") == "text") {
+        msgs.push_back({{"role", cur_role}, {"content", cur_parts[0].value("text", "")}});
+      } else {
+        msgs.push_back({{"role", cur_role}, {"content", cur_parts}});
+      }
+      cur_parts = json::array();
+      cur_has_parts = false;
+      cur_role.clear();
+    };
+
+    // 本地路径 → data URI；失败返回空串
+    auto to_url = [](const std::string& raw, const std::string& mime) -> std::string {
+      if (raw.empty()) return {};
+      if (raw.rfind("http://", 0) == 0 || raw.rfind("https://", 0) == 0 ||
+          raw.rfind("data:", 0) == 0) {
+        return raw;
+      }
+      return local_file_to_data_uri(raw, mime);
+    };
+
     for (const auto& h : req.history) {
-      if (h.kind != fish::core::BlockKind::kText) continue;
-      // 用真实 role：全塞 user 会让模型分不清谁说的
       const std::string role = (h.role == "assistant") ? "assistant" : "user";
-      msgs.push_back({{"role", role}, {"content", h.text}});
+
+      if (h.kind == fish::core::BlockKind::kImage) {
+        const std::string url = to_url(h.media_url, h.mime);
+        if (url.empty()) continue;   // 读不到就跳过，不要发死路径
+
+        if (role == "assistant" && !cfg_.supports_assistant_image) {
+          // 只在图片这一处做降级：先收尾当前消息，再插一条
+          // 只含「归属标签 + 图」的 user 消息，然后清空合并状态，
+          // 让后续文字重新按正常 role 走。
+          flush_history();
+          json parts = json::array();
+          parts.push_back({{"type", "text"}, {"text", std::string(kAssistantImageTag)}});
+          parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+          msgs.push_back({{"role", "user"}, {"content", parts}});
+          continue;
+        }
+
+        if (role != cur_role) {
+          flush_history();
+          cur_role = role;
+        }
+        cur_parts.push_back({{"type", "image_url"}, {"image_url", {{"url", url}}}});
+        cur_has_parts = true;
+        continue;
+      }
+
+      if (h.kind == fish::core::BlockKind::kText) {
+        if (h.text.empty()) continue;
+        if (role != cur_role) {
+          flush_history();
+          cur_role = role;
+        }
+        cur_parts.push_back({{"type", "text"}, {"text", h.text}});
+        cur_has_parts = true;
+      }
     }
+    flush_history();
+
     msgs.push_back({{"role", "user"}, {"content", to_blocks(req.user_blocks)}});
     payload["messages"] = std::move(msgs);
+
+    // 工具声明：只在调用方提供了 tools 时加，避免无谓的 token 消耗
+    if (!req.tools_json.empty()) {
+      try {
+        payload["tools"] = json::parse(req.tools_json);
+        payload["tool_choice"] = "auto";
+      } catch (const std::exception& e) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "capability", "tools_parse")
+            .field("detail", e.what());
+      }
+    }
 
     std::map<std::string, std::string> headers;
     if (dial_ == Dialect::kOpenAI) {
@@ -307,6 +476,32 @@ class HttpChat final : public fish::core::IChatModel {
         }
         out.text = body["choices"][0]["message"].value("content", "");
         extract_usage(body.value("usage", json::object()), &out);
+
+        // 解析工具调用：上游可能返回 tool_calls 数组
+        const auto msg = body["choices"][0].value("message", json::object());
+        if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
+          for (const auto& tc : msg["tool_calls"]) {
+            if (!tc.is_object()) continue;
+            const auto fn = tc.value("function", json::object());
+            IChatModel::ToolCall call;
+            call.id = tc.value("id", "");
+            call.name = fn.value("name", "");
+            // arguments 可能是字符串，也可能是对象
+            if (fn.contains("arguments")) {
+              if (fn["arguments"].is_string()) {
+                call.arguments = fn["arguments"].get<std::string>();
+              } else {
+                call.arguments = fn["arguments"].dump();
+              }
+            }
+            if (!call.name.empty()) out.tool_calls.push_back(std::move(call));
+          }
+          if (!out.tool_calls.empty()) {
+            ::fish::log::log_line(::fish::log::LogLevel::kInfo, "capability", "tool_calls")
+                .field("count", static_cast<long long>(out.tool_calls.size()))
+                .field("first", out.tool_calls[0].name);
+          }
+        }
       } else {
         if (!body.contains("content") || !body["content"].is_array()) {
           return Result<Response>::fail(ErrorCode::kBadRequest, "no_content");
@@ -384,11 +579,29 @@ class HttpStt final : public fish::core::ISpeechToText {
     auto audio = HttpClient::instance().download(media_url, 16u << 20);
     if (!audio.ok()) return Result<std::string>::fail(audio.error.code, audio.error.detail);
 
-    const std::string tmp = "/tmp/fish_stt_" + std::to_string(std::rand()) + ".audio";
+    // 扩展名必须与真实格式一致：SiliconFlow 按扩展名判断解码器，
+    // 存成 .audio 会 400。按文件头嗅探，避免依赖 URL 后缀。
+    const std::string ext = sniff_audio_ext(audio.value->data());
+    std::string tmp = "/tmp/fish_stt_" + std::to_string(std::rand()) + ext;
     {
       std::ofstream f(tmp, std::ios::binary);
       if (!f) return Result<std::string>::fail(ErrorCode::kInternal, "tmp_write");
       f.write(audio.value->data(), static_cast<std::streamsize>(audio.value->size()));
+    }
+
+    // SILK 是腾讯自有格式，STT 服务不支持，必须先转 WAV。
+    // 用 tools/silk2wav.py（内部优先 ffmpeg，否则用纯 Python 的 pilk）。
+    if (ext == ".silk") {
+      const std::string wav = "/tmp/fish_stt_" + std::to_string(std::rand()) + ".wav";
+      const std::string cmd = "python3 tools/silk2wav.py '" + tmp + "' '" + wav +
+                              "' --rate 16000 >/dev/null 2>&1";
+      const int rc = std::system(cmd.c_str());
+      std::remove(tmp.c_str());
+      if (rc != 0) {
+        return Result<std::string>::fail(ErrorCode::kUnsupported,
+                                         "silk_convert_failed（装 ffmpeg 或 pilk）");
+      }
+      tmp = wav;
     }
 
     const std::string cmd = "curl -s -X POST '" + cfg_.base_url + "/audio/transcriptions' "
@@ -417,6 +630,33 @@ class HttpStt final : public fish::core::ISpeechToText {
   }
 
  private:
+  // 按文件头判断音频格式，返回带点的扩展名。
+  // QQ 的语音常见 SILK（腾讯自有），也有 mp3/wav/ogg。
+  static std::string sniff_audio_ext(const std::string& data) {
+    if (data.size() < 12) return ".bin";
+    const auto* p = reinterpret_cast<const unsigned char*>(data.data());
+    // SILK: 以 "#!SILK_V3" 或 0x02 "#!SILK" 开头
+    if (data.rfind("#!SILK", 0) == 0 || (p[0] == 0x02 && data.rfind("#!SILK", 1) == 0)) {
+      return ".silk";
+    }
+    // ID3 或 0xFF 0xFB/0xF3/0xF2 → mp3
+    if (data.rfind("ID3", 0) == 0 ||
+        (p[0] == 0xFF && (p[1] & 0xE0) == 0xE0)) {
+      return ".mp3";
+    }
+    // RIFF....WAVE
+    if (data.size() > 12 && data.rfind("RIFF", 0) == 0 && data.substr(8, 4) == "WAVE") {
+      return ".wav";
+    }
+    // OggS
+    if (data.rfind("OggS", 0) == 0) return ".ogg";
+    // fLaC
+    if (data.rfind("fLaC", 0) == 0) return ".flac";
+    // AMR
+    if (data.rfind("#!AMR", 0) == 0) return ".amr";
+    return ".bin";
+  }
+
   SttConfig cfg_;
   CircuitBreaker* breaker_;
 };
@@ -436,7 +676,15 @@ class EdgeTts final : public fish::core::ITextToSpeech {
         safe += c;
       }
     }
-    const std::string cmd = "edge-tts --voice '" + cfg_.voice + "' --text '" + safe +
+    // edge-tts 常被 pip 装到 ~/.local/bin，不在默认 PATH 里，
+    // 所以优先用绝对路径，找不到再退回裸命令名。
+    const std::string exe = resolve_edge_tts();
+    if (exe.empty()) {
+      return Result<std::string>::fail(
+          ErrorCode::kUnsupported,
+          "edge_tts_not_found（pip install edge-tts）");
+    }
+    const std::string cmd = "'" + exe + "' --voice '" + cfg_.voice + "' --text '" + safe +
                             "' --write-media '" + tmp + "' 2>/dev/null";
     if (std::system(cmd.c_str()) != 0) {
       return Result<std::string>::fail(ErrorCode::kUpstreamUnavailable, "edge_tts_failed");
@@ -450,6 +698,27 @@ class EdgeTts final : public fish::core::ITextToSpeech {
   }
 
  private:
+  // 依次尝试：绝对路径 → PATH 里的 edge-tts
+  static std::string resolve_edge_tts() {
+    static const char* kCandidates[] = {
+        "/usr/local/bin/edge-tts",
+        "/usr/bin/edge-tts",
+    };
+    for (const char* p : kCandidates) {
+      std::ifstream f(p);
+      if (f.good()) return p;
+    }
+    // ~/.local/bin（pip --user 的默认位置）
+    if (const char* home = std::getenv("HOME")) {
+      const std::string p = std::string(home) + "/.local/bin/edge-tts";
+      std::ifstream f(p);
+      if (f.good()) return p;
+    }
+    // 退回裸命令名，让 shell 去 PATH 里找
+    if (std::system("command -v edge-tts >/dev/null 2>&1") == 0) return "edge-tts";
+    return {};
+  }
+
   TtsConfig cfg_;
 };
 
@@ -900,6 +1169,8 @@ ChatConfig load_chat_config(const fish::config::Config& c) {
   cfg.max_tokens = static_cast<int>(c.get_int_or("capability.chat.max_tokens", 512));
   cfg.temperature = c.get_double_or("capability.chat.temperature", 1.0);
   cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.chat.timeout_ms", 30000));
+  // supports_assistant_image 不在这里读配置：
+  // 由 fish.probe 探测后由 main 注入，避免配置过时。
   return cfg;
 }
 

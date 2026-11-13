@@ -21,6 +21,9 @@ import fish.core;
 import fish.log;
 import fish.memory;
 import fish.image;
+import fish.media;
+import fish.tool;
+import fish.guard;
 
 export namespace fish::orchestrator {
 
@@ -98,6 +101,17 @@ class Pipeline {
     fish::core::ISpeechToText* stt{nullptr};
     fish::core::IImageModel* image{nullptr};      // 生图（可为空）
     fish::image::PortraitStore* portraits{nullptr};  // 形象库（可为空）
+    // 工具注册表：模型可主动调用（网络搜索 / 图片检索 / 记忆检索）
+    fish::tool::Registry* tools{nullptr};
+    // 单轮最多几次工具调用，防止无限循环
+    int max_tool_rounds{3};
+    // 安全防护
+    fish::guard::InputGuard* input_guard{nullptr};
+    fish::guard::OutputGuard* output_guard{nullptr};
+    fish::guard::RateLimiter* rate_limiter{nullptr};
+    // 媒体缓存：把入站/出站的图片语音落本地副本。
+    // 平台给的 URL 是临时签名链接，过期就成死链，记忆里必须存本地路径。
+    fish::media::MediaCache* media{nullptr};
     fish::memory::MemorySystem* memory{nullptr};
     fish::memory::Consolidator* consolidator{nullptr};
     bool group_voice{false};
@@ -341,7 +355,23 @@ Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
       continue;
     }
     if (block.kind == fish::core::BlockKind::kImage) {
-      out.push_back(block);  // 图片透传给多模态模型
+      // 平台给的是临时签名 URL，先落本地副本再交给模型。
+      // 模型支持直接读 data: URI 或本地文件；更重要的是记忆里能存住。
+      fish::core::ContentBlock copy = block;
+      if (deps_.media != nullptr) {
+        auto cached = deps_.media->fetch(block.media_url, ".jpg");
+        if (cached.ok()) {
+          copy.media_url = cached.value->path;
+          ::fish::log::log_line(fish::log::LogLevel::kDebug, "pipeline", "image_cached")
+              .field("path", cached.value->path)
+              .field("reused", cached.value->reused);
+        } else {
+          // 下载失败仍把原始 URL 交给模型：本轮能看就先看
+          ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "image_cache_failed")
+              .field("detail", cached.error.detail);
+        }
+      }
+      out.push_back(std::move(copy));
       continue;
     }
     if (block.kind == fish::core::BlockKind::kVoice) {
@@ -379,6 +409,35 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     ::fish::log::log_line(fish::log::LogLevel::kDebug, "pipeline", "duplicate_dropped")
         .field("msg_id", msg.message_id);
     return Result<int>::ok(0);
+  }
+
+  // 1.5 安全防护：频率限制 + 输入检查
+  if (deps_.rate_limiter != nullptr &&
+      !deps_.rate_limiter->allow(msg.conversation_id)) {
+    ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "rate_limited")
+        .field("conversation", msg.conversation_id);
+    return Result<int>::ok(0);   // 静默丢弃，不给刷屏者反馈
+  }
+  if (deps_.input_guard != nullptr) {
+    const auto verdict = deps_.input_guard->check(msg);
+    if (!verdict.allow) {
+      ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "input_rejected")
+          .field("rule", verdict.rule)
+          .field("conversation", msg.conversation_id);
+      // 有 note 就回一句；没有就静默
+      if (!verdict.note.empty()) {
+        fish::core::OutboundMessage reply;
+        reply.conversation_id = msg.conversation_id;
+        reply.reply_to_message_id = msg.message_id;
+        reply.context_token = msg.context_token;
+        fish::core::ContentBlock b;
+        b.kind = fish::core::BlockKind::kText;
+        b.text = verdict.note;
+        reply.blocks.push_back(std::move(b));
+        channel.send(reply, 1);
+      }
+      return Result<int>::ok(0);
+    }
   }
 
   // 2. 时效检查：超过被动窗口 80% 放弃
@@ -430,6 +489,23 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   if (query.empty() && image_count > 0) {
     query = "[图片]";
   }
+  // 落盘用的文本要标出「对方发了图」。
+  // 图片已由媒体缓存落成本地副本，路径存进 Message::image_paths，
+  // 下一轮组装历史时会重新作为多模态内容带进去，模型能一直看到。
+  std::string remembered_query = query;
+  std::vector<std::string> inbound_images;
+  for (const auto& b : *input.value) {
+    if (b.kind == fish::core::BlockKind::kImage && !b.media_url.empty()) {
+      inbound_images.push_back(b.media_url);
+    }
+  }
+  if (!inbound_images.empty()) {
+    if (remembered_query == "[图片]") {
+      remembered_query = "[对方发来一张图片]";
+    } else {
+      remembered_query += " [对方发来一张图片]";
+    }
+  }
 
   // 7. 记忆召回
   // 7. 若原始对话超出 token 预算 → 把最早的压缩成摘要 + 落盘
@@ -466,42 +542,117 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     // 角色必须显式传递：模型据此区分谁说的
     b.role = (m.role == "user") ? "user" : "assistant";
     history.push_back(std::move(b));
+
+    // 图片按发送者归属回传，role 标明是谁发的。
+    // 具体怎么编码成请求（assistant 图是否降级成单独的 user 消息 + 归属标签）
+    // 由 fish.capability 根据上游能力决定，这里只如实传递归属。
+    const std::string img_role = (m.role == "user") ? "user" : "assistant";
+    for (const auto& path : m.image_paths) {
+      if (path.empty()) continue;
+      fish::core::ContentBlock img;
+      img.kind = fish::core::BlockKind::kImage;
+      img.media_url = path;
+      img.mime = "image/png";
+      img.role = img_role;
+      history.push_back(std::move(img));
+    }
   }
 
-  // 9. 模型调用（带降级）
+  // 9. 模型调用（带降级 + 工具循环）
   fish::core::IChatModel::Request req;
   req.system_prompt = deps_.persona->stable_prefix();
   req.user_blocks = std::move(*input.value);
   req.history = std::move(history);
 
+  // 工具声明：只在注册表非空时带上
+  if (deps_.tools != nullptr && !deps_.tools->empty()) {
+    req.tools_json = deps_.tools->openai_tools_json();
+  }
+
   auto resp = deps_.chat->complete(req);
+
+  // 工具循环：模型要求调用工具 → 执行 → 把结果作为 user 消息追加 → 再问
+  // 最多 max_tool_rounds 轮，防止模型陷入死循环。
+  int tool_round = 0;
+  while (resp.ok() && resp.value->wants_tools() &&
+         deps_.tools != nullptr && tool_round < deps_.max_tool_rounds) {
+    ++tool_round;
+
+    // 把「模型想调用什么」和「工具返回了什么」拼成下一轮的上下文。
+    // 用 user 角色承载工具结果：上游对 tool 角色的支持不稳定，
+    // 实测用 user + 明确标注更可靠。
+    std::string tool_block;
+    for (const auto& call : resp.value->tool_calls) {
+      fish::tool::Call tc;
+      tc.name = call.name;
+      tc.arguments_json = call.arguments;
+
+      auto outcome = deps_.tools->run(tc);
+      ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "tool_ran")
+          .field("tool", call.name)
+          .field("ok", outcome.ok)
+          .field("round", static_cast<long long>(tool_round));
+
+      tool_block += "【工具调用】" + call.name + "\n";
+      tool_block += "【返回】" + outcome.content + "\n\n";
+    }
+
+    if (tool_block.empty()) break;
+
+    // 追加到本轮输入，让模型基于工具结果作答
+    fish::core::ContentBlock tb;
+    tb.kind = fish::core::BlockKind::kText;
+    tb.text = "[系统：以下是工具调用的真实结果，请据此回答，不要编造]\n" + tool_block;
+    tb.role = "user";
+    req.user_blocks.push_back(std::move(tb));
+
+    // 清空 tools，避免模型反复要求调用同一工具
+    // （第二轮通常应该直接给答案）
+    resp = deps_.chat->complete(req);
+  }
+
   std::string reply_text;
   if (resp.ok()) {
     reply_text = resp.value->text;
+    // 工具调用后模型可能只返回空文本：给个兜底
+    if (reply_text.empty() && tool_round > 0) {
+      reply_text = "查了一下，没找到特别确定的说法。";
+    }
   } else {
     reply_text = "我卡了一下…你刚才说什么？";
     ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "chat_degraded")
         .field("detail", resp.error.detail);
   }
 
+  // 9.8 输出防护：脱敏 + 去链接 + 长度截断
+  // 放在解析 [PHOTO] 之前：链接会被 QQ 拦截，先清掉再判断图片标记。
+  if (deps_.output_guard != nullptr) {
+    reply_text = deps_.output_guard->sanitize(reply_text);
+  }
+
   // 9.5 解析图片标记：[PHOTO] 取库存图，[PHOTO: 描述] 现场生成
   std::string photo_spec;
   const bool wants_photo = extract_photo_marker(reply_text, &photo_spec);
 
-  // 10. 落盘 + 巩固
-  if (deps_.memory != nullptr) {
-    fish::memory::Message user_msg;
-    user_msg.role = "user";
-    user_msg.text = query;
-    user_msg.at = msg.received_at;
-    fish::memory::Message bot_msg;
-    bot_msg.role = "assistant";
-    bot_msg.text = reply_text;
-    bot_msg.at = fish::core::Clock::now();
-    deps_.memory->record(msg.conversation_id, user_msg, bot_msg);
-
-    // 记忆压缩已在 gather 前由 needs_compaction()/compact() 处理
+  // 记忆里要记「实际发出去的东西」，而不是模型原始输出。
+  // 模型输出 "[PHOTO]" 时，用户实际看到的是「喏」+ 一张图；
+  // 若把剥离后的空 reply_text 存进去，下一轮模型就不知道自己发过图，
+  // 会说出「我看不到自己发出去的东西」这种话。
+  std::string remembered_reply = reply_text;
+  if (wants_photo) {
+    if (remembered_reply.empty()) remembered_reply = "喏";
+    remembered_reply += photo_spec.empty()
+                            ? " [发了一张自己的照片]"
+                            : " [发了一张照片：" + photo_spec + "]";
   }
+
+  // 出站图片的本地路径，稍后一起写进记忆。
+  // 必须存路径而不是只存文字：模型被问「描述一下这张图」时
+  // 需要真的把图重新带进上下文，否则只能回答「我看不到」。
+  std::vector<std::string> outbound_images;
+
+  // 10. 落盘 + 巩固（推迟到发图之后，见下方：需要带上图片路径）
+
 
   // 11-12. 组装出站，按预算逐条发送
   std::vector<fish::core::ContentBlock> outgoing;
@@ -553,8 +704,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
       // 不需要公网 URL，也不需要开放任何端口。
       fish::core::ContentBlock img;
       img.kind = fish::core::BlockKind::kImage;
-      img.media_url = std::move(photo_url);
+      img.media_url = photo_url;
       img.mime = "image/png";
+      img.role = "assistant";
+      outbound_images.push_back(photo_url);   // 记忆里要存路径
       outgoing.push_back(std::move(img));
       ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "photo_attached")
           .field("source", photo_src);
@@ -603,6 +756,26 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
       .field("conversation", msg.conversation_id)
       .field("chunks", sent)
       .field("chars", static_cast<long long>(reply_text.size()));
+
+  // 10. 落盘 + 巩固
+  // 放在发送之后：这样能把「实际发出去的图片路径」一并写进记忆，
+  // 下一轮模型重新拿到这些图，才能真正回答「描述一下这张图」。
+  if (deps_.memory != nullptr) {
+    fish::memory::Message user_msg;
+    user_msg.role = "user";
+    user_msg.text = remembered_query;
+    user_msg.at = msg.received_at;
+    user_msg.image_paths = std::move(inbound_images);
+
+    fish::memory::Message bot_msg;
+    bot_msg.role = "assistant";
+    bot_msg.text = remembered_reply;
+    bot_msg.at = fish::core::Clock::now();
+    bot_msg.image_paths = std::move(outbound_images);
+
+    deps_.memory->record(msg.conversation_id, user_msg, bot_msg);
+    // 记忆压缩已在 gather 前由 needs_compaction()/compact() 处理
+  }
 
   return Result<int>::ok(sent);
 }

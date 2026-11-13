@@ -55,6 +55,11 @@ class PortraitStore {
   // 重新从磁盘加载 manifest（外部手改文件后调用）
   fish::core::Error reload();
 
+  // 扫描目录，把 manifest 里没有的图片自动纳入。
+  // 用户直接把图丢进 portraits_dir 就能用，不必手写 manifest。
+  // 返回新增数量。
+  int scan_directory();
+
   [[nodiscard]] std::size_t size() const;
 
   // 挑一张：tag 非空且命中则优先，否则随机。
@@ -147,6 +152,65 @@ fish::core::Error PortraitStore::init() {
 }
 
 fish::core::Error PortraitStore::reload() { return load_manifest(); }
+
+int PortraitStore::scan_directory() {
+  // 用户可以直接把图丢进 portraits 目录，不用手写 manifest。
+  // 这里扫描常见图片扩展名，把 manifest 里没有的补进去，
+  // caption 先用文件名，tags 留空（可手改 manifest 补充）。
+  static const char* kExts[] = {".png", ".jpg", ".jpeg", ".gif", ".webp"};
+  std::error_code ec;
+
+  if (!fs::exists(dir_, ec)) return 0;
+
+  std::vector<Portrait> added;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& entry : fs::directory_iterator(dir_, ec)) {
+      if (!entry.is_regular_file()) continue;
+      const std::string path = entry.path().string();
+      const std::string ext = entry.path().extension().string();
+
+      bool ext_ok = false;
+      for (const char* e : kExts) {
+        if (ext == e) {
+          ext_ok = true;
+          break;
+        }
+      }
+      if (!ext_ok) continue;
+
+      // 已在 manifest 里就跳过
+      bool known = false;
+      for (const auto& p : items_) {
+        if (p.path == path) {
+          known = true;
+          break;
+        }
+      }
+      if (known) continue;
+
+      Portrait p;
+      p.path = path;
+      p.caption = entry.path().stem().string();   // 用文件名做初始说明
+      p.source = "scanned";
+      p.created_at = detail::today_str();
+      items_.push_back(p);
+      added.push_back(p);
+    }
+  }
+
+  if (!added.empty()) {
+    auto e = save_manifest();
+    if (!e.ok()) {
+      ::fish::log::log_line(::fish::log::LogLevel::kWarn, "image", "manifest_save_failed")
+          .field("detail", e.detail);
+    }
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "image", "scanned")
+        .field("added", static_cast<long long>(added.size()))
+        .field("dir", dir_);
+  }
+  return static_cast<int>(added.size());
+}
 
 fish::core::Error PortraitStore::load_manifest() {
   const std::string path = dir_ + "/manifest.md";

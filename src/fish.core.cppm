@@ -109,18 +109,30 @@ class IChannel {
 
 class IChatModel {
  public:
+  // 模型请求的一次工具调用
+  struct ToolCall {
+    std::string id;        // 上游给的调用 id，回传结果时必须带
+    std::string name;
+    std::string arguments; // JSON 字符串
+  };
+
   struct Request {
     std::string system_prompt;
     std::vector<ContentBlock> history;
     std::vector<ContentBlock> user_blocks;
     int max_tokens{512};
     double temperature{1.0};
+    // 可用工具的 OpenAI tools JSON 数组（空 = 不启用工具）
+    std::string tools_json;
   };
   struct Response {
     std::string text;
     int prompt_tokens{0};
     int cached_tokens{0};
     int output_tokens{0};
+    // 模型要求调用的工具（可能多个）
+    std::vector<ToolCall> tool_calls;
+    [[nodiscard]] bool wants_tools() const { return !tool_calls.empty(); }
   };
   virtual ~IChatModel() = default;
   virtual Result<Response> complete(const Request& req) = 0;

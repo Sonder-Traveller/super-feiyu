@@ -30,6 +30,13 @@ struct Message {
   std::string role;
   std::string text;
   fish::core::TimePoint at{};
+  // 该消息附带的图片本地路径（媒体缓存里的副本）。
+  // 空表示纯文本。
+  //
+  // 为什么必须存：平台给的是临时签名 URL，过期成死链；
+  // 若只存 "[发了一张照片]" 这样的文字标记，下一轮模型就真的
+  // 看不到那张图了，会说出「我看不到自己照片长什么样」。
+  std::vector<std::string> image_paths;
 };
 
 struct Fact {
@@ -104,18 +111,30 @@ class NotesStore {
  public:
   explicit NotesStore(std::string notes_dir);
   fish::core::Error ensure_dirs() const;
-  fish::core::Result<std::vector<Fact>> load_facts() const;
-  fish::core::Error append_fact(const Fact& f) const;
+
+  // 会话隔离：每个会话一个子目录，互不可见。
+  // 此前所有会话共享同一个 facts.md / episodes/ / traits.md，
+  // 导致 A 会话的事实和情景记忆会串到 B 会话里。
+  [[nodiscard]] std::string session_dir(const std::string& conv_id) const;
+
+  fish::core::Result<std::vector<Fact>> load_facts(const std::string& conv_id) const;
+  fish::core::Error append_fact(const std::string& conv_id, const Fact& f) const;
   // 全量改写（按 subject 分组），用于淘汰后重写权威文件
-  fish::core::Error rewrite_facts(const std::vector<Fact>& facts) const;
-  fish::core::Error append_episode(const Episode& e) const;
+  fish::core::Error rewrite_facts(const std::string& conv_id,
+                                  const std::vector<Fact>& facts) const;
+  fish::core::Error append_episode(const std::string& conv_id, const Episode& e) const;
   // 全量改写情景记忆（按月份分文件），用于容量淘汰后重写
-  fish::core::Error rewrite_episodes(const std::vector<Episode>& eps) const;
-  fish::core::Result<std::vector<Episode>> load_episodes(int max_months = 24) const;
-  fish::core::Result<std::vector<Trait>> load_traits() const;
-  fish::core::Error save_traits(const std::vector<Trait>& traits) const;
+  fish::core::Error rewrite_episodes(const std::string& conv_id,
+                                     const std::vector<Episode>& eps) const;
+  fish::core::Result<std::vector<Episode>> load_episodes(const std::string& conv_id,
+                                                         int max_months = 24) const;
+  fish::core::Result<std::vector<Trait>> load_traits(const std::string& conv_id) const;
+  fish::core::Error save_traits(const std::string& conv_id,
+                                const std::vector<Trait>& traits) const;
 
  private:
+  fish::core::Error ensure_session_dir(const std::string& conv_id) const;
+
   std::string dir_;
   mutable std::mutex mu_;
 };
@@ -157,12 +176,14 @@ class Consolidator {
  public:
   Consolidator(fish::core::IChatModel* chat, NotesStore* notes, IndexStore* index,
                fish::core::IEmbeddingModel* embedding);
-  fish::core::Result<ConsolidateReport> consolidate(const std::vector<Message>& transcript);
+  fish::core::Result<ConsolidateReport> consolidate(const std::string& conv_id,
+                                                    const std::vector<Message>& transcript);
   // 把一段较早的对话压成摘要文本
   fish::core::Result<std::string> summarize(const std::vector<Message>& transcript);
   static fish::core::Result<ConsolidateReport> apply_json(
       const std::string& json_text, const std::string& today, NotesStore* notes,
-      IndexStore* index, fish::core::IEmbeddingModel* embedding);
+      IndexStore* index, fish::core::IEmbeddingModel* embedding,
+      const std::string& conv_id);
 
  private:
   fish::core::IChatModel* chat_;
@@ -435,14 +456,34 @@ Error NotesStore::ensure_dirs() const {
   std::error_code ec;
   fs::create_directories(dir_, ec);
   if (ec) return Error::make(ErrorCode::kInternal, "mkdir:" + ec.message());
-  fs::create_directories(dir_ + "/episodes", ec);
-  if (ec) return Error::make(ErrorCode::kInternal, "mkdir_episodes:" + ec.message());
   return Error::none();
 }
 
-Result<std::vector<Fact>> NotesStore::load_facts() const {
+std::string NotesStore::session_dir(const std::string& conv_id) const {
+  // 会话 id 直接做目录名不安全（可能含 / : 等），只保留 [A-Za-z0-9-_]。
+  std::string safe;
+  safe.reserve(conv_id.size());
+  for (const char c : conv_id) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_';
+    safe += ok ? c : '_';
+  }
+  if (safe.empty()) safe = "default";
+  // 前缀区分群聊/私聊，避免 openid 恰好同名的极端情况
+  const std::string kind = (conv_id.rfind("g:", 0) == 0) ? "group" : "user";
+  return dir_ + "/" + kind + "/" + safe;
+}
+
+Error NotesStore::ensure_session_dir(const std::string& conv_id) const {
+  std::error_code ec;
+  fs::create_directories(session_dir(conv_id) + "/episodes", ec);
+  if (ec) return Error::make(ErrorCode::kInternal, "mkdir_session:" + ec.message());
+  return Error::none();
+}
+
+Result<std::vector<Fact>> NotesStore::load_facts(const std::string& conv_id) const {
   std::lock_guard<std::mutex> lock(mu_);
-  std::ifstream in(dir_ + "/facts.md");
+  std::ifstream in(session_dir(conv_id) + "/facts.md");
   std::vector<Fact> out;
   if (!in) return Result<std::vector<Fact>>::ok({});
 
@@ -465,15 +506,17 @@ Result<std::vector<Fact>> NotesStore::load_facts() const {
   return Result<std::vector<Fact>>::ok(std::move(out));
 }
 
-Error NotesStore::append_fact(const Fact& f) const {
+Error NotesStore::append_fact(const std::string& conv_id, const Fact& f) const {
+  ensure_session_dir(conv_id);
   std::lock_guard<std::mutex> lock(mu_);
   std::error_code ec;
-  fs::create_directories(dir_, ec);
+  const std::string sdir = session_dir(conv_id);
+  fs::create_directories(sdir, ec);
 
   // 读现有内容（已持锁，内联读取避免重入）
   std::vector<Fact> all;
   {
-    std::ifstream in(dir_ + "/facts.md");
+    std::ifstream in(sdir + "/facts.md");
     std::string line;
     std::string section;
     while (std::getline(in, line)) {
@@ -493,7 +536,7 @@ Error NotesStore::append_fact(const Fact& f) const {
   }
   all.push_back(f);
 
-  const std::string path = dir_ + "/facts.md";
+  const std::string path = sdir + "/facts.md";
   const std::string tmp = path + ".tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
@@ -516,12 +559,15 @@ Error NotesStore::append_fact(const Fact& f) const {
   return Error::none();
 }
 
-Error NotesStore::rewrite_facts(const std::vector<Fact>& facts) const {
+Error NotesStore::rewrite_facts(const std::string& conv_id,
+                                const std::vector<Fact>& facts) const {
+  ensure_session_dir(conv_id);
   std::lock_guard<std::mutex> lock(mu_);
   std::error_code ec;
-  fs::create_directories(dir_, ec);
+  const std::string sdir = session_dir(conv_id);
+  fs::create_directories(sdir, ec);
 
-  const std::string path = dir_ + "/facts.md";
+  const std::string path = sdir + "/facts.md";
   const std::string tmp = path + ".tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
@@ -544,13 +590,15 @@ Error NotesStore::rewrite_facts(const std::vector<Fact>& facts) const {
   return Error::none();
 }
 
-Error NotesStore::append_episode(const Episode& e) const {
+Error NotesStore::append_episode(const std::string& conv_id, const Episode& e) const {
+  ensure_session_dir(conv_id);
   std::lock_guard<std::mutex> lock(mu_);
   std::string month = e.created.size() >= 7 ? e.created.substr(0, 7) : "unknown";
 
   std::error_code ec;
-  fs::create_directories(dir_ + "/episodes", ec);
-  const std::string path = dir_ + "/episodes/" + month + ".md";
+  const std::string sdir = session_dir(conv_id);
+  fs::create_directories(sdir + "/episodes", ec);
+  const std::string path = sdir + "/episodes/" + month + ".md";
   const bool fresh = !fs::exists(path);
 
   std::ofstream out(path, std::ios::app);
@@ -561,10 +609,12 @@ Error NotesStore::append_episode(const Episode& e) const {
   return Error::none();
 }
 
-Error NotesStore::rewrite_episodes(const std::vector<Episode>& eps) const {
+Error NotesStore::rewrite_episodes(const std::string& conv_id,
+                                   const std::vector<Episode>& eps) const {
+  ensure_session_dir(conv_id);
   std::lock_guard<std::mutex> lock(mu_);
   std::error_code ec;
-  const std::string ep_dir = dir_ + "/episodes";
+  const std::string ep_dir = session_dir(conv_id) + "/episodes";
   fs::create_directories(ep_dir, ec);
 
   // 按月份分组
@@ -598,11 +648,12 @@ Error NotesStore::rewrite_episodes(const std::vector<Episode>& eps) const {
   return Error::none();
 }
 
-Result<std::vector<Episode>> NotesStore::load_episodes(int max_months) const {
+Result<std::vector<Episode>> NotesStore::load_episodes(const std::string& conv_id,
+                                                      int max_months) const {
   std::lock_guard<std::mutex> lock(mu_);
   std::vector<Episode> out;
   std::error_code ec;
-  const fs::path ep_dir = dir_ + "/episodes";
+  const fs::path ep_dir = session_dir(conv_id) + "/episodes";
   if (!fs::exists(ep_dir, ec)) return Result<std::vector<Episode>>::ok({});
 
   std::vector<fs::path> files;
@@ -636,9 +687,9 @@ Result<std::vector<Episode>> NotesStore::load_episodes(int max_months) const {
   return Result<std::vector<Episode>>::ok(std::move(out));
 }
 
-Result<std::vector<Trait>> NotesStore::load_traits() const {
+Result<std::vector<Trait>> NotesStore::load_traits(const std::string& conv_id) const {
   std::lock_guard<std::mutex> lock(mu_);
-  std::ifstream in(dir_ + "/traits.md");
+  std::ifstream in(session_dir(conv_id) + "/traits.md");
   std::vector<Trait> out;
   if (!in) return Result<std::vector<Trait>>::ok({});
 
@@ -655,11 +706,14 @@ Result<std::vector<Trait>> NotesStore::load_traits() const {
   return Result<std::vector<Trait>>::ok(std::move(out));
 }
 
-Error NotesStore::save_traits(const std::vector<Trait>& traits) const {
+Error NotesStore::save_traits(const std::string& conv_id,
+                              const std::vector<Trait>& traits) const {
+  ensure_session_dir(conv_id);
   std::lock_guard<std::mutex> lock(mu_);
   std::error_code ec;
-  fs::create_directories(dir_, ec);
-  const std::string tmp = dir_ + "/traits.md.tmp";
+  const std::string sdir = session_dir(conv_id);
+  fs::create_directories(sdir, ec);
+  const std::string tmp = sdir + "/traits.md.tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
     if (!out) return Error::make(ErrorCode::kInternal, "open_traits");
@@ -668,7 +722,7 @@ Error NotesStore::save_traits(const std::vector<Trait>& traits) const {
       out << "- " << t.pattern << " (证据 " << t.evidence << ")\n";
     }
   }
-  fs::rename(tmp, dir_ + "/traits.md", ec);
+  fs::rename(tmp, sdir + "/traits.md", ec);
   if (ec) return Error::make(ErrorCode::kInternal, "rename_traits");
   return Error::none();
 }
@@ -852,7 +906,8 @@ Consolidator::Consolidator(fish::core::IChatModel* chat, NotesStore* notes, Inde
                            fish::core::IEmbeddingModel* embedding)
     : chat_(chat), notes_(notes), index_(index), embedding_(embedding) {}
 
-Result<ConsolidateReport> Consolidator::consolidate(const std::vector<Message>& transcript) {
+Result<ConsolidateReport> Consolidator::consolidate(const std::string& conv_id,
+                                                    const std::vector<Message>& transcript) {
   if (transcript.empty()) {
     ConsolidateReport r;
     r.skipped = true;
@@ -886,7 +941,8 @@ Result<ConsolidateReport> Consolidator::consolidate(const std::vector<Message>& 
   std::snprintf(date, sizeof(date), "%04d-%02d-%02d", tm_buf.tm_year + 1900,
                 tm_buf.tm_mon + 1, tm_buf.tm_mday);
 
-  return apply_json(json_extract(resp.value->text), date, notes_, index_, embedding_);
+  return apply_json(json_extract(resp.value->text), date, notes_, index_, embedding_,
+                    conv_id);
 }
 
 Result<std::string> Consolidator::summarize(const std::vector<Message>& transcript) {
@@ -916,7 +972,8 @@ Result<std::string> Consolidator::summarize(const std::vector<Message>& transcri
 Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
                                                    const std::string& today,
                                                    NotesStore* notes, IndexStore* index,
-                                                   fish::core::IEmbeddingModel* embedding) {
+                                                   fish::core::IEmbeddingModel* embedding,
+                                                   const std::string& conv_id) {
   nlohmann::json body;
   try {
     body = nlohmann::json::parse(json_text);
@@ -941,7 +998,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
   };
   std::vector<Episode> existing_eps;
   if (notes != nullptr) {
-    auto ee = notes->load_episodes();
+    auto ee = notes->load_episodes(conv_id);
     if (ee.ok()) existing_eps = std::move(*ee.value);
   }
   for (const auto& e : body.value("episodes", nlohmann::json::array())) {
@@ -954,7 +1011,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     const bool dup_ep = std::any_of(existing_eps.begin(), existing_eps.end(),
                                     [&](const Episode& x) { return x.summary == ep.summary; });
     if (dup_ep) continue;
-    if (notes != nullptr) notes->append_episode(ep);
+    if (notes != nullptr) notes->append_episode(conv_id, ep);
     existing_eps.push_back(ep);
     if (index != nullptr && embedding != nullptr) {
       auto vec = embedding->embed(ep.summary);
@@ -968,7 +1025,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
   // 幂等：同内容不重复写入；id 用内容哈希，保证跨批次稳定
   std::vector<Fact> existing_facts;
   if (notes != nullptr) {
-    auto ef = notes->load_facts();
+    auto ef = notes->load_facts(conv_id);
     if (ef.ok()) existing_facts = std::move(*ef.value);
   }
   for (const auto& f : body.value("facts", nlohmann::json::array())) {
@@ -982,7 +1039,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     const bool dup = std::any_of(existing_facts.begin(), existing_facts.end(),
                                  [&](const Fact& x) { return x.content == fact.content; });
     if (dup) continue;
-    if (notes != nullptr) notes->append_fact(fact);
+    if (notes != nullptr) notes->append_fact(conv_id, fact);
     existing_facts.push_back(fact);
     if (index != nullptr && embedding != nullptr) {
       auto vec = embedding->embed(fact.content);
@@ -991,7 +1048,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     ++report.facts_written;
   }
 
-  auto existing = notes != nullptr ? notes->load_traits()
+  auto existing = notes != nullptr ? notes->load_traits(conv_id)
                                    : Result<std::vector<Trait>>::ok({});
   std::vector<Trait> traits = existing.ok() ? *existing.value : std::vector<Trait>{};
 
@@ -1007,7 +1064,7 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     }
     ++report.traits_updated;
   }
-  if (notes != nullptr && !traits.empty()) notes->save_traits(traits);
+  if (notes != nullptr && !traits.empty()) notes->save_traits(conv_id, traits);
 
   ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "consolidated")
       .field("episodes", report.episodes_written)
@@ -1035,26 +1092,41 @@ Error MemorySystem::init() {
   auto idx = index_.open();
   if (!idx.ok()) return idx;
 
-  // 索引为空但旁路文件有内容 → 重建
+  // 索引为空但旁路文件有内容 → 重建。
+  // 记忆按会话分目录（notes/<kind>/<safe_id>/），所以遍历所有会话，
+  // 把每个会话的 facts/episodes 都重新灌进索引。
   if (index_.item_count() == 0 && embedding_ != nullptr) {
     std::size_t rebuilt = 0;
-    auto facts = notes_.load_facts();
-    if (facts.ok()) {
-      for (const auto& f : *facts.value) {
-        auto vec = embedding_->embed(f.content);
-        if (vec.ok()) {
-          index_.upsert_item("fact", f.id, f.content, *vec.value);
-          ++rebuilt;
+    std::error_code dir_ec;
+    for (const auto& kind : {"group", "user"}) {
+      const fs::path base = fs::path(cfg_.notes_dir) / kind;
+      if (!fs::exists(base, dir_ec)) continue;
+      for (const auto& entry : fs::directory_iterator(base, dir_ec)) {
+        if (!entry.is_directory()) continue;
+        // 目录名是脱敏后的会话 id，重建时用它反推 conv_id 去读文件
+        const std::string safe_id = entry.path().filename().string();
+        const std::string conv_id =
+            std::string(kind) == "group" ? ("g:" + safe_id) : safe_id;
+
+        auto facts = notes_.load_facts(conv_id);
+        if (facts.ok()) {
+          for (const auto& f : *facts.value) {
+            auto vec = embedding_->embed(f.content);
+            if (vec.ok()) {
+              index_.upsert_item("fact", f.id, f.content, *vec.value);
+              ++rebuilt;
+            }
+          }
         }
-      }
-    }
-    auto episodes = notes_.load_episodes();
-    if (episodes.ok()) {
-      for (const auto& ep : *episodes.value) {
-        auto vec = embedding_->embed(ep.summary);
-        if (vec.ok()) {
-          index_.upsert_item("episode", ep.id, ep.summary, *vec.value);
-          ++rebuilt;
+        auto episodes = notes_.load_episodes(conv_id);
+        if (episodes.ok()) {
+          for (const auto& ep : *episodes.value) {
+            auto vec = embedding_->embed(ep.summary);
+            if (vec.ok()) {
+              index_.upsert_item("episode", ep.id, ep.summary, *vec.value);
+              ++rebuilt;
+            }
+          }
         }
       }
     }
@@ -1179,7 +1251,7 @@ Result<ConsolidateReport> MemorySystem::compact(const std::string& conv_id,
                       std::hash<std::string>{}(transcript_text) & 0xFFFFFFFFFFFFULL);
     ep.summary = transcript_text;
     ep.created = today();
-    notes_.append_episode(ep);
+    notes_.append_episode(conv_id, ep);
     if (embedding_ != nullptr) {
       if (auto v = embedding_->embed(transcript_text); v.ok()) {
         index_.upsert_item("episode", ep.id, transcript_text, *v.value);
@@ -1307,7 +1379,7 @@ Result<ConsolidateReport> MemorySystem::force_consolidate(const std::string& con
     transcript = it->second->take_all();
   }
 
-  auto result = consolidator.consolidate(transcript);
+  auto result = consolidator.consolidate(conv_id, transcript);
   if (!result.ok()) {
     // 失败恢复，避免丢记忆；下轮立即重试
     std::lock_guard<std::mutex> lock(mu_);

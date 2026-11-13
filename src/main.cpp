@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -14,9 +15,15 @@ import fish.core;
 import fish.log;
 import fish.config;
 import fish.capability;
+import fish.probe;
 import fish.memory;
+import fish.media;
 import fish.image;
+import fish.session;
+import fish.tool;
+import fish.guard;
 import fish.channels;
+import fish.dispatcher;
 import fish.orchestrator;
 
 namespace {
@@ -131,6 +138,14 @@ int main(int argc, char** argv) {
   const bool stub_mode = opt.stub || (opt.self_test && !opt.live_test);
   const auto chat_cfg = fish::capability::load_chat_config(cfg);
 
+  // 上游能力探测器：读缓存或现场探测（默认 30 天 TTL）
+  fish::probe::Config probe_cfg;
+  probe_cfg.cache_path = cfg.get_or("probe.cache_path", "data/probe/capabilities.json");
+  probe_cfg.ttl_days = static_cast<int>(cfg.get_int_or("probe.ttl_days", 30));
+  probe_cfg.model = chat_cfg.model;
+  probe_cfg.probe_on_start = cfg.get_bool_or("probe.on_start", true);
+  fish::probe::CapabilityProbe caps_probe(probe_cfg, chat_cfg.base_url, chat_cfg.api_key);
+
   // ── 启动校验：配置有错就立即失败，不允许静默运行 ──
   {
     std::vector<std::string> problems;
@@ -194,7 +209,14 @@ int main(int argc, char** argv) {
   std::unique_ptr<fish::core::ITextToSpeech> tts;
 
   if (!stub_mode && !chat_cfg.api_key.empty()) {
-    auto c = fish::capability::make_chat(chat_cfg);
+    // ── 上游能力探测 ──
+    // 不用配置开关：上游会静默变更行为（如 WorkBuddy 在 HTTP 200 下丢弃
+    // assistant 图片）。探测结果写盘缓存，默认 30 天有效，过期自动重探。
+    auto caps = caps_probe.load_or_probe();
+    auto effective_cfg = chat_cfg;
+    effective_cfg.supports_assistant_image = caps.assistant_image;
+
+    auto c = fish::capability::make_chat(effective_cfg);
     if (c.ok()) {
       chat = std::move(*c.value);
       fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "chat_provider")
@@ -230,6 +252,7 @@ int main(int argc, char** argv) {
   // ── 生图 + 形象库 ──
   std::unique_ptr<fish::core::IImageModel> image_model;
   const auto image_cfg = fish::capability::load_image_config(cfg);
+  const auto search_cfg = fish::capability::load_search_config(cfg);
   if (!stub_mode && image_cfg.provider != "none") {
     auto im = fish::capability::make_image(image_cfg);
     if (im.ok()) {
@@ -251,6 +274,13 @@ int main(int argc, char** argv) {
     if (!e.ok()) {
       fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "portraits_init_failed")
           .field("detail", e.detail);
+    } else {
+      // 用户可能直接往目录里丢图，扫描一次自动纳入
+      const int added = portraits.scan_directory();
+      if (added > 0) {
+        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "portraits_scanned")
+            .field("added", static_cast<long long>(added));
+      }
     }
   }
 
@@ -291,12 +321,15 @@ int main(int argc, char** argv) {
   mem_cfg.db_path = cfg.get_or("memory.db_path", "data/memory/index.db");
 
   fish::memory::MemorySystem memory_sys(mem_cfg, embedding.get());
+  bool memory_ready = false;
   {
     auto e = memory_sys.init();
     if (!e.ok()) {
       fish::log::log_line(fish::log::LogLevel::kError, "runtime", "memory_init_failed")
           .field("detail", e.detail);
       if (!opt.self_test) return 1;
+    } else {
+      memory_ready = true;
     }
   }
 
@@ -305,6 +338,93 @@ int main(int argc, char** argv) {
 
   fish::orchestrator::ReplyBudget budget(
       static_cast<int>(cfg.get_int_or("orchestrator.max_replies", 4)));
+
+  // 媒体缓存：入站图片/语音落本地副本。
+  // 平台给的 URL 是临时签名链接，过期成死链，记忆里必须存本地路径。
+  fish::media::MediaCache::Config media_cfg;
+  media_cfg.dir = cfg.get_or("memory.media_dir", "data/memory/media");
+  fish::media::MediaCache media_cache(media_cfg);
+  {
+    auto e = media_cache.init();
+    if (!e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "media_init_failed")
+          .field("detail", e.detail);
+    }
+  }
+
+  // ── 工具注册 ──
+  // 工具是「能力」，模型据此决定何时调用。没有对应后端时就不注册，
+  // 模型也不会去尝试调用不存在的工具。
+  fish::tool::Registry tools;
+  std::unique_ptr<fish::core::IWebSearch> search_holder;
+
+  // 记忆检索：用向量 + 关键词混合召回
+  if (memory_ready) {
+    tools.add(std::make_shared<fish::tool::MemorySearchTool>(
+        [&memory_sys](const std::string& query, int top_k) {
+          std::vector<std::string> out;
+          auto hits = memory_sys.search(query, top_k);
+          if (hits.ok()) {
+            for (const auto& h : *hits.value) out.push_back(h.text);
+          }
+          return out;
+        }));
+  }
+
+  // 本地图片检索：按标签在形象库里找
+  {
+    tools.add(std::make_shared<fish::tool::ImageSearchTool>(
+        [&portraits](const std::string& query) {
+          std::vector<std::string> out;
+          for (const auto& p : portraits.find_by_tag(query)) {
+            out.push_back(p.path + " | " + p.caption);
+          }
+          return out;
+        }));
+  }
+
+  // 网络搜索：只有配置了 provider 才注册
+  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
+    auto searcher = fish::capability::make_search(search_cfg);
+    if (searcher.ok() && *searcher.value) {
+      search_holder = std::move(*searcher.value);
+      auto* raw = search_holder.get();
+      tools.add(std::make_shared<fish::tool::WebSearchTool>(
+          [raw](const std::string& query, int max_results) {
+            std::vector<fish::tool::WebSearchTool::Hit> out;
+            auto r = raw->search(query, max_results);
+            if (r.ok()) {
+              for (const auto& h : *r.value) {
+                out.push_back({h.title, h.url, h.snippet});
+              }
+            }
+            return out;
+          }));
+    }
+  }
+
+  fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "tools_ready")
+      .field("count", static_cast<long long>(tools.size()));
+
+  // ── 安全防护 ──
+  fish::guard::InputGuard::Config guard_in_cfg;
+  guard_in_cfg.max_bytes =
+      static_cast<std::size_t>(cfg.get_int_or("guard.max_input_bytes", 8000));
+  guard_in_cfg.detect_injection = cfg.get_bool_or("guard.detect_injection", true);
+  guard_in_cfg.reject_injection = cfg.get_bool_or("guard.reject_injection", true);
+  fish::guard::InputGuard input_guard(guard_in_cfg);
+
+  fish::guard::OutputGuard::Config guard_out_cfg;
+  guard_out_cfg.max_bytes =
+      static_cast<std::size_t>(cfg.get_int_or("guard.max_output_bytes", 4000));
+  guard_out_cfg.redact_secrets = cfg.get_bool_or("guard.redact_secrets", true);
+  guard_out_cfg.strip_links = cfg.get_bool_or("guard.strip_links", true);
+  fish::guard::OutputGuard output_guard(guard_out_cfg);
+
+  fish::guard::RateLimiter::Config rate_cfg;
+  rate_cfg.max_per_window = static_cast<int>(cfg.get_int_or("guard.rate_limit", 12));
+  rate_cfg.window_seconds = static_cast<int>(cfg.get_int_or("guard.rate_window_s", 60));
+  fish::guard::RateLimiter rate_limiter(rate_cfg);
 
   fish::orchestrator::Pipeline::Deps deps;
   deps.chat = chat.get();
@@ -315,6 +435,12 @@ int main(int argc, char** argv) {
   deps.stt = stt.get();
   deps.image = image_model.get();
   deps.portraits = &portraits;
+  deps.media = &media_cache;
+  deps.tools = &tools;
+  deps.max_tool_rounds = static_cast<int>(cfg.get_int_or("tool.max_rounds", 3));
+  deps.input_guard = &input_guard;
+  deps.output_guard = &output_guard;
+  deps.rate_limiter = &rate_limiter;
   deps.memory = &memory_sys;
   deps.consolidator = &consolidator;
   deps.group_voice = cfg.get_bool_or("capability.tts.group_voice", false);
@@ -425,7 +551,33 @@ int main(int argc, char** argv) {
       .field("config", opt.config_path)
       .field("channels", static_cast<long long>(channels.size()));
 
-  // ── 每通道一个线程 ──
+  // ── 调度器：通道线程只 poll，处理在线程池里跑 ──
+  // 这样慢的模型调用不会阻塞收消息，多会话可真正并行。
+  fish::session::SessionRegistry sessions;
+  fish::dispatcher::Dispatcher dispatcher({.threads = 0});
+
+  {
+    // handler 捕获各通道指针，按 session 的 channel 名找到对应通道
+    std::map<std::string, fish::core::IChannel*> by_name;
+    for (std::size_t i = 0; i < channels.size(); ++i) {
+      by_name[channel_names[i]] = channels[i].get();
+    }
+    dispatcher.set_handler([&pipeline, by_name](fish::dispatcher::Task& task) -> int {
+      auto it = by_name.find(task.channel_name);
+      if (it == by_name.end() || it->second == nullptr) return -1;
+      auto r = pipeline.handle(*it->second, task.msg);
+      if (!r.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "runtime", "handle_failed")
+            .field("session", task.session ? task.session->key() : "?")
+            .field("detail", r.error.detail);
+        return -1;
+      }
+      if (!r.value.has_value()) return 0;
+      return *r.value;
+    });
+  }
+
+  // ── 每通道一个收消息线程 ──
   std::vector<std::thread> workers;
   std::vector<std::unique_ptr<ChannelStats>> stats;
   stats.reserve(channels.size());
@@ -438,7 +590,7 @@ int main(int argc, char** argv) {
     fish::core::IChannel* raw = channels[i].get();
     const std::string name = channel_names[i];
 
-    workers.emplace_back([raw, st_ptr, &pipeline, name] {
+    workers.emplace_back([raw, st_ptr, &dispatcher, &sessions, name] {
       while (!g_stop.load()) {
         auto msg = raw->poll();
         if (!msg.ok()) {
@@ -450,10 +602,25 @@ int main(int argc, char** argv) {
           continue;
         }
         st_ptr->polled.fetch_add(1);
-        auto r = pipeline.handle(*raw, *msg.value);
-        if (r.ok()) {
-          st_ptr->handled.fetch_add(1);
-        } else {
+
+        // 构造会话上下文：key 由统一函数推导，保证落盘和内存用同一把键
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        fish::session::SessionInfo info;
+        info.key = fish::session::session_key(*msg.value);
+        info.channel = name;
+        info.kind = msg.value->kind;
+        info.created_at_ms = now_ms;
+        info.last_active_ms = now_ms;
+
+        fish::dispatcher::Task task;
+        task.msg = std::move(*msg.value);
+        task.session = sessions.get_or_create(info);
+        task.channel_name = name;
+
+        if (!dispatcher.submit(std::move(task))) {
           st_ptr->errors.fetch_add(1);
         }
       }
@@ -491,6 +658,9 @@ int main(int argc, char** argv) {
   for (auto& t : workers) {
     if (t.joinable()) t.join();
   }
+  // 通道线程停了之后，把已提交的任务跑完再退出
+  // （否则进行中的模型调用会被硬中断，回复丢失）
+  dispatcher.shutdown();
   channels.clear();
 
   fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "shutdown");

@@ -20,6 +20,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
+// 测试统一用的会话 id。记忆按会话分目录，测试也必须走同一个键，
+// 否则写和读会落到不同目录。
+constexpr const char* kTestConv = "test-conv-001";
+
 int g_failures = 0;
 
 #define CHECK(cond, msg)                               \
@@ -129,9 +133,9 @@ void test_notes_roundtrip() {
   f.content = "喜欢短回复";
   f.confidence = 0.9;
   f.created = "2026-11-13";
-  CHECK(notes.append_fact(f).ok(), "append_fact ok");
+  CHECK(notes.append_fact(kTestConv, f).ok(), "append_fact ok");
 
-  auto loaded = notes.load_facts();
+  auto loaded = notes.load_facts(kTestConv);
   CHECK(loaded.ok() && loaded.value->size() == 1, "fact persisted");
   CHECK(loaded.ok() && (*loaded.value)[0].content == "喜欢短回复", "content roundtrip");
   CHECK(loaded.ok() && (*loaded.value)[0].subject == "偏好", "subject roundtrip");
@@ -141,13 +145,13 @@ void test_notes_roundtrip() {
   ep.summary = "聊了加班";
   ep.importance = 0.7;
   ep.created = "2026-11-13";
-  CHECK(notes.append_episode(ep).ok(), "append_episode ok");
-  auto eps = notes.load_episodes();
+  CHECK(notes.append_episode(kTestConv, ep).ok(), "append_episode ok");
+  auto eps = notes.load_episodes(kTestConv);
   CHECK(eps.ok() && eps.value->size() == 1, "episode persisted");
 
   std::vector<fish::memory::Trait> traits{{"不喜欢被追问细节", 4}};
-  CHECK(notes.save_traits(traits).ok(), "save_traits ok");
-  auto lt = notes.load_traits();
+  CHECK(notes.save_traits(kTestConv, traits).ok(), "save_traits ok");
+  auto lt = notes.load_traits(kTestConv);
   CHECK(lt.ok() && (*lt.value)[0].evidence == 4, "trait evidence roundtrip");
 
   fs::remove_all(dir);
@@ -190,19 +194,19 @@ void test_consolidation() {
     "traits":[{"pattern":"不喜欢被追问","evidence":2}]
   })";
 
-  auto r = fish::memory::Consolidator::apply_json(out, "2026-11-13", &notes, &idx, &emb);
+  auto r = fish::memory::Consolidator::apply_json(out, "2026-11-13", &notes, &idx, &emb, kTestConv);
   CHECK(r.ok(), "apply_json ok");
   CHECK(r.ok() && r.value->episodes_written == 1, "one episode");
   CHECK(r.ok() && r.value->facts_written == 1, "one fact");
 
-  auto facts = notes.load_facts();
+  auto facts = notes.load_facts(kTestConv);
   CHECK(facts.ok() && facts.value->size() == 1, "fact in sidecar file");
   CHECK(idx.item_count() == 2, "index has episode + fact");
 
   // 证据累加
   const std::string out2 = R"({"episodes":[],"facts":[],"traits":[{"pattern":"不喜欢被追问","evidence":2}]})";
-  fish::memory::Consolidator::apply_json(out2, "2026-11-14", &notes, &idx, &emb);
-  auto traits = notes.load_traits();
+  fish::memory::Consolidator::apply_json(out2, "2026-11-14", &notes, &idx, &emb, kTestConv);
+  auto traits = notes.load_traits(kTestConv);
   CHECK(traits.ok() && (*traits.value)[0].evidence == 4, "trait evidence accumulates");
 
   idx.close();
@@ -225,7 +229,7 @@ void test_index_rebuild() {
     f.content = "她养了一只猫";
     f.confidence = 0.9;
     f.created = "2026-11-13";
-    ms.notes().append_fact(f);
+    ms.notes().append_fact(kTestConv, f);
   }
 
   // 删除索引，验证从旁路文件重建
@@ -257,7 +261,7 @@ void test_gather() {
   ms.init();
 
   auto j = R"({"episodes":[],"facts":[{"subject":"用户","content":"养了一只叫豆豆的猫","confidence":0.9}],"traits":[]})";
-  fish::memory::Consolidator::apply_json(j, "2026-11-13", &ms.notes(), &ms.index(), &emb);
+  fish::memory::Consolidator::apply_json(j, "2026-11-13", &ms.notes(), &ms.index(), &emb, kTestConv);
 
   fish::memory::Message u, a;
   u.role = "user";
