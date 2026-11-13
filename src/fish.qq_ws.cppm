@@ -61,6 +61,24 @@ struct Config {
   int token_refresh_lead_ms{120000};  // 提前 2 分钟刷新
 };
 
+// 入站附件（QQ 官方把图片/语音放在 attachments 数组里）
+struct Attachment {
+  std::string content_type;   // image/jpeg、image/png、voice ...
+  std::string url;            // 可直接下载的 URL（腾讯 CDN，带签名，有有效期）
+  std::string filename;
+  int size{0};
+  int width{0};
+  int height{0};
+  [[nodiscard]] bool is_image() const {
+    return content_type.rfind("image/", 0) == 0;
+  }
+  [[nodiscard]] bool is_voice() const {
+    return content_type.rfind("voice", 0) == 0 ||
+           content_type.rfind("audio/", 0) == 0 ||
+           content_type == "silk";
+  }
+};
+
 // 解析后的事件（只保留收发消息需要的信息）
 struct Event {
   std::string type;              // GROUP_AT_MESSAGE_CREATE / C2C_MESSAGE_CREATE / READY
@@ -71,6 +89,7 @@ struct Event {
   std::string content;           // 已去掉 <@!xxx> 前缀
   bool is_group{false};
   bool mentioned{false};
+  std::vector<Attachment> attachments;  // 图片 / 语音
 };
 
 class Client {
@@ -138,7 +157,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* kGatewayUrl = "https://api.sgroup.qq.com/websocket";
+constexpr const char* kGatewayUrl = "wss://api.sgroup.qq.com/websocket";
 
 // 去掉群消息里的 <@!bot_id> / <@bot_id> 前缀
 std::string strip_mention(std::string s) {
@@ -420,6 +439,28 @@ void Client::parse_dispatch(const std::string& type, const json& d) {
   }
 
   if (ev.message_id.empty()) return;
+
+  // 附件：QQ 官方把图片/语音放在 attachments 数组，
+  // content 里只有文字（纯图片消息时 content 为空）。
+  if (d.contains("attachments") && d["attachments"].is_array()) {
+    for (const auto& a : d["attachments"]) {
+      if (!a.is_object()) continue;
+      Attachment att;
+      att.content_type = a.value("content_type", "");
+      att.url = a.value("url", "");
+      att.filename = a.value("filename", "");
+      if (a.contains("size") && a["size"].is_number()) {
+        att.size = a["size"].get<int>();
+      }
+      if (a.contains("width") && a["width"].is_number()) {
+        att.width = a["width"].get<int>();
+      }
+      if (a.contains("height") && a["height"].is_number()) {
+        att.height = a["height"].get<int>();
+      }
+      if (!att.url.empty()) ev.attachments.push_back(std::move(att));
+    }
+  }
 
   if (on_event_) {
     try {

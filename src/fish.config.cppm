@@ -93,7 +93,18 @@ std::string expand_env(const std::string& raw, std::vector<std::string>* missing
       }
       const char* val = std::getenv(name.c_str());
       if (val != nullptr && *val != '\0') {
-        out += val;
+        // 剥掉尾部 CR/LF：Windows 写的 .env 经 shell source 后会带 \r，
+        // 直接拼进密钥会导致鉴权失败（100007 appid invalid）。
+        std::string sv{val};
+        while (!sv.empty() &&
+               (sv.back() == '\r' || sv.back() == '\n' || sv.back() == ' ' ||
+                sv.back() == '\t')) {
+          sv.pop_back();
+        }
+        while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t')) {
+          sv.erase(sv.begin());
+        }
+        out += sv;
       } else if (has_def) {
         out += def;
       } else if (missing != nullptr) {

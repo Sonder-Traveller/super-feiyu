@@ -13,6 +13,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <random>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -189,6 +190,66 @@ std::string http_base_from_ws(const std::string& ws) {
   return s;
 }
 
+// 标准 base64 编码（RFC 4648，带 = 填充）。
+// QQ 官方的二进制直传要求 file_data 是这个格式。
+//
+// 注意：必须先转 unsigned char 再提升到 unsigned。
+// char 在多数平台是有符号的，PNG 等二进制里有大量 >127 的字节，
+// 直接 static_cast<unsigned>(char) 会做符号扩展（0x80 → 0xFFFFFF80），
+// 污染位运算，产出的 base64 长度正确但内容全错，
+// 腾讯会报 850019「富媒体文件格式不支持」。
+std::string base64_encode(const std::string& in) {
+  static constexpr char kTable[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((in.size() + 2) / 3) * 4);
+
+  const auto byte_at = [&in](std::size_t idx) -> unsigned {
+    return static_cast<unsigned>(static_cast<unsigned char>(in[idx]));
+  };
+
+  std::size_t i = 0;
+  while (i + 2 < in.size()) {
+    const unsigned n = (byte_at(i) << 16) | (byte_at(i + 1) << 8) | byte_at(i + 2);
+    out += kTable[(n >> 18) & 0x3F];
+    out += kTable[(n >> 12) & 0x3F];
+    out += kTable[(n >> 6) & 0x3F];
+    out += kTable[n & 0x3F];
+    i += 3;
+  }
+  const std::size_t rest = in.size() - i;
+  if (rest == 1) {
+    const unsigned n = byte_at(i) << 16;
+    out += kTable[(n >> 18) & 0x3F];
+    out += kTable[(n >> 12) & 0x3F];
+    out += "==";
+  } else if (rest == 2) {
+    const unsigned n = (byte_at(i) << 16) | (byte_at(i + 1) << 8);
+    out += kTable[(n >> 18) & 0x3F];
+    out += kTable[(n >> 12) & 0x3F];
+    out += kTable[(n >> 6) & 0x3F];
+    out += '=';
+  }
+  return out;
+}
+
+// 全局单调递增的消息序号。
+// QQ 的去重键是 (msg_id, msg_seq)：同一 msg_id 下 seq 重复会被拒
+// （40054005 消息被去重）。进程内单调递增可保证同一次运行内永不重复。
+//
+// 但**重启后计数器会归零**，可能与服务端记着的旧 (msg_id, seq) 撞上
+// （尤其被动回复窗口 5 分钟内重启）。所以起点取一个随机偏移，
+// 让重启后的序号落在历史区间之外。
+unsigned long long next_msg_seq() {
+  static std::atomic<unsigned long long> counter{0};
+  static const unsigned long long base = [] {
+    // 1..900000 的随机起点，远大于单次运行会发出的消息数
+    std::random_device rd;
+    return static_cast<unsigned long long>(rd() % 900000) + 1;
+  }();
+  return base + (++counter);
+}
+
 }  // namespace
 
 // ── LocalChannel ────────────────────────────────────────
@@ -285,6 +346,9 @@ std::string QQOfficialChannel::auth_header() const {
 }
 
 Error QQOfficialChannel::refresh_token() {
+  // 注意：本函数自己管理 mu_，调用方**不得**持锁调用，
+  // 否则 std::mutex 不可重入会直接死锁。
+  // 历史 bug：send() 持锁调用这里，导致发图时进程永久卡住。
   json payload{{"appId", cfg_.app_id}, {"clientSecret", cfg_.app_secret}};
   auto resp = fish::capability::HttpClient::instance().post_json(cfg_.token_url, {},
                                                                  payload.dump(), 15000);
@@ -306,9 +370,14 @@ Error QQOfficialChannel::refresh_token() {
         ttl = std::stoll(j["expires_in"].get<std::string>());
       }
     }
-    std::lock_guard<std::mutex> lock(mu_);
-    access_token_ = j["access_token"].get<std::string>();
-    token_expiry_ = fish::core::Clock::now() + std::chrono::seconds(ttl - 120);
+    // 提前量不能超过 ttl 本身，否则 expiry 落在过去，
+    // 每次 send 都会重新取 token（QQ 偶尔只给 60s 的短 token）。
+    const long long lead = std::min<long long>(120, ttl / 4);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      access_token_ = j["access_token"].get<std::string>();
+      token_expiry_ = fish::core::Clock::now() + std::chrono::seconds(ttl - lead);
+    }
     ::fish::log::log_line(::fish::log::LogLevel::kInfo, "qq", "token_ok")
         .field("ttl_s", ttl);
     return Error::none();
@@ -349,6 +418,25 @@ Error QQOfficialChannel::connect() {
       b.text = ev.content;
       msg.blocks.push_back(std::move(b));
     }
+    // 图片 / 语音附件：QQ 官方放在 attachments 里，content 可能为空
+    for (const auto& att : ev.attachments) {
+      fish::core::ContentBlock b;
+      b.media_url = att.url;
+      b.mime = att.content_type;
+      if (att.is_image()) {
+        b.kind = fish::core::BlockKind::kImage;
+      } else if (att.is_voice()) {
+        b.kind = fish::core::BlockKind::kVoice;
+      } else {
+        continue;  // 文件等其他类型暂不处理
+      }
+      msg.blocks.push_back(std::move(b));
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "qq", "attachment")
+          .field("type", att.content_type)
+          .field("bytes", static_cast<long long>(att.size))
+          .field("w", static_cast<long long>(att.width))
+          .field("h", static_cast<long long>(att.height));
+    }
     if (msg.blocks.empty()) return;
 
     std::lock_guard<std::mutex> lock(mu_);
@@ -386,72 +474,120 @@ Result<fish::core::InboundMessage> QQOfficialChannel::poll() {
 }
 
 Result<std::string> QQOfficialChannel::upload_media(const std::string& conv_id, bool is_group,
-                                                    const std::string& local_path,
+                                                    const std::string& media_ref,
                                                     int file_type) {
   // file_type: 1=图片 2=视频 3=语音 4=文件
-  std::ifstream in(local_path, std::ios::binary | std::ios::ate);
-  if (!in) {
-    return Result<std::string>::fail(ErrorCode::kBadRequest, "media_open_failed");
-  }
-  const auto size = in.tellg();
-  if (size <= 0) {
-    return Result<std::string>::fail(ErrorCode::kBadRequest, "media_empty");
-  }
-  in.seekg(0);
-  std::string bytes(static_cast<std::size_t>(size), '\0');
-  in.read(bytes.data(), size);
+  //
+  // 官方支持三种上传方式（见 /v2/groups/{id}/files 文档）：
+  //   1. URL 上传   —— 需要公网可访问的 URL，腾讯自己去下载
+  //   2. 分片上传   —— upload_prepare + PUT 分片 + 合并，适合大文件
+  //   3. 二进制直传 —— JSON 里放 file_data(base64)，上限 5MB
+  //
+  // 这里用**方式 3**：不需要公网端口，部署最简单。
+  // 之前误用 multipart file=@ 会报 40093007「富媒体文件下载失败」，
+  // 因为官方根本不接受 multipart，只认 JSON 的 file_data / url / upload_id。
+  //
+  // 超过 5MB 的图（基本不会）回退到 URL 方式，由调用方保证 media_ref 是 URL。
+  constexpr std::size_t kDirectMax = 5u << 20;
 
-  // 平台要求先上传拿 file_info；用 multipart 提交
-  // 注意：为保持依赖精简，这里用 curl 命令行调用 multipart 上传
-  const std::string tmp = "/tmp/fish_upload_" + std::to_string(std::rand());
-  {
-    std::ofstream f(tmp, std::ios::binary);
-    if (!f) return Result<std::string>::fail(ErrorCode::kInternal, "tmp_write");
-    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  std::string url_field;
+  std::string file_data_b64;
+  std::string file_name = "image.png";
+
+  const bool is_url = media_ref.rfind("http://", 0) == 0 ||
+                      media_ref.rfind("https://", 0) == 0;
+  if (is_url) {
+    url_field = media_ref;
+  } else {
+    std::ifstream in(media_ref, std::ios::binary | std::ios::ate);
+    if (!in) {
+      return Result<std::string>::fail(ErrorCode::kBadRequest, "media_open_failed");
+    }
+    const auto size = in.tellg();
+    if (size <= 0) {
+      return Result<std::string>::fail(ErrorCode::kBadRequest, "media_empty");
+    }
+    in.seekg(0);
+    std::string bytes(static_cast<std::size_t>(size), '\0');
+    in.read(bytes.data(), size);
+
+    // 文件名取路径最后一段（官方要求扩展名与类型一致）
+    const auto slash = media_ref.find_last_of('/');
+    if (slash != std::string::npos && slash + 1 < media_ref.size()) {
+      file_name = media_ref.substr(slash + 1);
+    }
+
+    if (bytes.size() > kDirectMax) {
+      return Result<std::string>::fail(
+          ErrorCode::kBadRequest,
+          "media_too_large_for_direct_upload(" + std::to_string(bytes.size()) +
+              "B>5MB)，需改用分片上传");
+    }
+    file_data_b64 = base64_encode(bytes);
   }
 
   std::string conv = conv_id;
   if (is_group && conv.rfind("g:", 0) == 0) conv = conv.substr(2);
-  const std::string url = cfg_.api_base +
-                          (is_group ? "/v2/groups/" + conv + "/files"
-                                    : "/v2/users/" + conv + "/files");
+  const std::string api_url = cfg_.api_base +
+                              (is_group ? "/v2/groups/" + conv + "/files"
+                                        : "/v2/users/" + conv + "/files");
 
-  const std::string cmd = "curl -s -X POST '" + url + "' "
-                          "-H 'Authorization: " + auth_header() + "' " +
-                          "-F 'file_type=" + std::to_string(file_type) + "' " +
-                          "-F 'srv_send_msg=false' " +
-                          "-F 'file=@" + tmp + "' 2>/dev/null";
-  std::string out;
-  if (FILE* pipe = popen(cmd.c_str(), "r")) {
-    char buf[8192];
-    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) out += buf;
-    pclose(pipe);
+  json payload{{"file_type", file_type}, {"srv_send_msg", false}};
+  if (!url_field.empty()) {
+    payload["url"] = url_field;
+  } else {
+    payload["file_name"] = file_name;
+    payload["file_data"] = file_data_b64;
   }
-  std::remove(tmp.c_str());
 
-  if (out.empty()) {
-    return Result<std::string>::fail(ErrorCode::kUpstreamUnavailable, "upload_no_response");
+  // 上传失败时 850019「格式不支持」很难定位，把请求元信息打出来
+  // （不打 base64 本身，太长）
+  ::fish::log::log_line(::fish::log::LogLevel::kDebug, "qq", "upload_req")
+      .field("file_type", file_type)
+      .field("file_name", file_name)
+      .field("b64_len", static_cast<long long>(file_data_b64.size()))
+      .field("has_url", !url_field.empty());
+
+  auto resp = fish::capability::HttpClient::instance().post_json(
+      api_url, {{"Authorization", auth_header()}}, payload.dump(), 60000);
+  if (!resp.ok()) {
+    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq", "upload_failed")
+        .field("detail", resp.error.detail)
+        .field("bytes", static_cast<long long>(file_data_b64.size()));
+    return Result<std::string>::fail(resp.error.code, "upload_" + resp.error.detail);
   }
+
   try {
-    const auto j = json::parse(out);
-    if (j.contains("file_info")) {
+    const auto j = json::parse(resp.value->body);
+    if (j.contains("file_info") && j["file_info"].is_string()) {
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "qq", "upload_ok")
+          .field("mode", url_field.empty() ? "direct" : "url")
+          .field("bytes", static_cast<long long>(file_data_b64.size()));
       return Result<std::string>::ok(j["file_info"].get<std::string>());
     }
-  } catch (...) {
+    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq", "upload_no_file_info")
+        .field("body", resp.value->body.substr(0, 300));
+  } catch (const std::exception& e) {
+    return Result<std::string>::fail(ErrorCode::kBadRequest,
+                                     std::string("upload_parse:") + e.what());
   }
-  return Result<std::string>::fail(ErrorCode::kUpstreamUnavailable, "upload_failed");
+  return Result<std::string>::fail(ErrorCode::kUpstreamUnavailable, "upload_no_file_info");
 }
 
 Error QQOfficialChannel::send(const fish::core::OutboundMessage& msg, int attempt_no) {
   if (!connected()) {
     return Error::make(ErrorCode::kUpstreamUnavailable, "qq_not_connected");
   }
+  // 检查 token 是否要刷新：先只读判断，**不要在持锁状态下调用 refresh_token()**
+  // （refresh_token 自己会加 mu_，std::mutex 不可重入 → 死锁）
+  bool need_refresh = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    if (fish::core::Clock::now() >= token_expiry_) {
-      auto e = refresh_token();
-      if (!e.ok()) return e;
-    }
+    need_refresh = (fish::core::Clock::now() >= token_expiry_);
+  }
+  if (need_refresh) {
+    auto e = refresh_token();
+    if (!e.ok()) return e;
   }
 
   const bool is_group = msg.conversation_id.rfind("g:", 0) == 0;
@@ -463,7 +599,16 @@ Error QQOfficialChannel::send(const fish::core::OutboundMessage& msg, int attemp
   for (const auto& block : msg.blocks) {
     json payload;
     payload["msg_id"] = msg.reply_to_message_id;  // 被动回复凭证
-    payload["msg_seq"] = attempt_no;              // 同 msg_id 递增
+    // msg_seq 必须在同一 msg_id 下唯一递增。
+    // 之前用 attempt_no（每个出站块都从 1 开始），
+    // 导致第二条消息就被判「40054005 消息被去重」。
+    // 这里用进程内单调递增的计数器，保证永不重复。
+    const auto seq = next_msg_seq();
+    payload["msg_seq"] = static_cast<long long>(seq);
+    ::fish::log::log_line(::fish::log::LogLevel::kDebug, "qq", "send_seq")
+        .field("msg_id", msg.reply_to_message_id)
+        .field("msg_seq", static_cast<long long>(seq))
+        .field("attempt", attempt_no);
 
     if (block.kind == fish::core::BlockKind::kText) {
       payload["content"] = block.text;

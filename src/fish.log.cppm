@@ -27,6 +27,11 @@ class Logger {
     Line(Logger& owner, LogLevel lv, std::string_view module, std::string_view event);
     ~Line();
     Line& field(std::string_view k, std::string_view v);
+    // const char* 必须显式接住：否则会优先匹配 bool 重载，
+    // 日志里只剩 detail:true，真实错误信息丢失。
+    Line& field(std::string_view k, const char* v) {
+      return field(k, std::string_view{v == nullptr ? "" : v});
+    }
     Line& field(std::string_view k, long long v);
     Line& field(std::string_view k, unsigned long long v);
     Line& field(std::string_view k, int v);
