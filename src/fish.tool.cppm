@@ -121,8 +121,14 @@ class WebSearchTool final : public ITool {
   explicit WebSearchTool(Searcher s) : search_(std::move(s)) {}
   [[nodiscard]] std::string name() const override { return "web_search"; }
   [[nodiscard]] std::string description() const override {
-    return "搜索互联网获取最新信息。当对方问及近期事件、"
-           "你不确定的事实、或需要外部资料时使用。";
+    return "搜索互联网获取信息。适用于：近期事件、你不确定的事实、需要外部资料。\n"
+           "提高结果质量的技巧：\n"
+           "- 优先搜原始出处（官方文档、当事人账号），而不是转述文章\n"
+           "- 加 site: 限定可信站点，如 site:github.com、site:gov.cn\n"
+           "- 加 after:2026 限定时间，避免搜到过时内容\n"
+           "- 用「原文」「出处」「官方」这类词找一手来源\n"
+           "注意：搜索结果里混着大量营销号和 AI 生成内容，"
+           "多条结果说法一致也可能是因为互相转载。拿到结果后要自己判断可信度。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -200,6 +206,27 @@ namespace fish::tool {
 using json = nlohmann::json;
 
 namespace detail {
+
+// 搜索结果的来源可信度警示。
+//
+// 为什么需要：网络搜索结果里混着大量营销号、AI 生成的 SEO 内容、
+// 个人自设。实测教训：查"大肥鱼人设"时，多家媒体和百科互相转载同一篇
+// 营销号文章，把「傲娇」「叫用户鱼片」这类小范围自设写成通稿，
+// 交叉验证看起来"多来源一致"，其实同源。
+//
+// 所以每次给模型搜索结果，都要附上这段，让它自己判断可信度。
+constexpr const char* kSourceWarning =
+    "\n\n【关于以上搜索结果的提醒】\n"
+    "1. 多条结果说法一致，不代表是对的——营销号会互相转载，"
+    "看起来「多来源」其实同源。\n"
+    "2. 区分这三类，可信度从高到低：\n"
+    "   - 一手事实（官方文档、当事人原话、可核实的原始记录）\n"
+    "   - 二手转述（媒体报道、百科词条）—— 可能失真\n"
+    "   - 营销号/自媒体/SEO 内容 —— 常把猜测写成定论，不要采信\n"
+    "3. 遇到「官方认证」「正统设定」「据说」这类措辞，要警惕。\n"
+    "4. 如果搜索结果里有矛盾，如实告诉对方「网上说法不一致」，"
+    "不要自己挑一个当成事实。\n"
+    "5. 不确定就说不确定。编一个答案被拆穿，比直接说不知道难看得多。";
 
 // 工具结果给模型看之前的截断，避免超长内容污染上下文
 constexpr std::size_t kMaxContentBytes = 4000;
@@ -429,6 +456,8 @@ Outcome WebSearchTool::run(const Call& call) {
     if (!hits[i].url.empty()) s += "\n   来源编号 " + std::to_string(i + 1);
     s += "\n";
   }
+  // 附来源可信度警示：搜索结果里混着大量营销号，必须让模型自己判断
+  s += detail::kSourceWarning;
   out.ok = true;
   out.content = detail::truncate(std::move(s));
   return out;
@@ -471,6 +500,8 @@ Outcome WebFetchTool::run(const Call& call) {
   std::string s;
   if (!page.title.empty()) s += page.title + "\n\n";
   s += page.content;
+  // 抓到的页面同样可能是营销号或 AI 生成内容
+  s += detail::kSourceWarning;
   out.ok = true;
   out.content = detail::truncate(std::move(s));
   return out;
@@ -533,6 +564,11 @@ Outcome MemeLookupTool::run(const Call& call) {
     s += h.term + "：" + h.meaning;
     if (!h.usage.empty()) s += "\n  用法：" + h.usage;
     s += "\n";
+  }
+  // 热梗领域营销号最多：同一个梗的解释经常被抄来抄去还抄错，
+  // 必须提醒模型别把搜索到的说法当成定论。
+  if (source == "联网搜索") {
+    s += detail::kSourceWarning;
   }
   out.ok = true;
   out.content = detail::truncate(std::move(s));

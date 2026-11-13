@@ -378,6 +378,24 @@ std::string format_relative_time(std::int64_t at_ms) {
   return buf;
 }
 
+// 解析回复里的语音标记。
+//   [VOICE]  → 返回 true，并把标记从文本里删掉
+//
+// 设计：和 [PHOTO] 一样是显式标记，不是"有 TTS 就每条都发"。
+// 语音是重资源（合成耗时、占配额、用户侧还得点开听），
+// 应该只在语气需要时用，比如"懒得打字"的场合。
+bool extract_voice_marker(std::string& text) {
+  const std::string marker = "[VOICE]";
+  const auto pos = text.find(marker);
+  if (pos == std::string::npos) return false;
+  text.erase(pos, marker.size());
+  // 清理残留空白
+  while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
+  const auto nb = text.find_first_not_of(" \t\n");
+  if (nb != std::string::npos) text = text.substr(nb);
+  return true;
+}
+
 Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
     const fish::core::InboundMessage& msg) {
   std::vector<fish::core::ContentBlock> out;
@@ -767,9 +785,16 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
-  const bool voice_ok = deps_.tts != nullptr && cap.supports_voice_out &&
+  // 语音：只在模型主动要求时发，不是每条都发。
+  //
+  // 之前是「只要 TTS 可用就每条都合成语音」，结果每条消息都带一段语音，
+  // 既吵又浪费配额。改成和图片一样的标记机制：模型用 [VOICE] 表示
+  // "这条我想用语音说"，通常用于语气需要表达的场合。
+  const bool wants_voice = extract_voice_marker(reply_text);
+  const bool voice_ok = wants_voice && deps_.tts != nullptr &&
+                        cap.supports_voice_out && !wants_photo &&
                         (msg.kind == fish::core::ChatKind::kPrivate || deps_.group_voice);
-  if (voice_ok && !wants_photo) {   // 发图时不叠加语音，避免一次回太多
+  if (voice_ok) {
     auto audio = deps_.tts->synthesize(reply_text);
     if (audio.ok()) {
       fish::core::ContentBlock voice;
@@ -777,6 +802,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
       voice.media_url = std::move(*audio.value);
       voice.mime = "audio/mpeg";
       outgoing.push_back(std::move(voice));
+      ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "voice_attached");
+    } else {
+      ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "tts_failed")
+          .field("detail", audio.error.detail);
     }
   }
 
