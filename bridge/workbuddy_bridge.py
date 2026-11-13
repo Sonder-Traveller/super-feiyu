@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """WorkBuddy 桥接层：把本机已登录的 WorkBuddy 变成 OpenAI 兼容接口。
 
-**它不属于 super-feiyu 本体。** 独立进程，super-feiyu 只把它当成一个
-普通的 OpenAI 兼容 provider（provider = "openai", base_url = 本服务）。
+**独立进程，不属于 super-feiyu 本体。**
 
-    super-feiyu ──▶ http://127.0.0.1:18081/v1 ──▶ 本桥接 ──▶ WorkBuddy 上游
-       (capability)                                              (copilot.tencent.com
-                                                                 或 workbuddy.ai)
+    super-feiyu ──▶ http://127.0.0.1:PORT/v1 ──▶ 本桥接 ──▶ WorkBuddy 上游
 
 设计要点：
-1. 凭据从 WorkBuddy 桌面端的凭据文件读取，**只在进程内存里**，不落盘、不进日志
-2. 上游只支持流式（stream=true），本桥接把 SSE 聚合成一次性响应
-3. 对外接口是 OpenAI 兼容的 /v1/chat/completions（非流式）
-4. 区域优先：cn 与 global 的 token 互不通用，按账号实际登录的 domain 路由
-5. 不内置任何密钥；全部来自用户机器上已存在的凭据文件
+1. 凭据从 WorkBuddy 桌面端凭据库读取，只在进程内存里，不落盘、不进日志
+2. 上游强制流式（stream=true），本桥接把 SSE 聚合成一次性响应
+3. 多账号轮换：某个账号限流/失败时自动切下一个
+4. 区域感知：cn 与 global 的 token 互不通用，各自绑定自己的 domain
+5. 主机白名单：防止凭据被转发到任意地址
 
 用法:
-    python3 workbuddy_bridge.py [--port 18081] [--vault PATH]
+    python3 workbuddy_bridge.py [--port 18091] [--vault PATH] [--region cn|global|auto]
 """
 from __future__ import annotations
 
@@ -25,14 +22,16 @@ import json
 import os
 import ssl
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
-# 允许桥接走的网关主机（防止 token 被转发到任意地址）
+# 只允许这些主机（防止 token 被转发到任意地址）
 ALLOWED_HOST_SUFFIXES = (
     "copilot.tencent.com",
     "tencentbuddy.com",
@@ -44,44 +43,100 @@ ALLOWED_HOST_SUFFIXES = (
 
 DEFAULT_MODEL = "fast-model"
 
+# 上游要求的最小请求头集（实测：缺 User-Agent 会 400）
+UA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/5.8.3"
 
-# ── 凭据 ────────────────────────────────────────────────
-class Credentials:
-    """从 WorkBuddy 凭据库读取 token。只在内存中保留。"""
 
-    def __init__(self, vault_dir: Path):
-        self.vault_dir = vault_dir
+# ── 凭据池 ──────────────────────────────────────────────
+class Account:
+    __slots__ = ("region", "name", "token", "domain", "failures", "cooldown_until")
 
-    def _candidates(self):
-        """按区域目录遍历凭据文件，cn 优先。"""
+    def __init__(self, region: str, name: str, token: str, domain: str):
+        self.region = region
+        self.name = name
+        self.token = token
+        self.domain = domain
+        self.failures = 0
+        self.cooldown_until = 0.0
+
+    def available(self) -> bool:
+        return time.time() >= self.cooldown_until
+
+    def penalize(self, seconds: float) -> None:
+        self.failures += 1
+        self.cooldown_until = time.time() + seconds
+
+    def reward(self) -> None:
+        self.failures = 0
+        self.cooldown_until = 0.0
+
+
+class AccountPool:
+    """多账号池：优先用健康的，失败自动冷却并切换。"""
+
+    def __init__(self, vault: Path, prefer_region: str = "auto"):
+        self.vault = vault
+        self.prefer_region = prefer_region
+        self.accounts: list[Account] = []
+        self._lock = threading.Lock()
+        self._rr = 0
+        self.reload()
+
+    def reload(self) -> None:
+        accounts: list[Account] = []
         for region in ("cn", "global"):
-            d = self.vault_dir / region
-            if d.is_dir():
-                for f in sorted(d.glob("*.json")):
-                    yield region, f
+            d = self.vault / region
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.json")):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                auth = data.get("auth") or {}
+                token = auth.get("accessToken")
+                domain = auth.get("domain")
+                if not isinstance(token, str) or not token or token.startswith("{"):
+                    continue          # 加密信封暂不支持
+                if not isinstance(domain, str) or not domain:
+                    continue
+                name = (data.get("account") or {}).get("nickname") or f.stem[:8]
+                accounts.append(Account(region, name, token, domain))
 
-    @staticmethod
-    def _parse(path: Path):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        auth = data.get("auth") or {}
-        token = auth.get("accessToken")
-        domain = auth.get("domain")
-        if not isinstance(token, str) or not token:
-            return None
-        if not isinstance(domain, str) or not domain:
-            return None
-        return {"token": token, "domain": domain}
+        # 区域优先级排序
+        if self.prefer_region in ("cn", "global"):
+            accounts.sort(key=lambda a: 0 if a.region == self.prefer_region else 1)
 
-    def best(self):
-        """返回 (token, domain)。优先 cn（区域优先于新鲜度）。"""
-        for region, path in self._candidates():
-            parsed = self._parse(path)
-            if parsed:
-                return parsed["token"], parsed["domain"]
-        return None
+        with self._lock:
+            self.accounts = accounts
+
+    def pick(self) -> Account | None:
+        with self._lock:
+            if not self.accounts:
+                return None
+            n = len(self.accounts)
+            for i in range(n):
+                idx = (self._rr + i) % n
+                acc = self.accounts[idx]
+                if acc.available():
+                    self._rr = (idx + 1) % n
+                    return acc
+            # 全部冷却中：返回冷却最早结束的
+            return min(self.accounts, key=lambda a: a.cooldown_until)
+
+    def stats(self) -> list[dict]:
+        with self._lock:
+            return [
+                {
+                    "region": a.region,
+                    "name": a.name,
+                    "domain": a.domain,
+                    "failures": a.failures,
+                    "available": a.available(),
+                    "cooldown_s": max(0, int(a.cooldown_until - time.time())),
+                }
+                for a in self.accounts
+            ]
 
 
 def host_allowed(host: str) -> bool:
@@ -89,69 +144,65 @@ def host_allowed(host: str) -> bool:
 
 
 # ── 上游调用 ────────────────────────────────────────────
-def call_upstream(token: str, domain: str, payload: dict, timeout: int = 120) -> dict:
-    """调用上游流式接口，把 SSE 聚合成一次性响应。"""
-    if not host_allowed(domain):
-        raise RuntimeError(f"host not allowed: {domain}")
+def call_upstream(acc: Account, payload: dict, timeout: int) -> dict:
+    """调用上游流式接口，聚合 SSE 成一次性响应。"""
+    if not host_allowed(acc.domain):
+        raise RuntimeError(f"host not allowed: {acc.domain}")
 
-    url = f"https://{domain}/v2/chat/completions"
     body = dict(payload)
-    body["stream"] = True  # 上游强制流式
+    body["stream"] = True
 
     req = urllib.request.Request(
-        url,
+        f"https://{acc.domain}/v2/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {acc.token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
-            "User-Agent": f"WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/5.8.3",
+            "User-Agent": UA,
         },
         method="POST",
     )
 
-    ctx = ssl.create_default_context()
     text_parts: list[str] = []
     usage = None
     model_name = body.get("model", DEFAULT_MODEL)
     finish = "stop"
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            for raw in resp:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except Exception:
-                    continue
-                if chunk.get("model"):
-                    model_name = chunk["model"]
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                for choice in chunk.get("choices") or []:
-                    if choice.get("finish_reason"):
-                        finish = choice["finish_reason"]
-                    delta = choice.get("delta") or {}
-                    piece = delta.get("content")
-                    if piece:
-                        text_parts.append(piece)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")[:400]
-        raise RuntimeError(f"upstream HTTP {e.code}: {detail}") from None
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=ssl.create_default_context()) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except Exception:
+                continue
+            if chunk.get("model"):
+                model_name = chunk["model"]
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+                piece = (choice.get("delta") or {}).get("content")
+                if piece:
+                    text_parts.append(piece)
 
-    text = "".join(text_parts)
     return {
         "id": "wb-bridge",
         "object": "chat.completion",
         "model": model_name,
         "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": text},
-             "finish_reason": finish}
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(text_parts)},
+                "finish_reason": finish,
+            }
         ],
         "usage": usage or {},
     }
@@ -160,7 +211,8 @@ def call_upstream(token: str, domain: str, payload: dict, timeout: int = 120) ->
 # ── HTTP 服务 ───────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     server_version = f"WorkBuddyBridge/{VERSION}"
-    creds: Credentials = None  # type: ignore
+    pool: AccountPool = None  # type: ignore
+    timeout_s = 120
     debug = False
 
     def log_message(self, fmt, *args):
@@ -176,21 +228,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path.rstrip("/") in ("/health", "/v1/health"):
-            token_info = self.creds.best() if self.creds else None
+        path = self.path.rstrip("/")
+        if path in ("/health", "/v1/health"):
+            stats = self.pool.stats() if self.pool else []
+            healthy = [s for s in stats if s["available"]]
             self._json(200, {
                 "status": "ok",
                 "version": VERSION,
-                "credentials": "found" if token_info else "missing",
-                # 绝不返回 token 本身
+                "accounts": len(stats),
+                "healthy": len(healthy),
+                "detail": stats,       # 只有账号名/区域，无 token
             })
             return
-        if self.path.rstrip("/") == "/v1/models":
+        if path in ("/v1/models", "/models"):
             self._json(200, {
                 "object": "list",
-                "data": [{"id": DEFAULT_MODEL, "object": "model", "owned_by": "workbuddy"},
-                         {"id": "balanced-model", "object": "model", "owned_by": "workbuddy"},
-                         {"id": "deep-model", "object": "model", "owned_by": "workbuddy"}],
+                "data": [
+                    {"id": "fast-model", "object": "model", "owned_by": "workbuddy"},
+                    {"id": "balanced-model", "object": "model", "owned_by": "workbuddy"},
+                    {"id": "deep-model", "object": "model", "owned_by": "workbuddy"},
+                    {"id": "auto", "object": "model", "owned_by": "workbuddy"},
+                ],
             })
             return
         self._json(404, {"error": {"message": "not found"}})
@@ -208,76 +266,100 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": "invalid json"}})
             return
 
-        cred = self.creds.best() if self.creds else None
-        if not cred:
-            self._json(503, {"error": {"message": "no workbuddy credentials found"}})
-            return
-        token, domain = cred
-
         payload = {
             "model": req.get("model") or DEFAULT_MODEL,
             "messages": req.get("messages") or [],
-            "stream": True,
         }
         for key in ("temperature", "top_p", "max_tokens"):
             if key in req:
                 payload[key] = req[key]
 
-        try:
-            result = call_upstream(token, domain, payload)
-        except Exception as e:
-            self._json(502, {"error": {"message": str(e)}})
-            return
+        # 多账号重试：失败就换下一个
+        tried: set[str] = set()
+        last_err = "no account"
+        for _ in range(max(1, len(self.pool.accounts))):
+            acc = self.pool.pick()
+            if acc is None:
+                break
+            key = f"{acc.region}/{acc.name}"
+            if key in tried and len(tried) >= len(self.pool.accounts):
+                break
+            tried.add(key)
+            try:
+                result = call_upstream(acc, payload, self.timeout_s)
+                acc.reward()
+                if self.debug:
+                    sys.stderr.write(f"[bridge] {key} ok\n")
+                self._json(200, result)
+                return
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    pass
+                last_err = f"{key} HTTP {e.code}: {detail}"
+                # 限流/服务端错误 → 冷却该账号；4xx 内容错误 → 不冷却但换号
+                acc.penalize(60 if e.code in (429, 500, 502, 503, 504) else 15)
+            except Exception as e:
+                last_err = f"{key} {type(e).__name__}: {e}"
+                acc.penalize(30)
 
-        self._json(200, result)
+        self._json(502, {"error": {"message": last_err}})
 
 
 def main():
     ap = argparse.ArgumentParser(description="WorkBuddy → OpenAI 兼容桥接层")
-    ap.add_argument("--port", type=int, default=18081)
+    ap.add_argument("--port", type=int, default=18091)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--vault", default=None,
-                    help="凭据目录，默认 $DSH_HOME/workbuddy-vault")
+    ap.add_argument("--vault", default=None)
+    ap.add_argument("--region", default="auto", choices=["auto", "cn", "global"])
+    ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
     if args.vault:
         vault = Path(args.vault)
     else:
-        dsh_home = os.environ.get("DSH_HOME")
-        if not dsh_home:
-            # Windows 与 Linux 的常见位置
-            candidates = [
-                Path.home() / ".dsh" / "workbuddy-vault",
-                Path(os.environ.get("USERPROFILE", "")) / ".dsh" / "workbuddy-vault",
-            ]
-            vault = next((c for c in candidates if c.is_dir()), candidates[0])
-        else:
-            vault = Path(dsh_home) / "workbuddy-vault"
+        dsh = os.environ.get("DSH_HOME")
+        cands = [
+            Path(dsh) / "workbuddy-vault" if dsh else None,
+            Path.home() / ".dsh" / "workbuddy-vault",
+            Path(os.environ.get("USERPROFILE", "")) / ".dsh" / "workbuddy-vault",
+        ]
+        vault = next((c for c in cands if c and c.is_dir()), None)  # type: ignore
 
-    if not vault.is_dir():
+    if vault is None or not vault.is_dir():
         print(f"[bridge] 凭据目录不存在: {vault}", file=sys.stderr)
         print("[bridge] 用 --vault 指定，或先在本机登录 WorkBuddy 桌面端", file=sys.stderr)
         return 1
 
-    Handler.creds = Credentials(vault)
+    Handler.pool = AccountPool(vault, args.region)
+    Handler.timeout_s = args.timeout
     Handler.debug = args.debug
 
-    cred = Handler.creds.best()
-    if cred:
-        _, domain = cred
-        print(f"[bridge] 凭据已载入，上游域名: {domain}", flush=True)
+    stats = Handler.pool.stats()
+    if not stats:
+        print("[bridge] 未找到可用凭据，请求将返回 503", file=sys.stderr)
     else:
-        print("[bridge] 未找到可用凭据，请求将返回 503", flush=True)
+        print(f"[bridge] 载入 {len(stats)} 个账号（优先级: {args.region}）:", flush=True)
+        for s in stats:
+            print(f"[bridge]   {s['region']:6s} {s['name']:20s} {s['domain']}", flush=True)
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        print(f"[bridge] 无法监听 {args.host}:{args.port}: {e}", file=sys.stderr)
+        print("[bridge] 换个端口试试：--port 18092", file=sys.stderr)
+        return 1
+
     print(f"[bridge] listening on http://{args.host}:{args.port}/v1", flush=True)
-    print(f"[bridge] 在 super-feiyu 里配置:", flush=True)
-    print(f"[bridge]   [capability.chat]", flush=True)
-    print(f"[bridge]   provider = \"openai\"", flush=True)
-    print(f"[bridge]   base_url = \"http://{args.host}:{args.port}/v1\"", flush=True)
-    print(f"[bridge]   api_key  = \"any-non-empty\"", flush=True)
-    print(f"[bridge]   model    = \"{DEFAULT_MODEL}\"", flush=True)
+    print("[bridge] super-feiyu 配置:", flush=True)
+    print("[bridge]   [capability.chat]", flush=True)
+    print('[bridge]   provider = "openai"', flush=True)
+    print(f'[bridge]   base_url = "http://{args.host}:{args.port}/v1"', flush=True)
+    print('[bridge]   api_key  = "any-non-empty"', flush=True)
+    print(f'[bridge]   model    = "{DEFAULT_MODEL}"', flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
