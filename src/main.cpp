@@ -358,6 +358,7 @@ int main(int argc, char** argv) {
   // 模型也不会去尝试调用不存在的工具。
   fish::tool::Registry tools;
   std::unique_ptr<fish::core::IWebSearch> search_holder;
+  std::unique_ptr<fish::core::IWebFetch> fetch_holder;
   std::unique_ptr<fish::meme::MemeStore> meme_store;
 
   // 记忆检索：用向量 + 关键词混合召回
@@ -415,6 +416,26 @@ int main(int argc, char** argv) {
               }
             }
             return out;
+          }));
+    }
+  }
+
+  // 网页抓取：与搜索配套，search 找链接、fetch 读内容
+  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
+    auto fetcher = fish::capability::make_fetch(search_cfg);
+    if (fetcher.ok() && *fetcher.value) {
+      fetch_holder = std::move(*fetcher.value);
+      auto* raw = fetch_holder.get();
+      tools.add(std::make_shared<fish::tool::WebFetchTool>(
+          [raw](const std::string& url) {
+            fish::tool::WebFetchTool::Page p;
+            auto r = raw->fetch(url);
+            if (r.ok()) {
+              p.url = r.value->url;
+              p.title = r.value->title;
+              p.content = r.value->content;
+            }
+            return p;
           }));
     }
   }

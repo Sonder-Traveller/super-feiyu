@@ -110,7 +110,20 @@
 - **配置**：`group_voice = false`
 - **待定**：QQ 官方群聊语音可能受配额限制
 
-### P12: web_search 未启用
-- **现状**：`capability.search.provider = "none"`
-- **原因**：没有 Tavily/Bocha 的 key
-- **影响**：`tools_ready count=2`（只有记忆和图片搜索）
+### P12: web_search / web_fetch 未实测（缺 key）
+- **现状**：已按 [DeepSeek 官方文档](https://api-docs.deepseek.com/zh-cn/guides/search/)
+  实现 `DeepSeekSearch` / `DeepSeekFetch`
+  - Search: `POST {base}/v1/tools/search`，返回 title/url/snippet/summary/rerank_score
+  - Fetch: `POST {base}/v1/tools/fetch`，返回 {title, content(Markdown)}
+- **阻塞**：`.env.local` 里没有 `DEEPSEEK_API_KEY`
+- **计费**：每 1000 次成功请求 5 元（失败/空结果不计费）
+- **限速**：Search 100 QPS / Fetch 25 QPS（账号级）
+- **待办**：拿到 key 后实测
+
+### P13: 配置里 search provider 用哪个
+- **选项**：
+  - `deepseek` —— 用 DeepSeek 官方 Search/Fetch（需 DEEPSEEK_API_KEY，按次计费）
+  - `tavily` —— Tavily 官方（需 TAVILY_API_KEY）
+  - `none` —— 不启用，模型看不到 web_search / web_fetch 工具
+- **现状**：`provider = "none"`，所以 `tools_ready count=3`
+  （记忆 + 图片 + 热梗），没有 web 工具

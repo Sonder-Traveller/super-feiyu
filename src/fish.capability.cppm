@@ -129,12 +129,29 @@ struct TtsConfig {
   int timeout_ms{20000};
 };
 
+// 网络搜索。与语音/生图同构：换厂商只改 provider/base_url。
+//
+// provider 取值：
+//   none      —— 不启用（模型看不到 web_search 工具）
+//   tavily    —— Tavily 官方
+//   generic   —— 任意 HTTP 端点（自建服务、聚合 API、本地桥接层）
+//   deepseek / bocha —— 保留的别名，都走 generic 的解析逻辑
 struct SearchConfig {
   std::string provider{"none"};
   std::string base_url;
   std::string api_key;
   int max_results{5};
   int timeout_ms{15000};
+
+  // ── DeepSeek 官方 Search / Fetch（provider = "deepseek"）──
+  // 端点：{base_url}/v1/tools/search 和 /v1/tools/fetch
+  // 计费：每 1000 次成功请求 5 元（失败/空结果不计费）
+  // 限速：Search 100 QPS / Fetch 25 QPS（账号级）
+  //
+  // search：是否要求返回网页正文（need_content）
+  bool search_need_content{false};
+  // fetch：给模型看的正文上限（防止超长页面撑爆上下文）
+  std::size_t fetch_max_chars{6000};
 };
 
 // 生图。与 TTS 同构：换厂商只改 provider/base_url/model。
@@ -160,6 +177,8 @@ fish::core::Result<std::unique_ptr<fish::core::IEmbeddingModel>> make_embedding(
 fish::core::Result<std::unique_ptr<fish::core::ISpeechToText>> make_stt(const SttConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::ITextToSpeech>> make_tts(const TtsConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::IWebSearch>> make_search(
+    const SearchConfig& cfg);
+fish::core::Result<std::unique_ptr<fish::core::IWebFetch>> make_fetch(
     const SearchConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::IImageModel>> make_image(const ImageConfig& cfg);
 
@@ -906,6 +925,180 @@ class TavilySearch final : public fish::core::IWebSearch {
   SearchConfig cfg_;
 };
 
+// DeepSeek 官方 Search API。
+// 端点：POST {base_url}/v1/tools/search
+// 文档：https://api-docs.deepseek.com/zh-cn/guides/search/
+//
+// 特点：
+//   - 原始 JSON API，不消耗模型轮次
+//   - 每 1000 次成功请求 5 元（失败/空结果不计费）
+//   - 返回结构化结果：title/url/snippet/summary/content/date/authority
+//   - 支持搜索语法：site: / -site: / -词 / "精确短语" / lang: / after: / before:
+class DeepSeekSearch final : public fish::core::IWebSearch {
+ public:
+  explicit DeepSeekSearch(SearchConfig cfg) : cfg_(std::move(cfg)) {}
+
+  Result<std::vector<Hit>> search(const std::string& query, int max_results) override {
+    // query 限制 1~128 字符，不能全空白
+    std::string q = query;
+    if (q.size() > 128) q.resize(128);
+    if (q.find_first_not_of(" \t\r\n") == std::string::npos) {
+      return Result<std::vector<Hit>>::fail(ErrorCode::kBadRequest, "search_empty_query");
+    }
+
+    int count = max_results > 0 ? max_results : cfg_.max_results;
+    if (count < 1) count = 1;
+    if (count > 50) count = 50;
+
+    json payload{
+        {"query", q},
+        {"count", count},
+        {"need_content", cfg_.search_need_content},
+    };
+
+    const std::string url = search_endpoint() + "/search";
+    std::map<std::string, std::string> headers{
+        {"Authorization", "Bearer " + cfg_.api_key},
+    };
+
+    auto resp = HttpClient::instance().post_json(url, headers, payload.dump(),
+                                                 cfg_.timeout_ms);
+    if (!resp.ok()) {
+      // 402 余额不足 / 429 限流 / 5xx 可重试，已在 HttpClient 内处理退避
+      return Result<std::vector<Hit>>::fail(resp.error.code,
+                                            "search_" + resp.error.detail);
+    }
+
+    try {
+      const auto body = json::parse(resp.value->body);
+      std::vector<Hit> hits;
+      for (const auto& r : body.value("results", json::array())) {
+        if (!r.is_object()) continue;
+        Hit h;
+        h.title = r.value("title", "");
+        h.url = r.value("url", "");
+        // summary 是给模型读的长摘要（600-800 字符），snippet 是给前端看的短摘要
+        // 优先用 summary，模型理解更完整
+        h.snippet = r.value("summary", "");
+        if (h.snippet.empty()) h.snippet = r.value("snippet", "");
+        if (r.contains("rerank_score") && r["rerank_score"].is_number()) {
+          h.score = r["rerank_score"].get<double>();
+        }
+        if (!h.title.empty() || !h.url.empty()) hits.push_back(std::move(h));
+      }
+      return Result<std::vector<Hit>>::ok(std::move(hits));
+    } catch (const std::exception& e) {
+      return Result<std::vector<Hit>>::fail(ErrorCode::kBadRequest,
+                                            std::string("search_parse:") + e.what());
+    }
+  }
+
+ private:
+  // base_url 可能带或不带 /v1，统一归一化
+  std::string search_endpoint() const {
+    std::string base = cfg_.base_url.empty() ? "https://api.deepseek.com" : cfg_.base_url;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (base.find("/v1/tools") != std::string::npos) return base;
+    if (base.size() >= 3 && base.compare(base.size() - 3, 3, "/v1") == 0) {
+      return base + "/tools";
+    }
+    return base + "/v1/tools";
+  }
+
+  SearchConfig cfg_;
+};
+
+// DeepSeek 官方 Fetch API。
+// 端点：POST {base_url}/v1/tools/fetch
+// 返回 {title, content}，content 是 Markdown 正文。
+//
+// 注意：fetch 由 DeepSeek 服务端执行，不存在 SSRF 风险
+// （我们不发请求到目标站点，只发给 DeepSeek）。
+// 403 表示被安全策略拒绝，404 表示抓不到可用内容。
+class DeepSeekFetch final : public fish::core::IWebFetch {
+ public:
+  explicit DeepSeekFetch(SearchConfig cfg) : cfg_(std::move(cfg)) {}
+
+  Result<Page> fetch(const std::string& url) override {
+    // 基本校验：必须是含 host 的 HTTP/HTTPS URL，不能带用户名密码
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+      return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_scheme_not_allowed");
+    }
+    if (url.size() > 8192) {
+      return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_url_too_long");
+    }
+    const auto scheme_end = url.find("://");
+    const auto host_start = scheme_end + 3;
+    if (host_start >= url.size() || url[host_start] == '/') {
+      return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_missing_host");
+    }
+    // 拒绝带 userinfo 的 URL（可能用于钓鱼/凭据泄露）
+    const auto authority_end = url.find_first_of("/?#", host_start);
+    const std::string authority =
+        url.substr(host_start, authority_end == std::string::npos
+                                   ? std::string::npos
+                                   : authority_end - host_start);
+    if (authority.find('@') != std::string::npos) {
+      return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_userinfo_not_allowed");
+    }
+
+    json payload{{"url", url}};
+    const std::string endpoint = fetch_endpoint() + "/fetch";
+    std::map<std::string, std::string> headers{
+        {"Authorization", "Bearer " + cfg_.api_key},
+    };
+
+    auto resp = HttpClient::instance().post_json(endpoint, headers, payload.dump(),
+                                                 cfg_.timeout_ms);
+    if (!resp.ok()) {
+      return Result<Page>::fail(resp.error.code, "fetch_" + resp.error.detail);
+    }
+
+    try {
+      const auto body = json::parse(resp.value->body);
+      Page page;
+      page.url = url;
+      page.title = body.value("title", "");
+      page.content = body.value("content", "");
+      page.content_type = "text/markdown";
+      page.status = 200;
+      page.bytes = page.content.size();
+
+      if (page.content.empty()) {
+        return Result<Page>::fail(ErrorCode::kUpstreamUnavailable, "fetch_empty_content");
+      }
+
+      // 截断：超长页面会撑爆上下文，按配置截到合理长度
+      if (page.content.size() > cfg_.fetch_max_chars) {
+        std::size_t cut = cfg_.fetch_max_chars;
+        while (cut > 0 &&
+               (static_cast<unsigned char>(page.content[cut]) & 0xC0) == 0x80) {
+          --cut;
+        }
+        page.content.resize(cut);
+        page.content += "\n\n…（内容过长已截断）";
+      }
+      return Result<Page>::ok(std::move(page));
+    } catch (const std::exception& e) {
+      return Result<Page>::fail(ErrorCode::kBadRequest,
+                                std::string("fetch_parse:") + e.what());
+    }
+  }
+
+ private:
+  std::string fetch_endpoint() const {
+    std::string base = cfg_.base_url.empty() ? "https://api.deepseek.com" : cfg_.base_url;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    if (base.find("/v1/tools") != std::string::npos) return base;
+    if (base.size() >= 3 && base.compare(base.size() - 3, 3, "/v1") == 0) {
+      return base + "/tools";
+    }
+    return base + "/v1/tools";
+  }
+
+  SearchConfig cfg_;
+};
+
 CircuitBreaker& breaker_for(const std::string& provider, const char* kind) {
   static std::mutex mu;
   static std::map<std::string, std::unique_ptr<CircuitBreaker>> pool;
@@ -1140,8 +1333,22 @@ Result<std::unique_ptr<fish::core::IWebSearch>> make_search(const SearchConfig& 
   if (cfg.provider == "none") {
     return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(std::make_unique<NullSearch>());
   }
+  if (cfg.provider == "tavily") {
+    return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(
+        std::make_unique<TavilySearch>(cfg));
+  }
+  // deepseek / bocha 走 DeepSeek 官方 Tools API 的实现
   return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(
-      std::make_unique<TavilySearch>(cfg));
+      std::make_unique<DeepSeekSearch>(cfg));
+}
+
+Result<std::unique_ptr<fish::core::IWebFetch>> make_fetch(const SearchConfig& cfg) {
+  if (cfg.provider == "none") {
+    return Result<std::unique_ptr<fish::core::IWebFetch>>::fail(
+        ErrorCode::kUnsupported, "fetch_provider_none");
+  }
+  return Result<std::unique_ptr<fish::core::IWebFetch>>::ok(
+      std::make_unique<DeepSeekFetch>(cfg));
 }
 
 Result<std::unique_ptr<fish::core::IImageModel>> make_image(const ImageConfig& cfg) {
@@ -1210,6 +1417,11 @@ SearchConfig load_search_config(const fish::config::Config& c) {
   cfg.base_url = c.get_or("capability.search.base_url", "");
   cfg.api_key = c.get_or("capability.search.api_key", "");
   cfg.max_results = static_cast<int>(c.get_int_or("capability.search.max_results", 5));
+  cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.search.timeout_ms", 15000));
+  cfg.search_need_content =
+      c.get_bool_or("capability.search.need_content", false);
+  cfg.fetch_max_chars =
+      static_cast<std::size_t>(c.get_int_or("capability.search.fetch_max_chars", 6000));
   return cfg;
 }
 

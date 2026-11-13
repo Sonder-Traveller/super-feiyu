@@ -208,6 +208,25 @@ class IWebSearch {
   virtual Result<std::vector<Hit>> search(const std::string& query, int max_results) = 0;
 };
 
+// 网页抓取：把 URL 的内容取回来。
+// 与 IWebSearch 配套：search 找链接，fetch 读内容。
+//
+// 安全：实现必须做 SSRF 防护（拒绝内网地址、file:// 等），
+// 因为 URL 来自模型输出，模型可能被诱导去读内部服务。
+class IWebFetch {
+ public:
+  struct Page {
+    std::string url;         // 最终 URL（可能因重定向变化）
+    std::string title;       // HTML <title>（非 HTML 为空）
+    std::string content;     // 正文（HTML 会尽量剥离标签）
+    std::string content_type;
+    int status{0};
+    std::size_t bytes{0};    // 原始响应大小
+  };
+  virtual ~IWebFetch() = default;
+  virtual Result<Page> fetch(const std::string& url) = 0;
+};
+
 // 生图。与 ITextToSpeech 同构：换厂商只换 provider，调用方不感知。
 // 注意「读图」不走这里 —— 读图是 chat 模型的多模态能力（kImage 块直传）。
 class IImageModel {

@@ -131,6 +131,28 @@ class WebSearchTool final : public ITool {
   Searcher search_;
 };
 
+// 网页抓取：把 URL 的内容取回来（Markdown 正文）
+class WebFetchTool final : public ITool {
+ public:
+  struct Page {
+    std::string url;
+    std::string title;
+    std::string content;
+  };
+  using Fetcher = std::function<Page(const std::string& url)>;
+  explicit WebFetchTool(Fetcher f) : fetch_(std::move(f)) {}
+  [[nodiscard]] std::string name() const override { return "web_fetch"; }
+  [[nodiscard]] std::string description() const override {
+    return "抓取指定网页的正文内容（Markdown）。"
+           "当 web_search 找到链接、或对方给了链接需要你读内容时使用。";
+  }
+  [[nodiscard]] std::string parameters_schema() const override;
+  Outcome run(const Call& call) override;
+
+ private:
+  Fetcher fetch_;
+};
+
 // 网络热梗检索：本地库优先，未命中时可选联网补充。
 // 与 web_search 分开：热梗是高频、短小的查询，走本地库零成本；
 // 联网只在本地没有时才发生，且结果会写回本地。
@@ -412,8 +434,49 @@ Outcome WebSearchTool::run(const Call& call) {
   return out;
 }
 
-// ── MemeLookupTool ──────────────────────────────────────
+// ── WebFetchTool ────────────────────────────────────────
 
+std::string WebFetchTool::parameters_schema() const {
+  return R"({
+    "type": "object",
+    "properties": {
+      "url": {"type": "string", "description": "要抓取的网页地址（http/https）"}
+    },
+    "required": ["url"]
+  })";
+}
+
+Outcome WebFetchTool::run(const Call& call) {
+  Outcome out;
+  const auto args = detail::parse_args(call.arguments_json);
+  const std::string url = detail::get_str(args, "url", 8192);
+  if (url.empty()) {
+    out.error = "missing_url";
+    out.content = "需要提供 url 参数。";
+    return out;
+  }
+  if (!fetch_) {
+    out.error = "no_fetcher";
+    out.content = "抓取功能未启用。";
+    return out;
+  }
+
+  const auto page = fetch_(url);
+  if (page.content.empty()) {
+    out.ok = true;
+    out.content = "没能取到这个页面的内容。";
+    return out;
+  }
+
+  std::string s;
+  if (!page.title.empty()) s += page.title + "\n\n";
+  s += page.content;
+  out.ok = true;
+  out.content = detail::truncate(std::move(s));
+  return out;
+}
+
+// ── MemeLookupTool ──────────────────────────────────────
 std::string MemeLookupTool::parameters_schema() const {
   return R"({
     "type": "object",
