@@ -170,15 +170,11 @@ fish::core::Error MemeStore::load() {
   std::ifstream in(file_path());
   if (in) {
     std::string line;
-    bool first = true;
     while (std::getline(in, line)) {
-      if (first) {
-        first = false;
-        // 跳过表头
-        if (line.rfind("term\t", 0) == 0) continue;
-      }
       line = detail::trim(line);
       if (line.empty() || line[0] == '#') continue;
+      // 跳过表头：表头可能不在第一行（前面常有注释），所以每行都判。
+      if (line.rfind("term\t", 0) == 0) continue;
       // 格式：term \t meaning \t usage \t origin \t added_at \t hits
       const auto f = detail::split(line, '\t');
       if (f.size() < 2) continue;
