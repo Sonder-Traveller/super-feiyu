@@ -3,6 +3,7 @@
 // 本机零推理，此处全是网络调用。
 module;
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -126,11 +127,22 @@ struct SearchConfig {
   int timeout_ms{15000};
 };
 
+// 生图。与 TTS 同构：换厂商只改 provider/base_url/model。
+struct ImageConfig {
+  std::string provider{"none"};        // none | siliconflow | openai | bridge
+  std::string base_url;
+  std::string api_key;
+  std::string model;
+  std::string default_size{"1024x1024"};
+  int timeout_ms{120000};              // 生图慢，给足时间
+};
+
 const char* chat_provider_list();
 const char* embedding_provider_list();
 const char* stt_provider_list();
 const char* tts_provider_list();
 const char* search_provider_list();
+const char* image_provider_list();
 
 fish::core::Result<std::unique_ptr<fish::core::IChatModel>> make_chat(const ChatConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::IEmbeddingModel>> make_embedding(
@@ -139,12 +151,14 @@ fish::core::Result<std::unique_ptr<fish::core::ISpeechToText>> make_stt(const St
 fish::core::Result<std::unique_ptr<fish::core::ITextToSpeech>> make_tts(const TtsConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::IWebSearch>> make_search(
     const SearchConfig& cfg);
+fish::core::Result<std::unique_ptr<fish::core::IImageModel>> make_image(const ImageConfig& cfg);
 
 ChatConfig load_chat_config(const fish::config::Config& c);
 EmbeddingConfig load_embedding_config(const fish::config::Config& c);
 SttConfig load_stt_config(const fish::config::Config& c);
 TtsConfig load_tts_config(const fish::config::Config& c);
 SearchConfig load_search_config(const fish::config::Config& c);
+ImageConfig load_image_config(const fish::config::Config& c);
 
 }  // namespace fish::capability
 
@@ -164,6 +178,7 @@ const char* embedding_provider_list() { return "ollama,openai,siliconflow"; }
 const char* stt_provider_list() { return "groq,local,openai,siliconflow"; }
 const char* tts_provider_list() { return "edge,openai,siliconflow"; }
 const char* search_provider_list() { return "bocha,deepseek,none,tavily"; }
+const char* image_provider_list() { return "bridge,openai,siliconflow"; }
 
 namespace {
 
@@ -261,7 +276,9 @@ class HttpChat final : public fish::core::IChatModel {
     }
     for (const auto& h : req.history) {
       if (h.kind != fish::core::BlockKind::kText) continue;
-      msgs.push_back({{"role", "user"}, {"content", h.text}});
+      // 用真实 role：全塞 user 会让模型分不清谁说的
+      const std::string role = (h.role == "assistant") ? "assistant" : "user";
+      msgs.push_back({{"role", role}, {"content", h.text}});
     }
     msgs.push_back({{"role", "user"}, {"content", to_blocks(req.user_blocks)}});
     payload["messages"] = std::move(msgs);
@@ -470,6 +487,115 @@ class HttpTts final : public fish::core::ITextToSpeech {
   CircuitBreaker* breaker_;
 };
 
+// ── 生图 ────────────────────────────────────────────────
+// 走 OpenAI 兼容的 /images/generations（文生图）。
+// 返回可能是 b64_json 或 url，两种都处理：
+//   - b64_json → 落盘到 /tmp，返回本地路径（通道可直接上传）
+//   - url      → 直接返回 URL
+class HttpImage final : public fish::core::IImageModel {
+ public:
+  HttpImage(ImageConfig cfg, CircuitBreaker* b) : cfg_(std::move(cfg)), breaker_(b) {}
+
+  Result<Response> generate(const Request& in) override {
+    if (cfg_.provider == "none") {
+      return Result<Response>::fail(ErrorCode::kUnsupported, "image_provider_none");
+    }
+
+    json payload{{"model", cfg_.model}, {"prompt", in.prompt}, {"n", 1}};
+    const std::string size = in.size.empty() ? cfg_.default_size : in.size;
+    if (!size.empty()) payload["size"] = size;
+    if (!in.negative_prompt.empty()) payload["negative_prompt"] = in.negative_prompt;
+    // 只要 base64，省一次额外下载；不支持的厂商会忽略该字段
+    payload["response_format"] = "b64_json";
+
+    HttpRequest req;
+    req.url = cfg_.base_url + "/images/generations";
+    req.headers = {{"Authorization", "Bearer " + cfg_.api_key},
+                   {"Content-Type", "application/json"}};
+    req.body = payload.dump();
+    req.timeout_ms = cfg_.timeout_ms;
+    req.max_retries = 1;   // 生图失败重试代价高，不自动重试
+
+    auto resp = HttpClient::instance().perform(req, breaker_);
+    if (!resp.ok()) return Result<Response>::fail(resp.error.code, resp.error.detail);
+
+    Response out;
+    out.model = cfg_.model;
+    out.actual_size = size;
+
+    try {
+      const auto body = json::parse(resp.value->body);
+      if (!body.contains("data") || !body["data"].is_array() || body["data"].empty()) {
+        return Result<Response>::fail(ErrorCode::kBadRequest, "image_no_data");
+      }
+      const auto& item = body["data"][0];
+
+      // 优先 b64_json
+      if (item.contains("b64_json") && item["b64_json"].is_string()) {
+        const std::string b64 = item["b64_json"].get<std::string>();
+        auto bin = base64_decode(b64);
+        if (bin.empty()) {
+          return Result<Response>::fail(ErrorCode::kBadRequest, "image_b64_bad");
+        }
+        const std::string path =
+            "/tmp/fish_img_" + std::to_string(std::rand()) + ".png";
+        std::ofstream f(path, std::ios::binary);
+        if (!f) return Result<Response>::fail(ErrorCode::kInternal, "image_write");
+        f.write(reinterpret_cast<const char*>(bin.data()),
+                static_cast<std::streamsize>(bin.size()));
+        out.image_url = path;
+        out.usage_note = "b64 " + std::to_string(bin.size()) + "B";
+        return Result<Response>::ok(std::move(out));
+      }
+
+      // 退而求其次：url
+      if (item.contains("url") && item["url"].is_string()) {
+        out.image_url = item["url"].get<std::string>();
+        out.usage_note = "url";
+        return Result<Response>::ok(std::move(out));
+      }
+
+      return Result<Response>::fail(ErrorCode::kBadRequest, "image_no_url");
+    } catch (const std::exception& e) {
+      return Result<Response>::fail(ErrorCode::kBadRequest,
+                                    std::string("image_parse:") + e.what());
+    }
+  }
+
+ private:
+  // 极简 base64 解码（避免引入额外依赖）
+  static std::vector<unsigned char> base64_decode(const std::string& s) {
+    static const auto table = [] {
+      std::array<int, 256> t{};
+      t.fill(-1);
+      const char* chars =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      for (int i = 0; i < 64; ++i) t[static_cast<unsigned char>(chars[i])] = i;
+      return t;
+    }();
+
+    std::vector<unsigned char> out;
+    out.reserve(s.size() * 3 / 4);
+    int val = 0;
+    int bits = -8;
+    for (const char c : s) {
+      if (c == '=' || c == '\n' || c == '\r') continue;
+      const int d = table[static_cast<unsigned char>(c)];
+      if (d < 0) continue;
+      val = (val << 6) + d;
+      bits += 6;
+      if (bits >= 0) {
+        out.push_back(static_cast<unsigned char>((val >> bits) & 0xFF));
+        bits -= 8;
+      }
+    }
+    return out;
+  }
+
+  ImageConfig cfg_;
+  CircuitBreaker* breaker_;
+};
+
 // ── 搜索 ────────────────────────────────────────────────
 class NullSearch final : public fish::core::IWebSearch {
  public:
@@ -633,7 +759,9 @@ Result<HttpResult> HttpClient::perform(const HttpRequest& req, CircuitBreaker* b
       }
       ::fish::log::log_line(::fish::log::LogLevel::kWarn, "http", "request_failed")
           .field("url", req.url)
-          .field("status", result.status);
+          .field("status", result.status)
+          // 4xx 多半是请求体不对，必须把上游说的话打出来，否则只能靠猜
+          .field("body", result.body.substr(0, 400));
       return Result<HttpResult>::fail(ec, "http_error");
     }
 
@@ -747,6 +875,21 @@ Result<std::unique_ptr<fish::core::IWebSearch>> make_search(const SearchConfig& 
       std::make_unique<TavilySearch>(cfg));
 }
 
+Result<std::unique_ptr<fish::core::IImageModel>> make_image(const ImageConfig& cfg) {
+  static const std::set<std::string> kOk{"none", "siliconflow", "openai", "bridge"};
+  if (!kOk.count(cfg.provider)) {
+    return Result<std::unique_ptr<fish::core::IImageModel>>::fail(
+        ErrorCode::kUnsupported, "unknown image provider '" + cfg.provider +
+                                     "'. supported: " + image_provider_list());
+  }
+  if (cfg.provider == "none") {
+    return Result<std::unique_ptr<fish::core::IImageModel>>::fail(
+        ErrorCode::kUnsupported, "image_provider_none");
+  }
+  return Result<std::unique_ptr<fish::core::IImageModel>>::ok(
+      std::make_unique<HttpImage>(cfg, &breaker_for(cfg.provider, "image")));
+}
+
 // ── 配置读取 ────────────────────────────────────────────
 ChatConfig load_chat_config(const fish::config::Config& c) {
   ChatConfig cfg;
@@ -796,6 +939,17 @@ SearchConfig load_search_config(const fish::config::Config& c) {
   cfg.base_url = c.get_or("capability.search.base_url", "");
   cfg.api_key = c.get_or("capability.search.api_key", "");
   cfg.max_results = static_cast<int>(c.get_int_or("capability.search.max_results", 5));
+  return cfg;
+}
+
+ImageConfig load_image_config(const fish::config::Config& c) {
+  ImageConfig cfg;
+  cfg.provider = c.get_or("capability.image.provider", "none");
+  cfg.base_url = c.get_or("capability.image.base_url", "");
+  cfg.api_key = c.get_or("capability.image.api_key", "");
+  cfg.model = c.get_or("capability.image.model", "");
+  cfg.default_size = c.get_or("capability.image.default_size", "1024x1024");
+  cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.image.timeout_ms", 120000));
   return cfg;
 }
 

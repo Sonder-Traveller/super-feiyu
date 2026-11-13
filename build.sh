@@ -12,7 +12,7 @@ OUT="${OUT:-build}"
 
 INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc)
 # 编译顺序：依赖在前
-MODULES=(core log config memory capability ws qq_ws onebot_ws channels orchestrator)
+MODULES=(core log config memory capability image ws qq_ws onebot_ws channels orchestrator)
 
 if [[ "${1:-}" == "--clean" ]]; then
   rm -rf "$OUT"

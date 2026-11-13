@@ -20,6 +20,7 @@ export module fish.orchestrator;
 import fish.core;
 import fish.log;
 import fish.memory;
+import fish.image;
 
 export namespace fish::orchestrator {
 
@@ -95,6 +96,8 @@ class Pipeline {
     fish::core::IReplyBudget* budget{nullptr};
     fish::core::ITextToSpeech* tts{nullptr};
     fish::core::ISpeechToText* stt{nullptr};
+    fish::core::IImageModel* image{nullptr};      // 生图（可为空）
+    fish::image::PortraitStore* portraits{nullptr};  // 形象库（可为空）
     fish::memory::MemorySystem* memory{nullptr};
     fish::memory::Consolidator* consolidator{nullptr};
     bool group_voice{false};
@@ -297,6 +300,36 @@ void Pipeline::maintenance() {
   }
 }
 
+// 解析回复里的图片标记。
+//   [PHOTO]          → 返回 true，spec 为空（用形象库现成图）
+//   [PHOTO: 描述]     → 返回 true，spec 为描述（现场生成）
+// 同时把标记从 reply_text 里删掉，避免被当成正文发出去。
+bool extract_photo_marker(std::string& text, std::string* spec) {
+  const std::string open = "[PHOTO";
+  const auto pos = text.find(open);
+  if (pos == std::string::npos) return false;
+
+  const auto close = text.find(']', pos);
+  if (close == std::string::npos) return false;
+
+  const std::string inner = text.substr(pos + open.size(), close - pos - open.size());
+  // inner 形如 "" 或 ": 描述"
+  if (!inner.empty()) {
+    if (inner[0] != ':') return false;
+    std::string s = inner.substr(1);
+    const auto b = s.find_first_not_of(" \t");
+    if (b != std::string::npos) s = s.substr(b);
+    *spec = s;
+  }
+
+  // 删掉标记本身，并清理残留空行
+  text.erase(pos, close - pos + 1);
+  while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
+  const auto nb = text.find_first_not_of(" \t\n");
+  if (nb != std::string::npos) text = text.substr(nb);
+  return true;
+}
+
 Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
     const fish::core::InboundMessage& msg) {
   std::vector<fish::core::ContentBlock> out;
@@ -384,11 +417,18 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   if (!input.ok()) return Result<int>::fail(input.error.code, input.error.detail);
 
   std::string query;
+  int image_count = 0;
   for (const auto& b : *input.value) {
     if (b.kind == fish::core::BlockKind::kText) {
       if (!query.empty()) query += " ";
       query += b.text;
+    } else if (b.kind == fish::core::BlockKind::kImage) {
+      ++image_count;
     }
+  }
+  // 纯图片消息：query 为空会让向量召回/落盘拿到空串，补一个可检索的占位
+  if (query.empty() && image_count > 0) {
+    query = "[图片]";
   }
 
   // 7. 记忆召回
@@ -416,12 +456,15 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     fish::core::ContentBlock b;
     b.kind = fish::core::BlockKind::kText;
     b.text = "【更早的对话摘要】\n" + mem_ctx.summary;
+    b.role = "user";
     history.push_back(std::move(b));
   }
   for (const auto& m : mem_ctx.working) {
     fish::core::ContentBlock b;
     b.kind = fish::core::BlockKind::kText;
-    b.text = (m.role == "user" ? "对方: " : "我: ") + m.text;
+    b.text = m.text;
+    // 角色必须显式传递：模型据此区分谁说的
+    b.role = (m.role == "user") ? "user" : "assistant";
     history.push_back(std::move(b));
   }
 
@@ -440,6 +483,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "chat_degraded")
         .field("detail", resp.error.detail);
   }
+
+  // 9.5 解析图片标记：[PHOTO] 取库存图，[PHOTO: 描述] 现场生成
+  std::string photo_spec;
+  const bool wants_photo = extract_photo_marker(reply_text, &photo_spec);
 
   // 10. 落盘 + 巩固
   if (deps_.memory != nullptr) {
@@ -461,11 +508,62 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   fish::core::ContentBlock text_block;
   text_block.kind = fish::core::BlockKind::kText;
   text_block.text = reply_text;
-  outgoing.push_back(std::move(text_block));
+  // 只有图片、没有文字时，发一个极短的话兜底（空文本会被通道丢弃）
+  if (text_block.text.empty() && wants_photo) text_block.text = "喏";
+  if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
+
+  // 图片：先查形象库（零成本、形象稳定），没有再现场生成
+  if (wants_photo) {
+    std::string photo_url;
+    std::string photo_src;
+
+    if (photo_spec.empty() && deps_.portraits != nullptr) {
+      const auto p = deps_.portraits->pick(query, fish::image::PickStrategy::kTagMatch);
+      if (!p.path.empty()) {
+        photo_url = p.path;
+        photo_src = "library";
+      }
+    }
+
+    if (photo_url.empty() && deps_.image != nullptr) {
+      fish::core::IImageModel::Request ireq;
+      ireq.prompt = photo_spec.empty()
+                        ? "一只蓝色的鲸鱼娘，日常抓拍，自然光线，手机随手拍的质感"
+                        : photo_spec;
+      auto gen = deps_.image->generate(ireq);
+      if (gen.ok()) {
+        photo_url = gen.value->image_url;
+        photo_src = "generated";
+        // 生成的图也进库，下次同类场景直接复用
+        if (deps_.portraits != nullptr && !photo_url.empty()) {
+          fish::image::Portrait np;
+          np.path = photo_url;
+          np.caption = photo_spec;
+          np.source = "generated";
+          deps_.portraits->add(np);
+        }
+      } else {
+        ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "image_failed")
+            .field("detail", gen.error.detail);
+      }
+    }
+
+    if (!photo_url.empty()) {
+      // 本地路径直接交给通道：QQ 官方支持二进制直传（file_data），
+      // 不需要公网 URL，也不需要开放任何端口。
+      fish::core::ContentBlock img;
+      img.kind = fish::core::BlockKind::kImage;
+      img.media_url = std::move(photo_url);
+      img.mime = "image/png";
+      outgoing.push_back(std::move(img));
+      ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "photo_attached")
+          .field("source", photo_src);
+    }
+  }
 
   const bool voice_ok = deps_.tts != nullptr && cap.supports_voice_out &&
                         (msg.kind == fish::core::ChatKind::kPrivate || deps_.group_voice);
-  if (voice_ok) {
+  if (voice_ok && !wants_photo) {   // 发图时不叠加语音，避免一次回太多
     auto audio = deps_.tts->synthesize(reply_text);
     if (audio.ok()) {
       fish::core::ContentBlock voice;

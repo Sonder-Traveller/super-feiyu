@@ -15,6 +15,7 @@ import fish.log;
 import fish.config;
 import fish.capability;
 import fish.memory;
+import fish.image;
 import fish.channels;
 import fish.orchestrator;
 
@@ -226,6 +227,33 @@ int main(int argc, char** argv) {
     if (s.ok()) stt = std::move(*s.value);
   }
 
+  // ── 生图 + 形象库 ──
+  std::unique_ptr<fish::core::IImageModel> image_model;
+  const auto image_cfg = fish::capability::load_image_config(cfg);
+  if (!stub_mode && image_cfg.provider != "none") {
+    auto im = fish::capability::make_image(image_cfg);
+    if (im.ok()) {
+      image_model = std::move(*im.value);
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "image_provider")
+          .field("provider", image_cfg.provider)
+          .field("model", image_cfg.model);
+    } else {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "image_init_failed")
+          .field("detail", im.error.detail);
+    }
+  }
+
+  // 形象库：目录默认 data/memory/portraits
+  fish::image::PortraitStore portraits(
+      cfg.get_or("memory.portraits_dir", "data/memory/portraits"));
+  {
+    auto e = portraits.init();
+    if (!e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "portraits_init_failed")
+          .field("detail", e.detail);
+    }
+  }
+
   if (!chat) {
     chat = std::make_unique<EchoChat>();
     fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "chat_stub_mode");
@@ -285,6 +313,8 @@ int main(int argc, char** argv) {
   deps.budget = &budget;
   deps.tts = tts.get();
   deps.stt = stt.get();
+  deps.image = image_model.get();
+  deps.portraits = &portraits;
   deps.memory = &memory_sys;
   deps.consolidator = &consolidator;
   deps.group_voice = cfg.get_bool_or("capability.tts.group_voice", false);

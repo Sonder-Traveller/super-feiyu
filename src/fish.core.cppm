@@ -28,6 +28,10 @@ struct ContentBlock {
   std::string text;
   std::string media_url;
   std::string mime;
+  // 说话人角色："user"（对方）| "assistant"（自己）。
+  // 必须显式携带：只靠「对方: / 我:」文字前缀区分，
+  // 模型会把双方的话混为一谈（身份混淆、把自己说的话当成对方的要求）。
+  std::string role{"user"};
 };
 
 struct InboundMessage {
@@ -151,6 +155,32 @@ class IWebSearch {
   };
   virtual ~IWebSearch() = default;
   virtual Result<std::vector<Hit>> search(const std::string& query, int max_results) = 0;
+};
+
+// 生图。与 ITextToSpeech 同构：换厂商只换 provider，调用方不感知。
+// 注意「读图」不走这里 —— 读图是 chat 模型的多模态能力（kImage 块直传）。
+class IImageModel {
+ public:
+  struct Request {
+    std::string prompt;
+    // 输出尺寸，形如 "1024x1024"；空表示由 provider 默认
+    std::string size;
+    // 参考图（改图用）：本地路径、file:// 或 http(s) URL。
+    // 为空表示文生图。
+    std::vector<std::string> reference_images;
+    std::string negative_prompt;
+  };
+  struct Response {
+    // 生成结果：本地落盘路径（便于直接发给通道）或 http(s) URL。
+    std::string image_url;
+    // provider 实际出图尺寸，形如 "1024x1024"（可能因比例限制被调整）
+    std::string actual_size;
+    std::string model;
+    // provider 侧的计费/用量信息，便于日志核对
+    std::string usage_note;
+  };
+  virtual ~IImageModel() = default;
+  virtual Result<Response> generate(const Request& req) = 0;
 };
 
 class IPersona {
