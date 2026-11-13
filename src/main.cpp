@@ -430,11 +430,28 @@ int main(int argc, char** argv) {
     });
   }
 
-  // ── 主线程：等信号 + 定期打指标 ──
+  // ── 主线程：等信号 + 定期打指标 + 周期维护 ──
   int tick = 0;
+  int mem_ticks = 0;
   while (!g_stop.load()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    if (++tick % 300 == 0) {  // 每 60 秒
+
+    // 每 60 秒：清理预算/去重表（否则长期运行会缓慢增长）
+    if (++tick % 300 == 0) {
+      pipeline.maintenance();
+    }
+
+    // 每 24 小时：按衰减权重淘汰旧记忆
+    if (++mem_ticks % 432000 == 0 && mem_ticks > 0) {
+      auto mr = memory_sys.maintain(30.0, 0.05);
+      if (mr.ok() && mr.value->evicted > 0) {
+        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "memory_maintained")
+            .field("evicted", mr.value->evicted)
+            .field("facts", static_cast<long long>(mr.value->facts_after));
+      }
+    }
+
+    if (tick % 300 == 0) {  // 每 60 秒
       std::uint64_t polled = 0;
       std::uint64_t handled = 0;
       std::uint64_t errors = 0;

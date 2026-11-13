@@ -2,6 +2,8 @@
 // 编排层：唯一持有业务决策（要不要回、回什么、怎么回）。
 module;
 #include <algorithm>
+#include <array>
+#include <functional>
 #include <chrono>
 #include <ctime>
 #include <fstream>
@@ -104,13 +106,23 @@ class Pipeline {
                                  const fish::core::InboundMessage& msg);
   DedupCache& dedup() { return dedup_; }
 
+  // 周期维护：清理预算/去重表。由 runtime 的定时线程调用。
+  void maintenance();
+
  private:
   fish::core::Result<std::vector<fish::core::ContentBlock>> normalize_input(
       const fish::core::InboundMessage& msg);
 
+  // 同一会话必须串行：否则两条消息并发处理会导致
+  // 回复顺序错乱、记忆写入竞争、上下文不一致。
+  // 用固定数量的条带锁（而非每会话一把），内存恒定。
+  [[nodiscard]] std::mutex& lock_for(const std::string& conv_id) const;
+
   Deps deps_;
   ReplyPolicy policy_;
   DedupCache dedup_;
+  static constexpr std::size_t kShards = 64;
+  mutable std::array<std::mutex, kShards> shards_{};
 };
 
 }  // namespace fish::orchestrator
@@ -272,6 +284,19 @@ Result<LayeredPersona> load_persona(const std::string& persona_path,
 // ── Pipeline ────────────────────────────────────────────
 Pipeline::Pipeline(Deps deps) : deps_(std::move(deps)) {}
 
+std::mutex& Pipeline::lock_for(const std::string& conv_id) const {
+  const std::size_t h = std::hash<std::string>{}(conv_id);
+  return shards_[h % kShards];
+}
+
+void Pipeline::maintenance() {
+  const auto dropped = dedup_.sweep();
+  if (dropped > 0) {
+    ::fish::log::log_line(::fish::log::LogLevel::kDebug, "pipeline", "dedup_swept")
+        .field("dropped", static_cast<long long>(dropped));
+  }
+}
+
 Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
     const fish::core::InboundMessage& msg) {
   std::vector<fish::core::ContentBlock> out;
@@ -336,7 +361,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
-  // 3. 准入判定
+  // 3. 同会话串行化：拿条带锁，避免并发处理同会话消息
+  std::lock_guard<std::mutex> conv_lock(lock_for(msg.conversation_id));
+
+  // 4. 准入判定
   const auto decision = policy_.evaluate(msg, cap);
   if (!decision.should_reply) {
     ::fish::log::log_line(fish::log::LogLevel::kDebug, "pipeline", "silent")
@@ -344,14 +372,14 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     return Result<int>::ok(0);
   }
 
-  // 4. 预算
+  // 5. 预算
   if (deps_.budget != nullptr && deps_.budget->remaining(msg.message_id) <= 0) {
     ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "budget_exhausted")
         .field("msg_id", msg.message_id);
     return Result<int>::fail(ErrorCode::kBudgetExhausted, "reply_budget_exhausted");
   }
 
-  // 5. 多模态归一化
+  // 6. 多模态归一化
   auto input = normalize_input(msg);
   if (!input.ok()) return Result<int>::fail(input.error.code, input.error.detail);
 
@@ -363,14 +391,14 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
-  // 6. 记忆召回
+  // 7. 记忆召回
   fish::memory::MemoryContext mem_ctx;
   if (deps_.memory != nullptr) {
     auto g = deps_.memory->gather(msg.conversation_id, query);
     if (g.ok()) mem_ctx = std::move(*g.value);
   }
 
-  // 7. 提示词分层：历史 + 召回记忆
+  // 8. 提示词分层：历史 + 召回记忆
   std::vector<fish::core::ContentBlock> history;
   for (const auto& m : mem_ctx.working) {
     fish::core::ContentBlock b;
@@ -401,7 +429,7 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     history.push_back(std::move(b));
   }
 
-  // 8. 模型调用（带降级）
+  // 9. 模型调用（带降级）
   fish::core::IChatModel::Request req;
   req.system_prompt = deps_.persona->stable_prefix();
   req.user_blocks = std::move(*input.value);
@@ -417,7 +445,7 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
         .field("detail", resp.error.detail);
   }
 
-  // 9. 落盘 + 巩固
+  // 10. 落盘 + 巩固
   if (deps_.memory != nullptr) {
     fish::memory::Message user_msg;
     user_msg.role = "user";
@@ -438,7 +466,7 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
-  // 10-11. 组装出站，按预算逐条发送
+  // 11-12. 组装出站，按预算逐条发送
   std::vector<fish::core::ContentBlock> outgoing;
   fish::core::ContentBlock text_block;
   text_block.kind = fish::core::BlockKind::kText;

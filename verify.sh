@@ -44,6 +44,12 @@ check "协议测试 ($(grep -c '^\[PASS\]' /tmp/v_t2.log) 项)" $?
 grep '^\[FAIL\]' /tmp/v_t2.log || true
 
 echo
+echo "════════ 3b. 生命周期测试 ════════"
+./build/test_lifecycle > /tmp/v_t2b.log 2>&1
+check "生命周期测试 ($(grep -c '^\[PASS\]' /tmp/v_t2b.log) 项)" $?
+grep '^\[FAIL\]' /tmp/v_t2b.log || true
+
+echo
 echo "════════ 4. 桩模式自检 ════════"
 ./build/super-feiyu --self-test > /tmp/v_t3.log 2>&1
 check "被动策略与流水线" $?

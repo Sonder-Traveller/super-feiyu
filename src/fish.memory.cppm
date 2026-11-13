@@ -93,6 +93,8 @@ class NotesStore {
   fish::core::Error ensure_dirs() const;
   fish::core::Result<std::vector<Fact>> load_facts() const;
   fish::core::Error append_fact(const Fact& f) const;
+  // 全量改写（按 subject 分组），用于淘汰后重写权威文件
+  fish::core::Error rewrite_facts(const std::vector<Fact>& facts) const;
   fish::core::Error append_episode(const Episode& e) const;
   fish::core::Result<std::vector<Episode>> load_episodes(int max_months = 24) const;
   fish::core::Result<std::vector<Trait>> load_traits() const;
@@ -115,6 +117,7 @@ class IndexStore {
   fish::core::Error close();
   fish::core::Error upsert_item(const std::string& kind, const std::string& id,
                                 const std::string& text, const std::vector<float>& vec);
+  fish::core::Error remove_item(const std::string& kind, const std::string& id);
 
   struct Hit {
     std::string kind;
@@ -191,7 +194,19 @@ class MemorySystem {
   fish::core::Result<ConsolidateReport> force_consolidate(const std::string& conv_id,
                                                           Consolidator& consolidator);
   [[nodiscard]] int round_count(const std::string& conv_id) const;
+  // 当前本地日期 yyyy-mm-dd（供外部做日期比较，也便于测试）
+  [[nodiscard]] std::string today_public() const { return today(); }
   [[nodiscard]] NotesStore& notes() { return notes_; }
+
+  // 周期维护：按衰减权重淘汰旧记忆。由 runtime 定时调用（建议每天一次）。
+  struct MaintainReport {
+    int facts_before{0};
+    int facts_after{0};
+    int evicted{0};
+    bool skipped{false};
+  };
+  core::Result<MaintainReport> maintain(double half_life_days = 30.0,
+                                        double min_weight = 0.05);
   [[nodiscard]] IndexStore& index() { return index_; }
 
  private:
@@ -427,6 +442,34 @@ Error NotesStore::append_fact(const Fact& f) const {
         << "<!-- 本文件由 super-feiyu 自动维护，可手工修正 -->\n\n";
     std::string cur;
     for (const auto& x : all) {
+      if (x.subject != cur) {
+        cur = x.subject;
+        out << "## " << cur << "\n";
+      }
+      out << "- [id:" << x.id << "] " << x.content;
+      if (!x.superseded_by.empty()) out << " → 被 " << x.superseded_by << " 取代";
+      out << " (置信度 " << x.confidence << ", " << x.created << ")\n";
+    }
+  }
+  fs::rename(tmp, path, ec);
+  if (ec) return Error::make(ErrorCode::kInternal, "rename_facts");
+  return Error::none();
+}
+
+Error NotesStore::rewrite_facts(const std::vector<Fact>& facts) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::error_code ec;
+  fs::create_directories(dir_, ec);
+
+  const std::string path = dir_ + "/facts.md";
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) return Error::make(ErrorCode::kInternal, "open_facts_tmp");
+    out << "# 关于用户的长期记忆\n\n"
+        << "<!-- 本文件由 super-feiyu 自动维护，可手工修正 -->\n\n";
+    std::string cur;
+    for (const auto& x : facts) {
       if (x.subject != cur) {
         cur = x.subject;
         out << "## " << cur << "\n";
@@ -679,6 +722,21 @@ Result<std::vector<IndexStore::Hit>> IndexStore::search_text(const std::string& 
   return Result<std::vector<Hit>>::ok(std::move(out));
 }
 
+Error IndexStore::remove_item(const std::string& kind, const std::string& id) {
+  if (db_ == nullptr) return Error::make(ErrorCode::kInternal, "db_closed");
+  sqlite3_stmt* stmt = nullptr;
+  const char* sql = "DELETE FROM items WHERE kind=? AND id=?;";
+  if (sqlite3_prepare_v2(static_cast<sqlite3*>(db_), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return Error::make(ErrorCode::kInternal, "prepare_remove");
+  }
+  sqlite3_bind_text(stmt, 1, kind.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+  const int rc = sqlite3_step(stmt);
+  sqlite3_finalize(stmt);
+  if (rc != SQLITE_DONE) return Error::make(ErrorCode::kInternal, "remove_failed");
+  return Error::none();
+}
+
 std::size_t IndexStore::item_count() const {
   if (db_ == nullptr) return 0;
   sqlite3_stmt* stmt = nullptr;
@@ -910,6 +968,75 @@ Error MemorySystem::init() {
       .field("notes", cfg_.notes_dir)
       .field("items", static_cast<long long>(index_.item_count()));
   return Error::none();
+}
+
+Result<MemorySystem::MaintainReport> MemorySystem::maintain(double half_life_days,
+                                                          double min_weight) {
+  MaintainReport rep;
+
+  auto facts = notes_.load_facts();
+  if (!facts.ok()) {
+    return Result<MaintainReport>::fail(facts.error.code, facts.error.detail);
+  }
+  rep.facts_before = static_cast<int>(facts.value->size());
+  if (rep.facts_before == 0) {
+    rep.skipped = true;
+    return Result<MaintainReport>::ok(rep);
+  }
+
+  // 计算每条事实的"距上次使用天数"。当前实现没有 last_used_at，
+  // 用 created 日期近似（越老的记忆权重越低）。
+  const std::string now_day = today();
+  auto days_between = [](const std::string& from, const std::string& to) -> double {
+    std::tm a{}, b{};
+    std::sscanf(from.c_str(), "%d-%d-%d", &a.tm_year, &a.tm_mon, &a.tm_mday);
+    std::sscanf(to.c_str(), "%d-%d-%d", &b.tm_year, &b.tm_mon, &b.tm_mday);
+    if (a.tm_year < 1970 || b.tm_year < 1970) return 0.0;
+    a.tm_year -= 1900; a.tm_mon -= 1;
+    b.tm_year -= 1900; b.tm_mon -= 1;
+    const auto ta = std::mktime(&a);
+    const auto tb = std::mktime(&b);
+    if (ta < 0 || tb < 0) return 0.0;
+    return std::difftime(tb, ta) / 86400.0;
+  };
+
+  Forgetting fg(Forgetting::Params{half_life_days, min_weight});
+  std::vector<Fact> kept;
+  kept.reserve(facts.value->size());
+  for (const auto& f : *facts.value) {
+    if (!f.superseded_by.empty()) {
+      kept.push_back(f);  // 已被取代的保留（便于追溯），不参与淘汰
+      continue;
+    }
+    const double age = days_between(f.created, now_day);
+    const double w = Forgetting::decay(f.confidence, age, half_life_days);
+    if (w < min_weight) {
+      ++rep.evicted;
+      continue;
+    }
+    kept.push_back(f);
+  }
+
+  if (rep.evicted > 0) {
+    // 改写旁路文件（权威源），并同步索引
+    // 用 NotesStore 的原子改写（rewrite_facts 内部按 subject 分组重写）
+    if (notes_.rewrite_facts(kept).ok() == false) {
+      return Result<MaintainReport>::fail(ErrorCode::kInternal, "rewrite_facts_failed");
+    }
+    for (const auto& f : *facts.value) {
+      // 从索引移除被淘汰项
+      bool still_there = std::any_of(kept.begin(), kept.end(),
+                                     [&](const Fact& x) { return x.id == f.id; });
+      if (!still_there) index_.remove_item("fact", f.id);
+    }
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "evicted")
+        .field("count", rep.evicted)
+        .field("before", rep.facts_before)
+        .field("after", static_cast<long long>(kept.size()));
+  }
+
+  rep.facts_after = static_cast<int>(kept.size());
+  return Result<MaintainReport>::ok(rep);
 }
 
 std::string MemorySystem::today() const {

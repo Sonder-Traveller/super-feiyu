@@ -49,6 +49,9 @@ echo "==> 3/4 编译主程序与测试"
 if [ -f tests/test_protocol.cpp ]; then
   "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c tests/test_protocol.cpp -o "$OUT/obj/test_protocol.o"
 fi
+if [ -f tests/test_lifecycle.cpp ]; then
+  "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c tests/test_lifecycle.cpp -o "$OUT/obj/test_lifecycle.o"
+fi
 
 echo "==> 4/4 链接"
 LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -lpthread -Wl,-rpath,"$PREFIX/lib")
@@ -58,9 +61,12 @@ LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -lpthread -Wl,-rpath,"$PREFIX/lib")
 if [ -f "$OUT/obj/test_protocol.o" ]; then
   "$CXX" "$OUT/obj/test_protocol.o" "$OUT"/obj/fish.*.o -o "$OUT/test_protocol" "${LIBS[@]}"
 fi
+if [ -f "$OUT/obj/test_lifecycle.o" ]; then
+  "$CXX" "$OUT/obj/test_lifecycle.o" "$OUT"/obj/fish.*.o -o "$OUT/test_lifecycle" "${LIBS[@]}"
+fi
 
 echo
 echo "构建完成:"
-for b in super-feiyu test_all test_e2e test_protocol; do
+for b in super-feiyu test_all test_e2e test_protocol test_lifecycle; do
   [ -x "$OUT/$b" ] && echo "  $OUT/$b  ($(du -h "$OUT/$b" | cut -f1))"
 done

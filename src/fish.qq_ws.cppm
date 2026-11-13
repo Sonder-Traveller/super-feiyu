@@ -103,6 +103,7 @@ class Client {
   void send_heartbeat();
   void heartbeat_loop();
   void schedule_reconnect();
+  void reconnect_loop();
   void parse_dispatch(const std::string& type, const nlohmann::json& d);
 
   Config cfg_;
@@ -120,6 +121,8 @@ class Client {
   std::atomic<bool> stop_{false};
   std::atomic<int> event_count_{0};
   std::thread heartbeat_thread_;
+  std::thread supervisor_thread_;
+  std::atomic<int> backoff_ms_{1000};
 };
 
 }  // namespace fish::qq_ws
@@ -238,6 +241,12 @@ Error Client::open_socket() {
     if (s == ws::State::kClosed || s == ws::State::kFailed) {
       if (!stop_.load()) {
         ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq_ws", "socket_closed");
+        // 释放 socket 交给 supervisor 重连（它靠 socket_ == nullptr 判断）
+        std::lock_guard<std::mutex> lock(mu_);
+        if (socket_) {
+          socket_->close();
+          socket_.reset();
+        }
         schedule_reconnect();
       }
     }
@@ -317,9 +326,56 @@ void Client::heartbeat_loop() {
 }
 
 void Client::schedule_reconnect() {
-  if (!cfg_.app_id.empty()) {
-    // 简单策略：交给上层重试；这里只记录
-    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq_ws", "reconnect_needed");
+  // 由 supervisor 线程接管；这里只记录一次
+  ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq_ws", "reconnect_needed")
+      .field("backoff_ms", backoff_ms_.load());
+}
+
+void Client::reconnect_loop() {
+  // 断线自愈：指数退避 1s → 60s，成功后重置。
+  // 有 session_id 时优先 RESUME（避免丢事件），否则重新 IDENTIFY。
+  while (!stop_.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    if (stop_.load()) break;
+
+    bool alive = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      alive = socket_ != nullptr;
+    }
+    if (alive) {
+      backoff_ms_.store(1000);
+      continue;
+    }
+
+    const int wait = backoff_ms_.load();
+    for (int slept = 0; slept < wait && !stop_.load(); slept += 100) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (stop_.load()) break;
+
+    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "qq_ws", "reconnecting")
+        .field("backoff_ms", wait);
+
+    // token 过期就先刷新
+    {
+      bool need = false;
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        need = access_token_.empty() || core::Clock::now() >= token_expiry_;
+      }
+      if (need) refresh_token();
+    }
+
+    auto e = open_socket();
+    if (e.ok()) {
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "qq_ws", "reconnected");
+      backoff_ms_.store(1000);
+    } else {
+      int next = wait * 2;
+      if (next > 60000) next = 60000;
+      backoff_ms_.store(next);
+    }
   }
 }
 
@@ -453,6 +509,7 @@ Error Client::start() {
   stop_.store(false);
   running_.store(true);
   heartbeat_thread_ = std::thread([this] { heartbeat_loop(); });
+  supervisor_thread_ = std::thread([this] { reconnect_loop(); });
 
   ::fish::log::log_line(::fish::log::LogLevel::kInfo, "qq_ws", "started")
       .field("app_id", cfg_.app_id);
@@ -468,6 +525,13 @@ void Client::stop() {
       heartbeat_thread_.join();
     } else {
       heartbeat_thread_.detach();
+    }
+  }
+  if (supervisor_thread_.joinable()) {
+    if (supervisor_thread_.get_id() != std::this_thread::get_id()) {
+      supervisor_thread_.join();
+    } else {
+      supervisor_thread_.detach();
     }
   }
   {
