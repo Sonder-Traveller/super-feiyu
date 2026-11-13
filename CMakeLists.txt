@@ -34,20 +34,33 @@ set(FISH_MODULE_INCLUDE
   ${FISH_LOCAL_PREFIX}/include/x86_64-linux-gnu
 )
 
-# 所有模块作为同一组文件集，由 CMake 负责编译顺序与依赖分析
+# 所有模块作为同一组文件集，由 CMake 负责编译顺序与依赖分析。
+# 顺序必须与 build.sh 的 MODULES 数组一致：依赖在前。
 add_library(fish_modules OBJECT
   src/fish.core.cppm
   src/fish.log.cppm
   src/fish.config.cppm
   src/fish.memory.cppm
   src/fish.capability.cppm
-  src/fish.transport.cppm
+  src/fish.probe.cppm
+  src/fish.media.cppm
+  src/fish.image.cppm
+  src/fish.meme.cppm
+  src/fish.session.cppm
+  src/fish.tool.cppm
+  src/fish.guard.cppm
+  src/fish.ws.cppm
+  src/fish.qq_ws.cppm
+  src/fish.onebot_ws.cppm
+  src/fish.channels.cppm
+  src/fish.dispatcher.cppm
   src/fish.orchestrator.cppm
 )
-target_include_directories(fish_modules PUBLIC ${FISH_MODULE_INCLUDE})
-target_link_libraries(fish_modules PUBLIC ${CURL_LIBRARY} ${SQLITE_LIBRARY})
+target_include_directories(fish_modules PUBLIC ${FISH_MODULE_INCLUDE}
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/thread-pool/pool/include)
+target_link_libraries(fish_modules PUBLIC ${CURL_LIBRARY} ${SQLITE_LIBRARY} pthread)
 target_compile_options(fish_modules PRIVATE
-  $<$<CXX_COMPILER_ID:Clang,GNU>:-Wall -Wextra>
+  $<$<CXX_COMPILER_ID:Clang,GNU>:-Wall -Wextra -O3>
 )
 
 add_executable(super-feiyu src/main.cpp)
@@ -55,6 +68,10 @@ target_link_libraries(super-feiyu PRIVATE fish_modules)
 
 enable_testing()
 
-add_executable(test_all tests/test_all.cpp)
-target_link_libraries(test_all PRIVATE fish_modules)
-add_test(NAME all COMMAND test_all)
+foreach(t all e2e protocol lifecycle)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_${t}.cpp)
+    add_executable(test_${t} tests/test_${t}.cpp)
+    target_link_libraries(test_${t} PRIVATE fish_modules)
+    add_test(NAME ${t} COMMAND test_${t})
+  endif()
+endforeach()

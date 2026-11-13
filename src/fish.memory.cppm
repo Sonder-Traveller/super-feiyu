@@ -97,7 +97,8 @@ struct ConsolidateReport {
 // ── L2 短时记忆 ─────────────────────────────────────────
 class WorkingMemory {
  public:
-  explicit WorkingMemory(int max_rounds = 20);
+  // 0 = 不按轮数截断（默认）。截断只能靠显式传参，不能靠默认值偷偷加上限。
+  explicit WorkingMemory(int max_rounds = 0);
   void push(const Message& user, const Message& assistant);
   [[nodiscard]] std::vector<Message> snapshot() const;
   [[nodiscard]] int round_count() const;
@@ -124,11 +125,11 @@ class NotesStore {
 
   fish::core::Result<std::vector<Fact>> load_facts(const std::string& conv_id) const;
   fish::core::Error append_fact(const std::string& conv_id, const Fact& f) const;
-  // 全量改写（按 subject 分组），用于淘汰后重写权威文件
+  // 全量改写（按 subject 分组），用于合并后重写权威文件
   fish::core::Error rewrite_facts(const std::string& conv_id,
                                   const std::vector<Fact>& facts) const;
   fish::core::Error append_episode(const std::string& conv_id, const Episode& e) const;
-  // 全量改写情景记忆（按月份分文件），用于容量淘汰后重写
+  // 全量改写情景记忆（按月份分文件），用于压缩后重写
   fish::core::Error rewrite_episodes(const std::string& conv_id,
                                      const std::vector<Episode>& eps) const;
   fish::core::Result<std::vector<Episode>> load_episodes(const std::string& conv_id,
@@ -206,7 +207,7 @@ class MemorySystem {
     int model_context_tokens{131072};   // 模型窗口大小
     double raw_context_ratio{0.40};     // 原文可占比例
     double summary_ratio{0.25};         // 摘要可占余下部分的比例
-    // 容量上限：超过就按权重淘汰（不是按时间）
+    // 没有条数上限：记忆只增不减，超预算时压成摘要 + 落盘，不删除。
 
     std::string notes_dir{"data/memory/notes"};
     std::string db_path{"data/memory/index.db"};

@@ -11,7 +11,7 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 | 项 | 状态 |
 |---|---|
-| 构建 | ✅ clang 10 个 C++20 模块，一次通过 |
+| 构建 | ✅ clang 19 个 C++20 模块，一次通过 |
 | 测试 | ✅ 84 项断言（单元 60 + 协议 24） |
 | 通道 | ✅ QQ 官方 WS / QQ 小号 OneBot WS / 微信 / 本地 |
 | 记忆 | ✅ 三层 + 巩固 + 遗忘 + 索引重建 |
@@ -44,14 +44,16 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 ---
 
-## 架构：10 个 C++20 模块
+## 架构：19 个 C++20 模块
 
 ```
               main.cpp (runtime)
                      │
-               orchestrator ── 唯一持有业务决策
+              dispatcher ── 线程池 + 会话隔离
                      │
-    ┌──────┬─────────┼─────────┬──────┬──────┐
+              orchestrator ── 唯一持有业务决策
+                     │
+    ┌──────┬─────────┼─────────┬──────┬──────┬──────┐
  channels  capability  memory  persona config  log
     │          │          │
   qq_ws    DeepSeek     L2 短时
@@ -64,16 +66,26 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 | 模块 | 职责 |
 |---|---|
-| `fish.core` | 领域类型、`Result`、七类接口 |
+| `fish.core` | 领域类型、`Result`、十类接口 |
 | `fish.log` | 结构化 JSON 日志 |
 | `fish.config` | TOML + 环境变量展开 |
 | `fish.memory` | **三层记忆**（核心） |
 | `fish.capability` | 多 provider 统一接口 + 熔断 |
+| `fish.probe` | 上游能力探测与缓存 |
+| `fish.media` | 媒体去重缓存（内容哈希） |
+| `fish.image` | 立绘库（manifest 权威 + 目录扫描） |
+| `fish.meme` | 热梗库（本地优先 + 命中计数） |
+| `fish.session` | 会话注册表 + 每会话互斥 |
+| `fish.tool` | 工具注册表（记忆/图片/搜索/抓取/梗） |
+| `fish.guard` | 输入注入防护 + 输出脱敏 + 限流 |
 | `fish.ws` | libcurl WebSocket 客户端 + 自动重连 |
 | `fish.qq_ws` | QQ 网关协议栈（op 码/心跳/RESUME） |
 | `fish.onebot_ws` | OneBot v11 事件解析 |
 | `fish.channels` | 四个通道实现（含富媒体上传） |
+| `fish.dispatcher` | 线程池调度，通道线程只投递 |
 | `fish.orchestrator` | 流水线、被动策略、预算、去重 |
+
+> 模块必须按依赖顺序编译，见 `build.sh` 里的 `MODULES` 数组。
 
 ---
 
@@ -94,8 +106,11 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 巩固用独立 LLM 调用，**失败不阻断对话**（记忆恢复、下轮重试）。
 去重用内容哈希做稳定 id，**连跑多次不产生重复**。
-**遗忘是按容量淘汰**：总量超过 `max_facts`/`max_episodes` 时，
-按「置信度 × 30 天半衰期」排序保留高权重条目（不是定时按时间删）。
+
+**记忆只增不减，没有任何条数或时间上限。** 预算按 token 算：
+`模型窗口 × raw_context_ratio`（默认 131072 × 0.40）。在预算内全部原文
+进上下文；超了就 `compact()` —— 最早的部分压成滚动摘要，原文落盘到
+`episodes/` 并建索引，模型用 `search()` 自己检索。**不删任何一条。**
 
 详见 [docs/modules/memory.md](docs/modules/memory.md)。
 
@@ -231,7 +246,27 @@ base_url = "http://127.0.0.1:18081/v1"
 | [deploy/README.md](deploy/README.md) | 生产部署与排查 |
 | [bridge/README.md](bridge/README.md) | 桥接层 |
 | [docs/decisions/](docs/decisions/) | 8 条 ADR |
+| [CREDITS.md](CREDITS.md) | **素材来源与逐图署名** |
+| [docs/ASSETS_LICENSE.md](docs/ASSETS_LICENSE.md) | 素材授权说明 |
 
 ## 许可
 
-MIT
+代码以 **GNU GPL v3** 发布，全文见 [LICENSE](LICENSE)。
+
+**素材不是代码，不适用 GPL。** `data/memory/portraits/` 下的 **129 张图片**
+来自社区作者，各自保留原授权，**全部禁止商业使用**：
+
+| 授权 | 数量 | 说明 |
+|---|---|---|
+| CC BY-NC-SA 4.0 | 33 | 需署名、非商业、衍生同协议 |
+| 非营利粉丝向 | 20 | 作者声明可随意使用，商用自评风险 |
+| 仅供个人学习使用 | 62 | roseion 皮肤素材，最窄的一档 |
+| MIT | 7 | 壁纸 + 三视图立绘 |
+| 无 LICENSE | 4 | gmskywalker，授权链不完整 |
+
+逐图来源与署名见 [CREDITS.md](CREDITS.md)，
+授权分析见 [docs/ASSETS_LICENSE.md](docs/ASSETS_LICENSE.md)。
+
+> **收进仓库不等于授权变宽。** 商用前必须逐张确认授权；
+> 若无法满足署名或非商业条件，请删掉 `data/memory/portraits/`，
+> 仅使用 GPL 代码。

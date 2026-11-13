@@ -44,9 +44,20 @@ config.toml
 secrets*.json
 
 # 运行时数据
-data/
+# 注意：必须写成 data/* 而不是 data/，
+# 否则 git 不会进入被忽略的目录，下面的 ! 否定规则就失效了。
+data/*
 logs/
 *.log
+
+# 例外：形象库与热梗库随仓库分发（授权见 CREDITS.md）
+# 入库不等于授权变宽，各图仍受原作者许可约束，禁止商业使用。
+!data/memory/
+data/memory/*
+!data/memory/portraits/
+!data/memory/portraits/**
+!data/memes/
+!data/memes/**
 
 # 编辑器
 .vscode/
