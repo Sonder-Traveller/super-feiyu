@@ -76,6 +76,11 @@ working_rounds = 20        # L2 短时记忆保留轮数
 consolidate_every = 20     # 每多少轮触发一次巩固
 recall_top_k = 5           # L3 事实召回条数
 episode_top_k = 3          # L3 情景召回条数
+
+# 容量上限：超过就按权重（置信度 × 时间衰减）淘汰到配额内。
+# 注意不是按时间删——又旧又不重要的先走，高置信度的旧事实会留下。
+max_facts = 2000           # 事实条数上限
+max_episodes = 5000        # 情景条数上限
 notes_dir = "data/memory/notes"    # 旁路文件（权威源，人可读、可手改）
 db_path = "data/memory/index.db"   # SQLite 索引（可随时从文件重建）
 

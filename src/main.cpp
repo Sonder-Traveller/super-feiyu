@@ -259,6 +259,8 @@ int main(int argc, char** argv) {
   mem_cfg.consolidate_every = static_cast<int>(cfg.get_int_or("memory.consolidate_every", 20));
   mem_cfg.recall_top_k = static_cast<int>(cfg.get_int_or("memory.recall_top_k", 5));
   mem_cfg.episode_top_k = static_cast<int>(cfg.get_int_or("memory.episode_top_k", 3));
+  mem_cfg.max_facts = static_cast<int>(cfg.get_int_or("memory.max_facts", 2000));
+  mem_cfg.max_episodes = static_cast<int>(cfg.get_int_or("memory.max_episodes", 5000));
   mem_cfg.notes_dir = cfg.get_or("memory.notes_dir", "data/memory/notes");
   mem_cfg.db_path = cfg.get_or("memory.db_path", "data/memory/index.db");
 
@@ -441,13 +443,13 @@ int main(int argc, char** argv) {
       pipeline.maintenance();
     }
 
-    // 每 24 小时：按衰减权重淘汰旧记忆
-    if (++mem_ticks % 432000 == 0 && mem_ticks > 0) {
-      auto mr = memory_sys.maintain(30.0, 0.05);
-      if (mr.ok() && mr.value->evicted > 0) {
-        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "memory_maintained")
-            .field("evicted", mr.value->evicted)
-            .field("facts", static_cast<long long>(mr.value->facts_after));
+    // 每 5 分钟检查一次容量：超配额就按权重淘汰到配额内
+    if (++mem_ticks % 1500 == 0 && mem_ticks > 0) {
+      auto mr = memory_sys.maintain(mem_cfg.max_facts, mem_cfg.max_episodes);
+      if (mr.ok() && !mr.value->skipped) {
+        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "memory_evicted")
+            .field("facts", static_cast<long long>(mr.value->facts_after))
+            .field("episodes", static_cast<long long>(mr.value->episodes_after));
       }
     }
 

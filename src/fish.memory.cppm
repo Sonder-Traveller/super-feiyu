@@ -96,6 +96,8 @@ class NotesStore {
   // 全量改写（按 subject 分组），用于淘汰后重写权威文件
   fish::core::Error rewrite_facts(const std::vector<Fact>& facts) const;
   fish::core::Error append_episode(const Episode& e) const;
+  // 全量改写情景记忆（按月份分文件），用于容量淘汰后重写
+  fish::core::Error rewrite_episodes(const std::vector<Episode>& eps) const;
   fish::core::Result<std::vector<Episode>> load_episodes(int max_months = 24) const;
   fish::core::Result<std::vector<Trait>> load_traits() const;
   fish::core::Error save_traits(const std::vector<Trait>& traits) const;
@@ -179,6 +181,9 @@ class MemorySystem {
     int consolidate_every{20};
     int recall_top_k{5};
     int episode_top_k{3};
+    // 容量上限：超过就按权重淘汰（不是按时间）
+    int max_facts{2000};
+    int max_episodes{5000};
     std::string notes_dir{"data/memory/notes"};
     std::string db_path{"data/memory/index.db"};
   };
@@ -202,11 +207,16 @@ class MemorySystem {
   struct MaintainReport {
     int facts_before{0};
     int facts_after{0};
-    int evicted{0};
+    int episodes_before{0};
+    int episodes_after{0};
+    int evicted_facts{0};
+    int evicted_episodes{0};
     bool skipped{false};
   };
-  core::Result<MaintainReport> maintain(double half_life_days = 30.0,
-                                        double min_weight = 0.05);
+  // 按容量淘汰：总量超过配额时，保留权重最高的 max_facts / max_episodes 条。
+  // 权重 = confidence × 时间衰减（越新越重要），所以不是单纯删最旧，
+  // 而是"又旧又不重要"的先走。
+  core::Result<MaintainReport> maintain(int max_facts, int max_episodes);
   [[nodiscard]] IndexStore& index() { return index_; }
 
  private:
@@ -498,6 +508,43 @@ Error NotesStore::append_episode(const Episode& e) const {
   if (fresh) out << "# " << month << " 情景记忆\n\n";
   out << "- [id:" << e.id << "] " << e.summary << " (重要度 " << e.importance << ", "
       << e.created << ")\n";
+  return Error::none();
+}
+
+Error NotesStore::rewrite_episodes(const std::vector<Episode>& eps) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::error_code ec;
+  const std::string ep_dir = dir_ + "/episodes";
+  fs::create_directories(ep_dir, ec);
+
+  // 按月份分组
+  std::map<std::string, std::vector<Episode>> by_month;
+  for (const auto& e : eps) {
+    const std::string month = e.created.size() >= 7 ? e.created.substr(0, 7) : "unknown";
+    by_month[month].push_back(e);
+  }
+
+  // 清掉旧文件，再按分组写回（先写 tmp 再 rename，避免中途失败丢失）
+  for (const auto& entry : fs::directory_iterator(ep_dir, ec)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".md") {
+      fs::remove(entry.path(), ec);
+    }
+  }
+  for (const auto& [month, list] : by_month) {
+    const std::string path = ep_dir + "/" + month + ".md";
+    const std::string tmp = path + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::trunc);
+      if (!out) return Error::make(ErrorCode::kInternal, "open_episode_tmp");
+      out << "# " << month << " 情景记忆\n\n";
+      for (const auto& e : list) {
+        out << "- [id:" << e.id << "] " << e.summary << " (重要度 " << e.importance
+            << ", " << e.created << ")\n";
+      }
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) return Error::make(ErrorCode::kInternal, "rename_episode");
+  }
   return Error::none();
 }
 
@@ -970,72 +1017,133 @@ Error MemorySystem::init() {
   return Error::none();
 }
 
-Result<MemorySystem::MaintainReport> MemorySystem::maintain(double half_life_days,
-                                                          double min_weight) {
+Result<MemorySystem::MaintainReport> MemorySystem::maintain(int max_facts,
+                                                         int max_episodes) {
   MaintainReport rep;
 
-  auto facts = notes_.load_facts();
-  if (!facts.ok()) {
-    return Result<MaintainReport>::fail(facts.error.code, facts.error.detail);
-  }
-  rep.facts_before = static_cast<int>(facts.value->size());
-  if (rep.facts_before == 0) {
-    rep.skipped = true;
-    return Result<MaintainReport>::ok(rep);
-  }
-
-  // 计算每条事实的"距上次使用天数"。当前实现没有 last_used_at，
-  // 用 created 日期近似（越老的记忆权重越低）。
+  // 权重 = confidence × 0.5^(age_days / half_life)
+  // 为什么不是单纯按时间删：一条三个月前但置信度很高的事实，
+  // 比一条昨天随口说的更该留下。时间衰减只作为排序因子，不单独构成删除条件。
+  constexpr double kHalfLifeDays = 30.0;
   const std::string now_day = today();
-  auto days_between = [](const std::string& from, const std::string& to) -> double {
+
+  auto day_diff = [](const std::string& from, const std::string& to) -> double {
     std::tm a{}, b{};
-    std::sscanf(from.c_str(), "%d-%d-%d", &a.tm_year, &a.tm_mon, &a.tm_mday);
-    std::sscanf(to.c_str(), "%d-%d-%d", &b.tm_year, &b.tm_mon, &b.tm_mday);
-    if (a.tm_year < 1970 || b.tm_year < 1970) return 0.0;
-    a.tm_year -= 1900; a.tm_mon -= 1;
-    b.tm_year -= 1900; b.tm_mon -= 1;
-    const auto ta = std::mktime(&a);
-    const auto tb = std::mktime(&b);
+    if (std::sscanf(from.c_str(), "%d-%d-%d", &a.tm_year, &a.tm_mon, &a.tm_mday) != 3) {
+      return 0.0;
+    }
+    if (std::sscanf(to.c_str(), "%d-%d-%d", &b.tm_year, &b.tm_mon, &b.tm_mday) != 3) {
+      return 0.0;
+    }
+    a.tm_year -= 1900;
+    a.tm_mon -= 1;
+    b.tm_year -= 1900;
+    b.tm_mon -= 1;
+    const std::time_t ta = std::mktime(&a);
+    const std::time_t tb = std::mktime(&b);
     if (ta < 0 || tb < 0) return 0.0;
-    return std::difftime(tb, ta) / 86400.0;
+    const double d = std::difftime(tb, ta) / 86400.0;
+    return d < 0.0 ? 0.0 : d;  // 未来日期按 0 处理
   };
 
-  Forgetting fg(Forgetting::Params{half_life_days, min_weight});
-  std::vector<Fact> kept;
-  kept.reserve(facts.value->size());
-  for (const auto& f : *facts.value) {
-    if (!f.superseded_by.empty()) {
-      kept.push_back(f);  // 已被取代的保留（便于追溯），不参与淘汰
-      continue;
+  // ── 事实 ──
+  auto facts_r = notes_.load_facts();
+  if (!facts_r.ok()) {
+    return Result<MaintainReport>::fail(facts_r.error.code, facts_r.error.detail);
+  }
+  std::vector<Fact> facts = std::move(*facts_r.value);
+  rep.facts_before = static_cast<int>(facts.size());
+
+  if (max_facts > 0 && static_cast<int>(facts.size()) > max_facts) {
+    // 已被取代的条目单独处理：不参与权重竞争，直接随其替代者去留
+    std::vector<std::pair<double, std::size_t>> ranked;
+    ranked.reserve(facts.size());
+    for (std::size_t i = 0; i < facts.size(); ++i) {
+      const double age = day_diff(facts[i].created, now_day);
+      const double w = facts[i].confidence * std::pow(0.5, age / kHalfLifeDays);
+      ranked.emplace_back(w, i);
     }
-    const double age = days_between(f.created, now_day);
-    const double w = Forgetting::decay(f.confidence, age, half_life_days);
-    if (w < min_weight) {
-      ++rep.evicted;
-      continue;
+    // 权重高的在前
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<bool> keep(facts.size(), false);
+    for (int i = 0; i < max_facts && i < static_cast<int>(ranked.size()); ++i) {
+      keep[ranked[static_cast<std::size_t>(i)].second] = true;
     }
-    kept.push_back(f);
+
+    std::vector<Fact> kept;
+    kept.reserve(static_cast<std::size_t>(max_facts));
+    for (std::size_t i = 0; i < facts.size(); ++i) {
+      if (keep[i]) {
+        kept.push_back(std::move(facts[i]));
+      } else {
+        index_.remove_item("fact", facts[i].id);
+        ++rep.evicted_facts;
+      }
+    }
+    if (!kept.empty() || rep.evicted_facts > 0) {
+      auto e = notes_.rewrite_facts(kept);
+      if (!e.ok()) {
+        return Result<MaintainReport>::fail(e.code, e.detail);
+      }
+    }
+    facts = std::move(kept);
+  }
+  rep.facts_after = static_cast<int>(facts.size());
+
+  // ── 情景 ──
+  auto eps_r = notes_.load_episodes(240);
+  if (eps_r.ok()) {
+    std::vector<Episode> eps = std::move(*eps_r.value);
+    rep.episodes_before = static_cast<int>(eps.size());
+
+    if (max_episodes > 0 && static_cast<int>(eps.size()) > max_episodes) {
+      std::vector<std::pair<double, std::size_t>> ranked;
+      ranked.reserve(eps.size());
+      for (std::size_t i = 0; i < eps.size(); ++i) {
+        const double age = day_diff(eps[i].created, now_day);
+        const double w = eps[i].importance * std::pow(0.5, age / kHalfLifeDays);
+        ranked.emplace_back(w, i);
+      }
+      std::sort(ranked.begin(), ranked.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+
+      std::vector<bool> keep(eps.size(), false);
+      for (int i = 0; i < max_episodes && i < static_cast<int>(ranked.size()); ++i) {
+        keep[ranked[static_cast<std::size_t>(i)].second] = true;
+      }
+
+      std::vector<Episode> kept;
+      kept.reserve(static_cast<std::size_t>(max_episodes));
+      for (std::size_t i = 0; i < eps.size(); ++i) {
+        if (keep[i]) {
+          kept.push_back(std::move(eps[i]));
+        } else {
+          index_.remove_item("episode", eps[i].id);
+          ++rep.evicted_episodes;
+        }
+      }
+      if (rep.evicted_episodes > 0) {
+        notes_.rewrite_episodes(kept);
+      }
+      eps = std::move(kept);
+    }
+    rep.episodes_after = static_cast<int>(eps.size());
   }
 
-  if (rep.evicted > 0) {
-    // 改写旁路文件（权威源），并同步索引
-    // 用 NotesStore 的原子改写（rewrite_facts 内部按 subject 分组重写）
-    if (notes_.rewrite_facts(kept).ok() == false) {
-      return Result<MaintainReport>::fail(ErrorCode::kInternal, "rewrite_facts_failed");
-    }
-    for (const auto& f : *facts.value) {
-      // 从索引移除被淘汰项
-      bool still_there = std::any_of(kept.begin(), kept.end(),
-                                     [&](const Fact& x) { return x.id == f.id; });
-      if (!still_there) index_.remove_item("fact", f.id);
-    }
-    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "evicted")
-        .field("count", rep.evicted)
-        .field("before", rep.facts_before)
-        .field("after", static_cast<long long>(kept.size()));
+  if (rep.evicted_facts > 0 || rep.evicted_episodes > 0) {
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "capacity_evicted")
+        .field("facts_before", rep.facts_before)
+        .field("facts_after", rep.facts_after)
+        .field("episodes_before", rep.episodes_before)
+        .field("episodes_after", rep.episodes_after)
+        .field("evicted_facts", rep.evicted_facts)
+        .field("evicted_episodes", rep.evicted_episodes);
+  } else {
+    rep.skipped = true;
   }
 
-  rep.facts_after = static_cast<int>(kept.size());
   return Result<MaintainReport>::ok(rep);
 }
 

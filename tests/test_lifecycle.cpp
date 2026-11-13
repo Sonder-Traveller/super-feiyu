@@ -162,49 +162,89 @@ void test_different_sessions_parallel() {
   CHECK(chat.max_inflight.load() > 1, "不同会话确实并行（>1）");
 }
 
-// 记忆淘汰：极老的条目应被清掉，新的保留
-void test_memory_eviction() {
-  std::printf("\n=== 记忆淘汰 ===\n");
+// 容量淘汰：超过配额时按权重保留，而不是单纯删最旧
+void test_memory_capacity_eviction() {
+  std::printf("\n=== 容量淘汰 ===\n");
   const std::string base = "/tmp/fish_life_" + std::to_string(std::rand());
   StubEmbedding emb;
 
   fish::memory::MemorySystem::Config c;
   c.notes_dir = base + "/notes";
   c.db_path = base + "/i.db";
+  c.max_facts = 3;   // 配额 3
+  c.max_episodes = 2;
   fish::memory::MemorySystem ms(c, &emb);
   CHECK(ms.init().ok(), "init ok");
 
-  // 造一条"很老"的和一条"很新"的
-  fish::memory::Fact old_f;
-  old_f.id = "fold";
-  old_f.content = "很久以前的事";
-  old_f.confidence = 0.9;
-  old_f.created = "2020-01-01";
-  ms.notes().append_fact(old_f);
+  const std::string today = ms.today_public();
 
-  fish::memory::Fact new_f;
-  new_f.id = "fnew";
-  new_f.content = "昨天的事";
-  new_f.confidence = 0.9;
-  new_f.created = ms.today_public();
-  ms.notes().append_fact(new_f);
+  // 造 6 条事实：其中 2 条老的、4 条新的
+  auto add = [&](const std::string& id, const std::string& content, double conf,
+                 const std::string& date) {
+    fish::memory::Fact f;
+    f.id = id;
+    f.content = content;
+    f.confidence = conf;
+    f.created = date;
+    ms.notes().append_fact(f);
+  };
+  add("old1", "很久以前随口说的", 0.3, "2020-01-01");
+  add("old2", "很久以前随口说的2", 0.3, "2020-06-01");
+  add("new1", "昨天说的重要事", 0.95, today);
+  add("new2", "今天说的重要事", 0.95, today);
+  add("new3", "刚才说的", 0.9, today);
+  add("new4", "刚刚又说的", 0.9, today);
 
   auto before = ms.notes().load_facts();
-  CHECK(before.ok() && before.value->size() == 2, "淘汰前 2 条");
+  CHECK(before.ok() && before.value->size() == 6, "淘汰前 6 条");
 
-  auto rep = ms.maintain(30.0, 0.05);
+  auto rep = ms.maintain(c.max_facts, c.max_episodes);
   CHECK(rep.ok(), "maintain 成功");
-  CHECK(rep.ok() && rep.value->evicted >= 1, "至少淘汰 1 条");
+  CHECK(rep.ok() && rep.value->evicted_facts == 3, "淘汰 3 条（6 → 3）");
 
   auto after = ms.notes().load_facts();
-  CHECK(after.ok() && after.value->size() == 1, "淘汰后剩 1 条");
-  bool kept_new = false;
+  CHECK(after.ok() && after.value->size() == 3, "剩 3 条，等于配额");
+
+  // 保留的应该都是新的（高权重）
+  int new_kept = 0;
   if (after.ok()) {
     for (const auto& f : *after.value) {
-      if (f.content == "昨天的事") kept_new = true;
+      if (f.id.rfind("new", 0) == 0) ++new_kept;
     }
   }
-  CHECK(kept_new, "新记忆被保留（不是乱删）");
+  CHECK(new_kept == 3, "按权重保留（留新不留旧，不是随机删）");
+
+  fs::remove_all(base);
+}
+
+// 未超配额时不动
+void test_capacity_no_eviction_when_under() {
+  std::printf("\n=== 未超配额不淘汰 ===\n");
+  const std::string base = "/tmp/fish_life2_" + std::to_string(std::rand());
+  StubEmbedding emb;
+
+  fish::memory::MemorySystem::Config c;
+  c.notes_dir = base + "/notes";
+  c.db_path = base + "/i.db";
+  fish::memory::MemorySystem ms(c, &emb);
+  ms.init();
+
+  for (int i = 0; i < 5; ++i) {
+    fish::memory::Fact f;
+    f.id = "f" + std::to_string(i);
+    f.content = "记忆" + std::to_string(i);
+    f.confidence = 0.9;
+    f.created = ms.today_public();
+    ms.notes().append_fact(f);
+  }
+
+  auto rep = ms.maintain(100, 100);  // 配额远大于实际
+  CHECK(rep.ok(), "maintain 成功");
+  CHECK(rep.ok() && rep.value->skipped, "未超配额 → 跳过");
+  CHECK(rep.ok() && rep.value->evicted_facts == 0, "没删任何东西");
+
+  auto after = ms.notes().load_facts();
+  CHECK(after.ok() && after.value->size() == 5, "5 条原样保留");
 
   fs::remove_all(base);
 }
@@ -240,7 +280,8 @@ int main() {
 
   test_session_serialization();
   test_different_sessions_parallel();
-  test_memory_eviction();
+  test_memory_capacity_eviction();
+  test_capacity_no_eviction_when_under();
   test_pipeline_maintenance();
 
   std::printf("\n");
