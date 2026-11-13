@@ -18,6 +18,7 @@ import fish.orchestrator;
 import fish.guard;
 import fish.tool;
 import fish.session;
+import fish.persona;
 
 namespace fs = std::filesystem;
 
@@ -617,6 +618,69 @@ void test_photo_markers() {
   }
 }
 
+// 人格存储：全局默认 + 每会话覆盖
+void test_persona_store() {
+  std::printf("\n=== persona store ===\n");
+
+  const auto dir = fs::temp_directory_path() / "fish_persona_test";
+  fs::remove_all(dir);
+
+  fish::persona::PersonaStore::Config cfg;
+  cfg.dir = dir.string();
+  fish::persona::PersonaStore store(cfg);
+
+  auto init = store.init();
+  CHECK(init.ok(), "init ok");
+
+  // 没有任何文件时，全局默认为空（不是错误）
+  auto d0 = store.default_persona();
+  CHECK(d0.ok(), "default readable");
+  CHECK(d0.value->empty(), "default empty when never set");
+
+  // 会话找不到覆盖时也回落到空
+  auto c0 = store.persona_for("conv-a");
+  CHECK(c0.ok() && c0.value->empty(), "session falls back to empty default");
+
+  // 设全局默认
+  CHECK(store.set_default_persona("全局人格").ok(), "set default");
+  auto d1 = store.default_persona();
+  CHECK(d1.ok() && *d1.value == "全局人格", "default persisted");
+
+  // 会话 A 没覆盖 → 拿到全局
+  auto ca = store.persona_for("conv-a");
+  CHECK(ca.ok() && *ca.value == "全局人格", "session inherits default");
+
+  // 会话 B 设覆盖，不影响 A，也不影响全局
+  CHECK(store.set_persona_for("conv-b", "B 的人格").ok(), "set override B");
+  CHECK(store.has_override("conv-b"), "B has override");
+  CHECK(!store.has_override("conv-a"), "A has no override");
+
+  auto cb = store.persona_for("conv-b");
+  CHECK(cb.ok() && *cb.value == "B 的人格", "B uses its own");
+
+  auto ca2 = store.persona_for("conv-a");
+  CHECK(ca2.ok() && *ca2.value == "全局人格", "A still inherits default");
+
+  auto d2 = store.default_persona();
+  CHECK(d2.ok() && *d2.value == "全局人格", "default unchanged by override");
+
+  // 空串 = 取消覆盖，回到全局
+  CHECK(store.set_persona_for("conv-b", "").ok(), "clear override B");
+  CHECK(!store.has_override("conv-b"), "B no longer has override");
+  auto cb2 = store.persona_for("conv-b");
+  CHECK(cb2.ok() && *cb2.value == "全局人格", "B back to default");
+
+  // 含特殊字符的会话 id 也能安全落盘
+  const std::string weird = "g:123456/../evil";
+  CHECK(store.set_persona_for(weird, "怪 id").ok(), "weird id writable");
+  auto cw = store.persona_for(weird);
+  CHECK(cw.ok() && *cw.value == "怪 id", "weird id readable");
+  // 且不能逃出目录
+  CHECK(!fs::exists(dir.parent_path() / "evil.md"), "path traversal blocked");
+
+  fs::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -642,6 +706,7 @@ int main() {
   test_session_key();
   test_session_registry();
   test_photo_markers();
+  test_persona_store();
 
   std::printf("\n");
   if (g_failures != 0) {
