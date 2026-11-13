@@ -139,6 +139,8 @@ struct TtsConfig {
 struct SearchConfig {
   std::string provider{"none"};
   std::string base_url;
+  // generic 用：请求路径。空则自动补 /search。
+  std::string path;
   std::string api_key;
   int max_results{5};
   int timeout_ms{15000};
@@ -152,6 +154,11 @@ struct SearchConfig {
   bool search_need_content{false};
   // fetch：给模型看的正文上限（防止超长页面撑爆上下文）
   std::size_t fetch_max_chars{6000};
+
+  // ── generic 抓取（provider = "generic"）──
+  // generic 是自己直连目标站点，需要 SSRF 防护
+  bool allow_private_hosts{false};
+  std::size_t fetch_max_bytes{2u << 20};
 };
 
 // 生图。与 TTS 同构：换厂商只改 provider/base_url/model。
@@ -206,7 +213,7 @@ const char* chat_provider_list() {
 const char* embedding_provider_list() { return "ollama,openai,siliconflow"; }
 const char* stt_provider_list() { return "groq,local,openai,siliconflow"; }
 const char* tts_provider_list() { return "edge,openai,siliconflow"; }
-const char* search_provider_list() { return "bocha,deepseek,none,tavily"; }
+const char* search_provider_list() { return "bocha,deepseek,generic,none,tavily"; }
 const char* image_provider_list() { return "bridge,openai,siliconflow"; }
 
 namespace {
@@ -1099,8 +1106,300 @@ class DeepSeekFetch final : public fish::core::IWebFetch {
   SearchConfig cfg_;
 };
 
-CircuitBreaker& breaker_for(const std::string& provider, const char* kind) {
-  static std::mutex mu;
+// 通用 HTTP 搜索（provider = "generic"）。
+//
+// 用途：让用户接**任意** API 或桥接层——自建搜索服务、第三方聚合 API、
+// 把某个搜索引擎包成 HTTP 的本地桥接。与语音/生图同构：
+// provider 只是配置，换实现不改调用方。
+//
+// 协议（尽量宽容，能适配大多数实现）：
+//   请求：POST {base_url}{path}，path 默认 /search
+//         body: {"query","max_results"}（有 key 时附 api_key）
+//         header: Authorization: Bearer <key>（有 key 时带）
+//   响应：接受以下任一形态
+//         1. {"results":[{title,url,content/snippet,score}]}   (Tavily 风格)
+//         2. {"data":[{title,url,snippet}]}
+//         3. {"items":[...]} / {"hits":[...]} / {"sources":[...]}
+//         4. [...]（裸数组）
+//         5. {"answer":"..."}（只给一段摘要的聚合 API）
+//   字段名做多重兼容，任一命中即可。
+class GenericSearch final : public fish::core::IWebSearch {
+ public:
+  explicit GenericSearch(SearchConfig cfg) : cfg_(std::move(cfg)) {}
+
+  Result<std::vector<Hit>> search(const std::string& query, int max_results) override {
+    if (cfg_.base_url.empty()) {
+      return Result<std::vector<Hit>>::fail(ErrorCode::kBadRequest,
+                                            "search_base_url_empty");
+    }
+
+    std::string url = cfg_.base_url;
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    if (!cfg_.path.empty()) {
+      url += cfg_.path;
+    } else if (url.find("/search") == std::string::npos &&
+               url.find("/v1/") == std::string::npos) {
+      url += "/search";
+    }
+
+    json payload{{"query", query}, {"max_results", max_results}};
+    if (!cfg_.api_key.empty()) payload["api_key"] = cfg_.api_key;
+
+    std::map<std::string, std::string> headers;
+    if (!cfg_.api_key.empty()) {
+      headers["Authorization"] = "Bearer " + cfg_.api_key;
+    }
+
+    auto resp = HttpClient::instance().post_json(url, headers, payload.dump(),
+                                                 cfg_.timeout_ms);
+    if (!resp.ok()) {
+      return Result<std::vector<Hit>>::fail(resp.error.code,
+                                            "search_" + resp.error.detail);
+    }
+
+    try {
+      const auto body = json::parse(resp.value->body);
+      std::vector<Hit> hits;
+
+      const json* arr = nullptr;
+      if (body.is_array()) {
+        arr = &body;
+      } else {
+        for (const char* key : {"results", "data", "items", "hits", "sources"}) {
+          if (body.contains(key) && body[key].is_array()) {
+            arr = &body[key];
+            break;
+          }
+        }
+      }
+
+      if (arr != nullptr) {
+        for (const auto& r : *arr) {
+          if (!r.is_object()) continue;
+          Hit h;
+          for (const char* k : {"title", "name", "heading"}) {
+            if (r.contains(k) && r[k].is_string()) {
+              h.title = r[k].get<std::string>();
+              break;
+            }
+          }
+          for (const char* k : {"url", "link", "href"}) {
+            if (r.contains(k) && r[k].is_string()) {
+              h.url = r[k].get<std::string>();
+              break;
+            }
+          }
+          for (const char* k : {"summary", "content", "snippet", "description", "text"}) {
+            if (r.contains(k) && r[k].is_string()) {
+              h.snippet = r[k].get<std::string>();
+              break;
+            }
+          }
+          if (r.contains("score") && r["score"].is_number()) {
+            h.score = r["score"].get<double>();
+          } else if (r.contains("rerank_score") && r["rerank_score"].is_number()) {
+            h.score = r["rerank_score"].get<double>();
+          }
+          if (!h.title.empty() || !h.snippet.empty() || !h.url.empty()) {
+            hits.push_back(std::move(h));
+          }
+        }
+      } else if (body.contains("answer") && body["answer"].is_string()) {
+        Hit h;
+        h.title = "搜索摘要";
+        h.snippet = body["answer"].get<std::string>();
+        hits.push_back(std::move(h));
+      }
+
+      if (max_results > 0 && static_cast<int>(hits.size()) > max_results) {
+        hits.resize(static_cast<std::size_t>(max_results));
+      }
+      return Result<std::vector<Hit>>::ok(std::move(hits));
+    } catch (const std::exception& e) {
+      return Result<std::vector<Hit>>::fail(ErrorCode::kBadRequest,
+                                            std::string("search_parse:") + e.what());
+    }
+  }
+
+ private:
+  SearchConfig cfg_;
+};
+
+// 通用 HTTP 抓取（provider = "generic"）。
+//
+// 与 DeepSeekFetch 的区别：这是**我们直连目标站点**，
+// 所以必须自己做 SSRF 防护（拒绝内网/环回/链路本地地址），
+// 因为 URL 来自模型输出，模型可能被提示注入诱导去读内部服务。
+class GenericFetch final : public fish::core::IWebFetch {
+ public:
+  explicit GenericFetch(SearchConfig cfg) : cfg_(std::move(cfg)) {}
+
+  Result<Page> fetch(const std::string& url) override {
+    if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+      return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_scheme_not_allowed");
+    }
+
+    if (!cfg_.allow_private_hosts) {
+      const std::string host = extract_host(url);
+      if (host.empty()) {
+        return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_bad_url");
+      }
+      if (is_private_host(host)) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "fetch", "blocked_private")
+            .field("host", host);
+        return Result<Page>::fail(ErrorCode::kBadRequest, "fetch_private_host_blocked");
+      }
+    }
+
+    auto dl = HttpClient::instance().download(url, cfg_.fetch_max_bytes);
+    if (!dl.ok()) {
+      return Result<Page>::fail(dl.error.code, "fetch_" + dl.error.detail);
+    }
+
+    Page page;
+    page.url = url;
+    page.bytes = dl.value->size();
+    const std::string& raw = *dl.value;
+
+    const bool looks_html = raw.find("<html") != std::string::npos ||
+                            raw.find("<!DOCTYPE") != std::string::npos ||
+                            raw.find("<body") != std::string::npos;
+    if (looks_html) {
+      page.content_type = "text/html";
+      page.title = extract_title(raw);
+      page.content = strip_html(raw);
+    } else {
+      page.content_type = "text/plain";
+      page.content = raw;
+    }
+
+    if (page.content.size() > cfg_.fetch_max_chars) {
+      std::size_t cut = cfg_.fetch_max_chars;
+      while (cut > 0 &&
+             (static_cast<unsigned char>(page.content[cut]) & 0xC0) == 0x80) {
+        --cut;
+      }
+      page.content.resize(cut);
+      page.content += "\n…（内容过长已截断）";
+    }
+    page.status = 200;
+    return Result<Page>::ok(std::move(page));
+  }
+
+ private:
+  static std::string extract_host(const std::string& url) {
+    const auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) return {};
+    std::string rest = url.substr(scheme_end + 3);
+    const auto slash = rest.find_first_of("/?#");
+    if (slash != std::string::npos) rest = rest.substr(0, slash);
+    const auto at = rest.find('@');
+    if (at != std::string::npos) rest = rest.substr(at + 1);
+    const auto colon = rest.find(':');
+    if (colon != std::string::npos) rest = rest.substr(0, colon);
+    return rest;
+  }
+
+  static bool is_private_host(const std::string& host) {
+    if (host.empty()) return true;
+    if (host == "localhost" || host == "localhost.localdomain") return true;
+
+    int a = 0, b = 0, c = 0, d = 0;
+    if (std::sscanf(host.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) == 4) {
+      if (a == 10) return true;                         // 10/8
+      if (a == 172 && b >= 16 && b <= 31) return true;  // 172.16/12
+      if (a == 192 && b == 168) return true;            // 192.168/16
+      if (a == 127) return true;                        // 环回
+      if (a == 169 && b == 254) return true;            // 链路本地（云元数据）
+      if (a == 0) return true;
+      if (a >= 224) return true;                        // 组播/保留
+      if (a == 100 && b >= 64 && b <= 127) return true; // CGNAT
+      return false;
+    }
+
+    if (host.find(':') != std::string::npos) {
+      if (host == "::1" || host == "[::1]") return true;
+      if (host.rfind("fe80:", 0) == 0 || host.rfind("[fe80:", 0) == 0) return true;
+      if (host.rfind("fc", 0) == 0 || host.rfind("fd", 0) == 0) return true;
+      if (host.rfind("[fc", 0) == 0 || host.rfind("[fd", 0) == 0) return true;
+      return false;
+    }
+    return false;
+  }
+
+  static std::string extract_title(const std::string& html) {
+    const auto open = html.find("<title");
+    if (open == std::string::npos) return {};
+    const auto gt = html.find('>', open);
+    if (gt == std::string::npos) return {};
+    const auto close = html.find("</title>", gt);
+    if (close == std::string::npos) return {};
+    std::string t = html.substr(gt + 1, close - gt - 1);
+    std::string out;
+    bool last_space = false;
+    for (const char ch : t) {
+      const bool is_space = (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t');
+      if (is_space) {
+        if (!last_space && !out.empty()) out += ' ';
+        last_space = true;
+      } else {
+        out += ch;
+        last_space = false;
+      }
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+  }
+
+  // 剥离 HTML 标签。不追求完美解析，够模型理解就行。
+  static std::string strip_html(const std::string& html) {
+    std::string out;
+    out.reserve(html.size() / 2);
+    bool in_tag = false;
+    bool in_script = false;
+    bool in_style = false;
+
+    for (std::size_t i = 0; i < html.size(); ++i) {
+      const char ch = html[i];
+      if (!in_tag && ch == '<') {
+        if (html.compare(i, 7, "<script") == 0) in_script = true;
+        if (html.compare(i, 6, "<style") == 0) in_style = true;
+        in_tag = true;
+        continue;
+      }
+      if (in_tag) {
+        if (ch == '>') {
+          in_tag = false;
+          if (i >= 8 && html.compare(i - 8, 9, "</script>") == 0) in_script = false;
+          if (i >= 7 && html.compare(i - 7, 8, "</style>") == 0) in_style = false;
+          out += ' ';
+        }
+        continue;
+      }
+      if (in_script || in_style) continue;
+      out += ch;
+    }
+
+    std::string cleaned;
+    cleaned.reserve(out.size());
+    bool last_space = false;
+    for (const char ch : out) {
+      const bool is_space = (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+      if (is_space) {
+        if (!last_space) cleaned += ' ';
+        last_space = true;
+      } else {
+        cleaned += ch;
+        last_space = false;
+      }
+    }
+    return cleaned;
+  }
+
+  SearchConfig cfg_;
+};
+
+CircuitBreaker& breaker_for(const std::string& provider, const char* kind) {  static std::mutex mu;
   static std::map<std::string, std::unique_ptr<CircuitBreaker>> pool;
   std::lock_guard<std::mutex> lock(mu);
   const std::string key = provider + "/" + kind;
@@ -1324,7 +1623,9 @@ Result<std::unique_ptr<fish::core::ITextToSpeech>> make_tts(const TtsConfig& cfg
 }
 
 Result<std::unique_ptr<fish::core::IWebSearch>> make_search(const SearchConfig& cfg) {
-  static const std::set<std::string> kOk{"none", "deepseek", "tavily", "bocha"};
+  // provider 只决定「用哪个实现」，不限制用户接什么后端。
+  // 想接自建服务/聚合 API/本地桥接层，用 generic 即可。
+  static const std::set<std::string> kOk{"none", "deepseek", "tavily", "bocha", "generic"};
   if (!kOk.count(cfg.provider)) {
     return Result<std::unique_ptr<fish::core::IWebSearch>>::fail(
         ErrorCode::kUnsupported, "unknown search provider '" + cfg.provider +
@@ -1337,7 +1638,11 @@ Result<std::unique_ptr<fish::core::IWebSearch>> make_search(const SearchConfig& 
     return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(
         std::make_unique<TavilySearch>(cfg));
   }
-  // deepseek / bocha 走 DeepSeek 官方 Tools API 的实现
+  if (cfg.provider == "generic") {
+    return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(
+        std::make_unique<GenericSearch>(cfg));
+  }
+  // deepseek / bocha 走 DeepSeek 官方 Tools API
   return Result<std::unique_ptr<fish::core::IWebSearch>>::ok(
       std::make_unique<DeepSeekSearch>(cfg));
 }
@@ -1347,6 +1652,12 @@ Result<std::unique_ptr<fish::core::IWebFetch>> make_fetch(const SearchConfig& cf
     return Result<std::unique_ptr<fish::core::IWebFetch>>::fail(
         ErrorCode::kUnsupported, "fetch_provider_none");
   }
+  if (cfg.provider == "generic") {
+    // 通用抓取：我们直连目标站点，自己做 SSRF 防护
+    return Result<std::unique_ptr<fish::core::IWebFetch>>::ok(
+        std::make_unique<GenericFetch>(cfg));
+  }
+  // deepseek / bocha / tavily 走 DeepSeek 官方 Fetch（服务端执行，无 SSRF 风险）
   return Result<std::unique_ptr<fish::core::IWebFetch>>::ok(
       std::make_unique<DeepSeekFetch>(cfg));
 }
@@ -1415,6 +1726,7 @@ SearchConfig load_search_config(const fish::config::Config& c) {
   SearchConfig cfg;
   cfg.provider = c.get_or("capability.search.provider", "none");
   cfg.base_url = c.get_or("capability.search.base_url", "");
+  cfg.path = c.get_or("capability.search.path", "");
   cfg.api_key = c.get_or("capability.search.api_key", "");
   cfg.max_results = static_cast<int>(c.get_int_or("capability.search.max_results", 5));
   cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.search.timeout_ms", 15000));
@@ -1422,6 +1734,10 @@ SearchConfig load_search_config(const fish::config::Config& c) {
       c.get_bool_or("capability.search.need_content", false);
   cfg.fetch_max_chars =
       static_cast<std::size_t>(c.get_int_or("capability.search.fetch_max_chars", 6000));
+  cfg.allow_private_hosts =
+      c.get_bool_or("capability.search.allow_private_hosts", false);
+  cfg.fetch_max_bytes = static_cast<std::size_t>(
+      c.get_int_or("capability.search.fetch_max_bytes", 2 * 1024 * 1024));
   return cfg;
 }
 
