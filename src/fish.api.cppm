@@ -413,7 +413,14 @@ Response Server::builtin_route(const Request& req) {
   // PUT /v1/persona/default  {"persona":"..."}
   if (req.method == "PUT" && path == "/v1/persona/default") {
     std::string text;
-    json_get_string(req.body, "persona", &text);
+    // 字段必须存在：缺字段或坏 JSON 时若当成空串处理，
+    // 会静默把人格清空，用户以为改成功。
+    if (!json_get_string(req.body, "persona", &text)) {
+      Response r;
+      r.status = 400;
+      r.body = R"({"error":"missing_field","field":"persona"})";
+      return r;
+    }
     auto e = store_->set_default_persona(text);
     Response r;
     if (!e.ok()) {
@@ -455,7 +462,12 @@ Response Server::builtin_route(const Request& req) {
       return r;
     }
     std::string text;
-    json_get_string(req.body, "persona", &text);
+    if (!json_get_string(req.body, "persona", &text)) {
+      Response r;
+      r.status = 400;
+      r.body = R"({"error":"missing_field","field":"persona"})";
+      return r;
+    }
     auto e = store_->set_persona_for(conv, text);
     Response r;
     if (!e.ok()) {
@@ -526,9 +538,15 @@ void Server::handle_connection(int fd) {
   raw.reserve(4096);
   char buf[4096];
 
+  // 控制面请求很小，1MB 已经很宽松。
+  // 超限必须显式拒绝：早期是读到上限就停，然后照常解析，
+  // 结果 2MB 的请求也返回 200，调用方以为写成功了。
+  constexpr std::size_t kMaxBody = 1u << 20;
+
   // 读到 header 结束 + Content-Length 个 body 字节为止
   std::size_t want = std::string::npos;
-  while (raw.size() < (1u << 20)) {   // 1MB 上限，控制面用不到这么大
+  bool too_large = false;
+  while (raw.size() < kMaxBody) {
     const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n <= 0) break;
     raw.append(buf, static_cast<std::size_t>(n));
@@ -551,6 +569,10 @@ void Server::handle_connection(int fd) {
           }
         }
         want = he + 4 + body_len;
+        if (want > kMaxBody) {
+          too_large = true;
+          break;
+        }
       }
     }
     if (want != std::string::npos && raw.size() >= want) break;
@@ -558,7 +580,10 @@ void Server::handle_connection(int fd) {
 
   Request req;
   Response resp;
-  if (!parse_request(raw, &req)) {
+  if (too_large) {
+    resp.status = 413;
+    resp.body = R"({"error":"payload_too_large"})";
+  } else if (!parse_request(raw, &req)) {
     resp.status = 400;
     resp.body = R"({"error":"bad_request"})";
   } else {

@@ -77,8 +77,18 @@ std::size_t estimate_tokens(const std::string& text);
 
 // 上下文预算：按模型窗口的百分比切分，取代固定轮数
 struct TokenBudget {
+  // 原文缓冲（buffer）的硬上限：最多占模型窗口的 50%。
+  //
+  // 这是用户明确批准的一条比例上限（"给 buffer 加上限，50% 吧"）。
+  // 它是天花板，不是默认值：配置里写多高都会被压回这个数，
+  // 所以任何一条会话的原文缓冲都不会超过窗口的一半。
+  static constexpr double kRawBufferMaxRatio = 0.50;
+  // 配置缺省 / 非法时的取值。故意低于上限：没配置就按保守的来，
+  // 不因为多了一条上限就顺手把实际用量抬上去。
+  static constexpr double kRawBufferDefaultRatio = 0.40;
+
   std::size_t total{0};
-  std::size_t raw_budget{0};      // 原文可用
+  std::size_t raw_budget{0};      // 原文可用（<= total * kRawBufferMaxRatio）
   std::size_t summary_budget{0};  // 摘要可用
   std::size_t reserve{0};         // 留给回复与工具定义
 
@@ -205,7 +215,9 @@ class MemorySystem {
 
     // ── 上下文预算（按百分比分配，取代固定轮数）──
     int model_context_tokens{131072};   // 模型窗口大小
-    double raw_context_ratio{0.40};     // 原文可占比例
+    // 原文缓冲比例。天花板是 TokenBudget::kRawBufferMaxRatio（50%），
+    // 写超过也按 50% 算；想要更省可以往下调。
+    double raw_context_ratio{0.40};     // 原文可占比例（上限 50%）
     double summary_ratio{0.25};         // 摘要可占余下部分的比例
     // 没有条数上限：记忆只增不减，超预算时压成摘要 + 落盘，不删除。
 
@@ -292,9 +304,10 @@ TokenBudget TokenBudget::make(int model_context_tokens, double raw_ratio,
   if (model_context_tokens <= 0) return b;
   b.total = static_cast<std::size_t>(model_context_tokens);
 
+  // 原文缓冲比例：配置值可低不可高，天花板固定为 kRawBufferMaxRatio。
   double rr = raw_ratio;
-  if (!(rr > 0.0)) rr = 0.40;
-  if (rr > 0.95) rr = 0.95;
+  if (!(rr > 0.0)) rr = kRawBufferDefaultRatio;
+  if (rr > kRawBufferMaxRatio) rr = kRawBufferMaxRatio;
   b.raw_budget = static_cast<std::size_t>(static_cast<double>(b.total) * rr);
 
   const std::size_t rest = b.total > b.raw_budget ? b.total - b.raw_budget : 0;

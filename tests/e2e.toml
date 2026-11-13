@@ -15,9 +15,8 @@ model = "BAAI/bge-m3"
 dimension = 1024
 
 [memory]
-working_rounds = 20
-consolidate_every = 2
-recall_top_k = 5
-episode_top_k = 3
+model_context_tokens = 131072
+raw_context_ratio = 0.40
+summary_ratio = 0.25
 notes_dir = "/tmp/fish_e2e/notes"
 db_path = "/tmp/fish_e2e/i.db"

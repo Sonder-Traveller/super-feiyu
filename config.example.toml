@@ -76,7 +76,8 @@ max_results = 5
 # 模型上下文窗口大小。填你实际用的模型，用于算预算。
 model_context_tokens = 131072
 
-# 原始对话可占窗口的比例：预算内有几条给几条，一条不省。
+# 原始对话（buffer）可占窗口的比例：预算内有几条给几条，一条不省。
+# 硬上限 50%（TokenBudget::kRawBufferMaxRatio）：写更高也按 50% 算。
 raw_context_ratio = 0.40
 
 # 超预算时，把最早的对话压成摘要；摘要可占余下空间的比例。

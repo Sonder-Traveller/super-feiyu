@@ -5,9 +5,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <vector>
 
-#include "fish/core/interfaces.hpp"
-#include "fish/memory/memory_system.hpp"
+// 模块化之后不再有头文件，直接用 import。
+// 这个文件曾长期不在 build.sh 的构建列表里，所以 include 一直停留在
+// 头文件时代（fish/core/interfaces.hpp 早就不存在了）也没人发现。
+import fish.core;
+import fish.log;
+import fish.memory;
 
 namespace fs = std::filesystem;
 
@@ -28,6 +33,10 @@ class StubEmbedding final : public fish::core::IEmbeddingModel {
 };
 
 int failures = 0;
+
+// 会话隔离改造后，几乎所有 NotesStore / Consolidator 接口都要求 conv_id。
+// 测试统一用这一个会话键，避免每处手写不一致。
+constexpr const char* CONV = "mem-test-conv";
 #define CHECK(cond, msg)                            \
   do {                                              \
     if (!(cond)) {                                  \
@@ -56,40 +65,42 @@ void test_working_memory_capacity() {
   CHECK(snap.front().text == "u3", "oldest evicted, keeps most recent");
 }
 
-void test_decay() {
-  // 30 天不用，权重减半
-  const double w = fish::memory::Forgetting::decay(1.0, 30.0, 30.0);
-  CHECK(w > 0.49 && w < 0.51, "decay halves after one half-life");
+// 记忆只增不减：没有衰减、没有淘汰。
+//
+// 这两个函数（test_decay / test_eviction_selection）原本测的是
+// fish::memory::Forgetting —— 一个按半衰期衰减、按权重淘汰的实现。
+// 用户明确要求「记忆只增不减、不论时间只论数量」，那段代码已删除，
+// 测试却留了下来（而且没被构建，所以一直没人发现编译不过）。
+//
+// 现在改为验证「写入多条后全部仍在」，这才是当前设计的正确行为。
+void test_no_eviction() {
+  const auto dir = fs::temp_directory_path() / "fish_noevict_test";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
 
-  // 0 天不衰减
-  CHECK(fish::memory::Forgetting::decay(1.0, 0.0, 30.0) == 1.0, "no decay at zero days");
-}
+  fish::memory::NotesStore notes(dir.string());
+  const std::string conv = "noevict-conv";
+  CHECK(notes.ensure_dirs().ok(), "notes init");
 
-void test_eviction_selection() {
-  fish::memory::Forgetting f({30.0, 0.05, 100, 100});
-  std::vector<fish::memory::Fact> facts;
-
-  auto mk = [](const std::string& id, double conf, const std::string& sup) {
-    fish::memory::Fact x;
-    x.id = id;
-    x.content = id;
-    x.confidence = conf;
-    x.superseded_by = sup;
-    return x;
-  };
-
-  facts.push_back(mk("high", 0.95, ""));
-  facts.push_back(mk("low", 0.01, ""));
-  facts.push_back(mk("done", 0.9, "other"));  // 已被取代，不参与
-
-  // 200 天后：high 0.95*0.5^(200/30) 很小，会被淘汰；superseded 不参与
-  auto evict = f.select_evictions(facts, 200.0);
-  CHECK(!evict.empty(), "very old facts get evicted");
-  bool has_done = false;
-  for (const auto& id : evict) {
-    if (id == "done") has_done = true;
+  constexpr int kCount = 50;
+  bool all_ok = true;
+  for (int i = 0; i < kCount; ++i) {
+    fish::memory::Fact f;
+    f.id = "f" + std::to_string(i);
+    f.content = "content-" + std::to_string(i);
+    f.confidence = 0.01;   // 故意给最低置信度
+    f.created = "2020-01-01";   // 故意给最早日期
+    if (!notes.append_fact(conv, f).ok()) all_ok = false;
   }
-  CHECK(!has_done, "superseded facts are not evicted (already inactive)");
+  CHECK(all_ok, "50 条低置信度旧事实全部写入成功");
+
+  // 关键断言：50 条全在，一条都没被时间或置信度淘汰
+  auto loaded = notes.load_facts(conv);
+  CHECK(loaded.ok(), "load facts");
+  CHECK(loaded.ok() && loaded.value->size() == kCount,
+        "no fact evicted by age or confidence");
+
+  fs::remove_all(dir);
 }
 
 void test_notes_roundtrip() {
@@ -97,16 +108,19 @@ void test_notes_roundtrip() {
   fish::memory::NotesStore notes(dir);
   notes.ensure_dirs();
 
+  // 会话隔离改造后，所有 NotesStore 方法都要求 conv_id
+  const std::string conv = "mem-conv-1";
+
   fish::memory::Fact f;
   f.id = "f1";
   f.subject = "偏好";
   f.content = "喜欢短回复";
   f.confidence = 0.9;
   f.created = "2026-11-13";
-  auto e = notes.append_fact(f);
+  auto e = notes.append_fact(conv, f);
   CHECK(e.ok(), "append_fact succeeds");
 
-  auto loaded = notes.load_facts();
+  auto loaded = notes.load_facts(conv);
   CHECK(loaded.ok() && loaded.value->size() == 1, "fact roundtrip count");
   CHECK(loaded.ok() && (*loaded.value)[0].content == "喜欢短回复", "fact content roundtrip");
   CHECK(loaded.ok() && (*loaded.value)[0].subject == "偏好", "fact subject roundtrip");
@@ -116,16 +130,20 @@ void test_notes_roundtrip() {
   ep.summary = "聊了加班的事";
   ep.importance = 0.7;
   ep.created = "2026-11-13";
-  CHECK(notes.append_episode(ep).ok(), "append_episode succeeds");
+  CHECK(notes.append_episode(conv, ep).ok(), "append_episode succeeds");
 
-  auto eps = notes.load_episodes();
+  auto eps = notes.load_episodes(conv);
   CHECK(eps.ok() && eps.value->size() == 1, "episode roundtrip");
 
   std::vector<fish::memory::Trait> traits{{"不喜欢被追问细节", 4}};
-  CHECK(notes.save_traits(traits).ok(), "save_traits succeeds");
-  auto loaded_traits = notes.load_traits();
+  CHECK(notes.save_traits(conv, traits).ok(), "save_traits succeeds");
+  auto loaded_traits = notes.load_traits(conv);
   CHECK(loaded_traits.ok() && loaded_traits.value->size() == 1, "traits roundtrip");
   CHECK(loaded_traits.ok() && (*loaded_traits.value)[0].evidence == 4, "trait evidence");
+
+  // 会话隔离：另一个会话读不到这个会话的记忆
+  auto other = notes.load_facts("别的会话");
+  CHECK(other.ok() && other.value->empty(), "other session sees nothing");
 
   fs::remove_all(dir);
 }
@@ -174,7 +192,7 @@ void test_index_rebuild_from_notes() {
     f.confidence = 0.9;
     f.created = "2026-11-13";
     ms.notes().ensure_dirs();
-    ms.notes().append_fact(f);
+    ms.notes().append_fact("rebuild-conv", f);
   }
 
   // 第二轮：删除索引，验证从文件重建
@@ -209,19 +227,19 @@ void test_consolidate_json_apply() {
     "traits": [{"pattern": "不喜欢被追问", "evidence": 2}]
   })";
 
-  auto r = fish::memory::Consolidator::apply_json(model_out, "2026-11-13", &notes, &idx, &emb);
+  auto r = fish::memory::Consolidator::apply_json(model_out, "2026-11-13", &notes, &idx, &emb, CONV);
   CHECK(r.ok(), "apply_json succeeds");
   CHECK(r.ok() && r.value->episodes_written == 1, "one episode written");
   CHECK(r.ok() && r.value->facts_written == 1, "one fact written");
 
-  auto facts = notes.load_facts();
+  auto facts = notes.load_facts(CONV);
   CHECK(facts.ok() && facts.value->size() == 1, "fact persisted to sidecar file");
   CHECK(idx.item_count() == 2, "index has episode + fact");
 
   // 证据累加：再来一次同样 trait
   const std::string model_out2 = R"({"episodes":[],"facts":[],"traits":[{"pattern":"不喜欢被追问","evidence":2}]})";
-  fish::memory::Consolidator::apply_json(model_out2, "2026-11-14", &notes, &idx, &emb);
-  auto traits = notes.load_traits();
+  fish::memory::Consolidator::apply_json(model_out2, "2026-11-14", &notes, &idx, &emb, CONV);
+  auto traits = notes.load_traits(CONV);
   CHECK(traits.ok() && (*traits.value)[0].evidence == 4, "trait evidence accumulates");
 
   idx.close();
@@ -235,13 +253,12 @@ void test_gather_includes_working_and_longterm() {
   fish::memory::MemorySystem::Config c;
   c.notes_dir = base + "/notes";
   c.db_path = base + "/i.db";
-  c.working_rounds = 20;
   fish::memory::MemorySystem ms(c, &emb);
   ms.init();
 
   // 写一条长期事实
   auto j = R"({"episodes":[],"facts":[{"subject":"用户","content":"养了一只叫豆豆的猫","confidence":0.9}],"traits":[]})";
-  fish::memory::Consolidator::apply_json(j, "2026-11-13", &ms.notes(), &ms.index(), &emb);
+  fish::memory::Consolidator::apply_json(j, "2026-11-13", &ms.notes(), &ms.index(), &emb, CONV);
 
   // 记录短时
   fish::memory::Message u, a;
@@ -256,7 +273,10 @@ void test_gather_includes_working_and_longterm() {
   auto ctx = ms.gather("conv1", "猫");
   CHECK(ctx.ok(), "gather succeeds");
   CHECK(ctx.ok() && !ctx.value->working.empty(), "gather includes working memory");
-  CHECK(ctx.ok() && !ctx.value->facts.empty(), "gather includes long-term facts");
+
+  // 长期记忆不进 gather 的 working —— 走检索，由模型自己取。
+  auto hits = ms.search("豆豆", 5);
+  CHECK(hits.ok() && !hits.value->empty(), "long-term fact is retrievable via search");
 
   fs::remove_all(base);
 }
@@ -266,8 +286,7 @@ void test_gather_includes_working_and_longterm() {
 int main() {
   std::printf("=== memory tests ===\n");
   test_working_memory_capacity();
-  test_decay();
-  test_eviction_selection();
+  test_no_eviction();
   test_notes_roundtrip();
   test_index_search();
   test_index_rebuild_from_notes();

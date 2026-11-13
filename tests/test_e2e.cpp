@@ -98,8 +98,10 @@ int main(int argc, char** argv) {
   CHECK(fin.ok(), "force_consolidate 成功");
 
   // 旁路文件应存在
-  CHECK(fs::exists(mc.notes_dir + "/facts.md"), "facts.md 已生成（旁路文件是权威源）");
-  CHECK(fs::exists(mc.notes_dir + "/episodes"), "episodes 目录已生成");
+  // 会话隔离后文件在 notes/<group|user>/<safe_id>/ 下，不再是 notes_dir 根目录。
+  const std::string sdir = mem.notes().session_dir(conv);
+  CHECK(fs::exists(sdir + "/facts.md"), "facts.md 已生成（旁路文件是权威源）");
+  CHECK(fs::exists(sdir + "/episodes"), "episodes 目录已生成");
 
   // 索引应有条目
   const auto count = mem.index().item_count();

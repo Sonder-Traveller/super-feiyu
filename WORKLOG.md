@@ -158,3 +158,32 @@ peer_closed → reconnect_begin → (1s) → reconnect_ok
 3. 多实例/多鱼隔离
 4. 指标暴露 HTTP 端点（当前只有日志）
 5. 桥接层支持加密凭据信封
+
+---
+
+## 2026-11-13 补记：原文缓冲加 50% 上限
+
+用户要求「给 buffer 加上限，50% 吧」。这是目前为止**唯一一条**
+被明确批准的比例上限（见 ADR-009）。
+
+| 改动 | 文件 |
+|---|---|
+| `TokenBudget::kRawBufferMaxRatio = 0.50`，`make()` 里硬夹取 | `src/fish.memory.cppm` |
+| 新增 `kRawBufferDefaultRatio = 0.40`（未配置时用它，不是用上限） | `src/fish.memory.cppm` |
+| 配置 / 文档补一句「硬上限 50%」 | `config.example.toml`、`README.md`、`docs/modules/memory.md` |
+| 新增 5 项断言：夹取、不抬高、边界、默认值、不超发 | `tests/test_lifecycle.cpp` |
+
+行为：配置写 0.90 按 0.50 算；写 0.30 按 0.30 算；不写取 0.40。
+**默认值故意没动**——加一条上限不该顺手把上下文用量提高 25%，
+那是另一件事，需要单独决定。摘要、预留、条数、轮数**均未设上限**。
+
+顺带修掉两个测试文件的历史遗留问题（它们长期没被构建，所以没人发现）：
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| `test_memory.cpp` 编译失败 | 用 `working_rounds`、`MemoryContext::facts`，字段早已不存在 | 改用 `search()` 验证长期记忆可召回 |
+| `test_e2e.cpp` 两项断言失败 | 断言 `notes_dir/facts.md`，会话隔离后文件在 `notes/<kind>/<id>/` | 改用 `session_dir(conv)` 拼路径 |
+
+验证：5 个测试二进制全绿（`test_all` / `test_e2e` / `test_protocol` /
+`test_lifecycle` / `test_memory`）。
+

@@ -246,6 +246,34 @@ void test_gather_full_when_under_budget() {
   fs::remove_all(base);
 }
 
+// 原文缓冲的硬上限：无论配置写多高，最多占模型窗口的 50%
+void test_raw_buffer_cap() {
+  std::printf("\n=== 原文缓冲 50% 上限 ===\n");
+  const int window = 100000;
+  const std::size_t half = static_cast<std::size_t>(window) / 2;
+
+  // 配置想占 90%，实际被压回 50%
+  auto greedy = fish::memory::TokenBudget::make(window, 0.90, 0.25);
+  CHECK(greedy.raw_budget == half, "配置 0.90 → 仍压到窗口的 50%");
+
+  // 配置低于上限时按配置走，不被抬高
+  auto modest = fish::memory::TokenBudget::make(window, 0.30, 0.25);
+  CHECK(modest.raw_budget == 30000, "配置 0.30 → 按 30% 走");
+
+  // 不合法 / 未配置时取默认值（0.40），不是取上限
+  auto fallback = fish::memory::TokenBudget::make(window, 0.0, 0.25);
+  CHECK(fallback.raw_budget == 40000, "未配置 → 默认 40%，不因有上限就抬到 50%");
+
+  // 恰好等于上限时不误伤
+  auto exact = fish::memory::TokenBudget::make(window, 0.50, 0.25);
+  CHECK(exact.raw_budget == half, "配置正好 0.50 → 原样保留");
+
+  // 三段预算加起来不超过窗口
+  CHECK(modest.raw_budget + modest.summary_budget + modest.reserve ==
+            static_cast<std::size_t>(window),
+        "原文 + 摘要 + 预留 = 窗口，不超发");
+}
+
 // 维护：预算与去重表能被清理
 void test_pipeline_maintenance() {
   std::printf("\n=== 流水线维护 ===\n");
@@ -279,6 +307,7 @@ int main() {
   test_different_sessions_parallel();
   test_token_budget_compaction();
   test_gather_full_when_under_budget();
+  test_raw_buffer_cap();
   test_pipeline_maintenance();
 
   std::printf("\n");

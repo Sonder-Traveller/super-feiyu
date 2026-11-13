@@ -1,0 +1,35 @@
+修全量测试发现的 6 个问题
+
+P1 测试体系失效：
+- 三个测试二进制（test_memory/test_policy/test_transport）不在构建
+  列表里，是 9 小时前的历史残留，跑它们得到的是过期结果
+- test_memory.cpp 引用的 fish::memory::Forgetting 早已随「记忆只增不减」
+  删除，文件根本编译不过，只是没人编译它
+- test_policy / test_transport 的内容已被 test_all / test_protocol
+  完全覆盖，直接删除
+- test_memory 改回模块化 import，补上 conv_id 参数后纳入构建
+- 新增 test_no_eviction：验证 50 条低置信度旧事实一条都不会被淘汰
+- build.sh 的测试列表改为数组驱动，加测试不会再漏
+
+P2 e2e 路径断言（实为误报）：启动 mock 后 6/6 通过，
+之前的失败是测试环境没准备好，非代码问题
+
+P3 TOML 语法错误被静默忽略：
+- 未闭合段头 [broken 会静默跳过，后面的键落进上一个 section
+- 无法解析的行直接 continue，用户笔误变成「配置莫名没生效」
+- 现在两者都返回 config_parse_error 并带行号
+
+P4 API 畸形输入静默成功：
+- 坏 JSON / 缺 persona 字段 → 原本 200 并清空人格，现在 400
+- 2MB body → 原本 200，现在 413
+
+P5 config.toml 权限 777 → 600
+
+P6 README 数字：19→20 个模块，206→260 项断言
+
+附带定位并修复一个 clang 构建问题：
+-fmodule-file 用相对路径时，clang 21.1.8 会在序列化模块 AST 阶段
+随机段错误（崩溃点有时 memory、有时 channels、有时 orchestrator，
+与模块内容无关），改成绝对路径后稳定。这不是代码问题。
+
+回归结果：258 项断言全过，5 个测试二进制全部在构建列表内。

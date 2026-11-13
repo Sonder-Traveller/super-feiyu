@@ -12,3 +12,4 @@
 | [006](006-striped-locks.md) | 会话串行化用条带锁，不用每会话队列 | 已定 |
 | [007](007-brute-force-vector.md) | 向量检索暴力扫描，不用 FAISS | 已定 |
 | [008](008-two-vendor-keys.md) | 必须两个厂商 key（DeepSeek 无 embedding） | 已定 |
+| [009](009-raw-buffer-cap.md) | 原文缓冲硬上限 50%，代码里夹取 | 已定 |

@@ -351,7 +351,8 @@ int main(int argc, char** argv) {
   fish::memory::MemorySystem::Config mem_cfg;
   mem_cfg.model_context_tokens =
       static_cast<int>(cfg.get_int_or("memory.model_context_tokens", 131072));
-  mem_cfg.raw_context_ratio = cfg.get_double_or("memory.raw_context_ratio", 0.40);
+  mem_cfg.raw_context_ratio =
+      cfg.get_double_or("memory.raw_context_ratio", 0.40);   // 硬上限 50%
   mem_cfg.summary_ratio = cfg.get_double_or("memory.summary_ratio", 0.25);
   mem_cfg.notes_dir = cfg.get_or("memory.notes_dir", "data/memory/notes");
   mem_cfg.db_path = cfg.get_or("memory.db_path", "data/memory/index.db");

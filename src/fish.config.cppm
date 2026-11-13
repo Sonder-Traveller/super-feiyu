@@ -129,20 +129,45 @@ fish::core::Result<Config> Config::load(const std::string& path) {
   Config cfg;
   std::string line;
   std::string section;
+  std::size_t line_no = 0;
   std::vector<std::string> missing_env;
 
   while (std::getline(in, line)) {
+    ++line_no;
     line = trim(strip_comment(line));
     if (line.empty()) continue;
 
-    if (line.front() == '[' && line.back() == ']') {
+    // 段头必须以 ] 结尾。`[broken` 这种未闭合的段头如果被静默跳过，
+    // 后面所有键都会落进上一个 section，用户看到的报错会完全无关
+    // （例如只提示「api_key 为空」），排查成本极高。
+    if (line.front() == '[') {
+      if (line.back() != ']') {
+        return fish::core::Result<Config>::fail(
+            fish::core::ErrorCode::kBadRequest,
+            "config_parse_error:line " + std::to_string(line_no) +
+                ": unclosed section header: " + line);
+      }
       section = trim(line.substr(1, line.size() - 2));
       continue;
     }
+
     const auto eq = line.find('=');
-    if (eq == std::string::npos) continue;
+    if (eq == std::string::npos) {
+      // TOML 里裸词或未闭合的引号都会走到这里。跳过等于让用户的笔误
+      // 变成「配置莫名其妙没生效」，必须显式报错。
+      return fish::core::Result<Config>::fail(
+          fish::core::ErrorCode::kBadRequest,
+          "config_parse_error:line " + std::to_string(line_no) +
+              ": expected key = value, got: " + line);
+    }
 
     std::string key = trim(line.substr(0, eq));
+    if (key.empty()) {
+      return fish::core::Result<Config>::fail(
+          fish::core::ErrorCode::kBadRequest,
+          "config_parse_error:line " + std::to_string(line_no) + ": empty key");
+    }
+
     std::string val = trim(line.substr(eq + 1));
 
     if (!val.empty() && val.front() == '[') {
