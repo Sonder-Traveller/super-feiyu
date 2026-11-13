@@ -23,6 +23,25 @@ enum class Channel : std::uint8_t { kQQ, kWeChat };
 enum class ChatKind : std::uint8_t { kPrivate, kGroup };
 enum class BlockKind : std::uint8_t { kText, kImage, kVoice };
 
+// 发言人信息：让模型知道「谁在说」。
+// 群聊里这一点尤其重要——同一个人可能换昵称、多个人的观点要区分。
+struct Speaker {
+  std::string id;          // 稳定标识（openid / QQ 号）
+  std::string name;        // 昵称（会变，仅用于展示）
+  // 群名片 / 群昵称（与全局昵称可能不同）
+  std::string group_card;
+  // 群内角色："owner" | "admin" | "member"（未知为空）
+  std::string role;
+  [[nodiscard]] bool empty() const { return id.empty() && name.empty(); }
+  // 用于提示词的显示名：优先群名片，其次昵称，最后截断的 id
+  [[nodiscard]] std::string display_name() const {
+    if (!group_card.empty()) return group_card;
+    if (!name.empty()) return name;
+    if (id.size() > 8) return id.substr(0, 8) + "…";
+    return id;
+  }
+};
+
 struct ContentBlock {
   BlockKind kind{BlockKind::kText};
   std::string text;
@@ -32,6 +51,11 @@ struct ContentBlock {
   // 必须显式携带：只靠「对方: / 我:」文字前缀区分，
   // 模型会把双方的话混为一谈（身份混淆、把自己说的话当成对方的要求）。
   std::string role{"user"};
+  // 发言人（仅 user 侧有意义；assistant 侧留空）
+  Speaker speaker;
+  // 该消息的发送时刻（unix 毫秒）。0 表示未知。
+  // 用于让模型知道「这是什么时候说的」，能理解"昨天""刚才"这类指代。
+  std::int64_t at_ms{0};
 };
 
 struct InboundMessage {
@@ -40,11 +64,26 @@ struct InboundMessage {
   std::string conversation_id;
   std::string sender_id;
   std::string sender_name;
+  // 群名片 / 群内角色（QQ 群才有）
+  std::string sender_group_card;
+  std::string sender_role;
+  // 群名（群聊才有，便于模型理解场景）
+  std::string conversation_title;
   std::string message_id;
   std::vector<ContentBlock> blocks;
   bool mentioned_me{false};
   TimePoint received_at{};
   std::string context_token;
+
+  // 汇总成 Speaker，供 pipeline 使用
+  [[nodiscard]] Speaker speaker() const {
+    Speaker s;
+    s.id = sender_id;
+    s.name = sender_name;
+    s.group_card = sender_group_card;
+    s.role = sender_role;
+    return s;
+  }
 };
 
 struct OutboundMessage {

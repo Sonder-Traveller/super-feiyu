@@ -147,8 +147,10 @@ const std::vector<std::pair<std::string, std::regex>>& injection_patterns() {
        std::regex(R"((重复|输出|打印|告诉我|显示)\s*(你的)?\s*(系统提示词|system\s*prompt|初始指令|预设))",
                   std::regex::icase)},
       // 伪造角色边界（试图插入新的 system 消息）
+      // 注意：这里的 ) 是 regex 的闭括号，不是原始字符串结束符，
+      // 原始字符串用 )" 结尾，所以 regex 内容里的括号必须配对。
       {"fake_system",
-       std::regex(R"(^|\n)\s*(system|assistant)\s*[:：]\s*\S)", std::regex::icase)},
+       std::regex(R"((?:^|\n)\s*(?:system|assistant)\s*[:：]\s*\S)", std::regex::icase)},
       // 要求无视安全限制
       {"bypass_safety",
        std::regex(R"((不要|别|无需)\s*(遵守|理会|在意)\s*(任何)?\s*(限制|规则|约束|道德|法律))")},
@@ -174,11 +176,18 @@ const std::vector<std::pair<std::string, std::regex>>& secret_patterns() {
 }
 
 bool contains_injection(const std::string& text, std::string* which) {
-  for (const auto& [name, re] : injection_patterns()) {
-    if (std::regex_search(text, re)) {
-      if (which) *which = name;
-      return true;
+  // regex 构造可能抛 std::regex_error。这里兜住，
+  // 避免一个写错的模式让整个进程 terminate。
+  try {
+    for (const auto& [name, re] : injection_patterns()) {
+      if (std::regex_search(text, re)) {
+        if (which) *which = name;
+        return true;
+      }
     }
+  } catch (const std::regex_error& e) {
+    ::fish::log::log_line(::fish::log::LogLevel::kError, "guard", "regex_error")
+        .field("detail", e.what());
   }
   return false;
 }

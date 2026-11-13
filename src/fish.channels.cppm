@@ -413,9 +413,18 @@ Error QQOfficialChannel::connect() {
     msg.conversation_id = ev.conversation_id;
     msg.sender_id = ev.sender_id;
     msg.sender_name = ev.sender_name;
+    // 发言人元信息：群名片、群内角色、群名
+    msg.sender_group_card = ev.sender_group_card;
+    msg.sender_role = ev.sender_role;
+    msg.conversation_title = ev.conversation_title;
     msg.message_id = ev.message_id;
     msg.mentioned_me = ev.mentioned;
-    msg.received_at = fish::core::Clock::now();
+    // 用事件时间；缺失则退回本地接收时间
+    if (ev.at_ms > 0) {
+      msg.received_at = fish::core::TimePoint(std::chrono::milliseconds(ev.at_ms));
+    } else {
+      msg.received_at = fish::core::Clock::now();
+    }
 
     if (!ev.content.empty()) {
       fish::core::ContentBlock b;

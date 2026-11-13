@@ -344,6 +344,40 @@ bool extract_photo_marker(std::string& text, std::string* spec) {
   return true;
 }
 
+// 把时间戳转成人类可读的相对/绝对描述，用于提示词。
+// 模型不理解 unix 时间戳，但理解"昨天""3 小时前"。
+// 超过 7 天用绝对日期，避免"很久以前"这种模糊表述。
+std::string format_relative_time(std::int64_t at_ms) {
+  if (at_ms <= 0) return {};
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  const auto diff_s = (now_ms - at_ms) / 1000;
+  if (diff_s < 0) return "刚刚";
+  if (diff_s < 60) return "刚刚";
+  if (diff_s < 3600) {
+    return std::to_string(diff_s / 60) + " 分钟前";
+  }
+  if (diff_s < 86400) {
+    return std::to_string(diff_s / 3600) + " 小时前";
+  }
+  if (diff_s < 86400 * 7) {
+    return std::to_string(diff_s / 86400) + " 天前";
+  }
+  // 超过一周：给绝对日期
+  const std::time_t t = static_cast<std::time_t>(at_ms / 1000);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1,
+                tm.tm_mday);
+  return buf;
+}
+
 Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
     const fish::core::InboundMessage& msg) {
   std::vector<fish::core::ContentBlock> out;
@@ -541,6 +575,24 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     b.text = m.text;
     // 角色必须显式传递：模型据此区分谁说的
     b.role = (m.role == "user") ? "user" : "assistant";
+
+    // 发言人 + 时间：群聊里必须让模型知道「是谁、什么时候说的」，
+    // 否则多人对话会糊成一片，也理解不了"昨天""刚才"这类指代。
+    if (b.role == "user") {
+      b.speaker = m.speaker;
+      b.at_ms = m.at_ms;
+      const std::string who = m.speaker.empty() ? std::string{} : m.speaker.display_name();
+      const std::string when = format_relative_time(m.at_ms);
+      if (!who.empty() || !when.empty()) {
+        std::string tag;
+        if (!who.empty()) tag += who;
+        if (!when.empty()) {
+          if (!tag.empty()) tag += "，";
+          tag += when;
+        }
+        b.text = "[" + tag + "] " + b.text;
+      }
+    }
     history.push_back(std::move(b));
 
     // 图片按发送者归属回传，role 标明是谁发的。
@@ -554,6 +606,7 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
       img.media_url = path;
       img.mime = "image/png";
       img.role = img_role;
+      img.speaker = m.speaker;
       history.push_back(std::move(img));
     }
   }
@@ -766,12 +819,20 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     user_msg.text = remembered_query;
     user_msg.at = msg.received_at;
     user_msg.image_paths = std::move(inbound_images);
+    // 发言人 + 时间：群聊里必须记，否则模型分不清是群里哪个人说的
+    user_msg.speaker = msg.speaker();
+    user_msg.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         msg.received_at.time_since_epoch())
+                         .count();
 
     fish::memory::Message bot_msg;
     bot_msg.role = "assistant";
     bot_msg.text = remembered_reply;
     bot_msg.at = fish::core::Clock::now();
     bot_msg.image_paths = std::move(outbound_images);
+    bot_msg.at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        bot_msg.at.time_since_epoch())
+                        .count();
 
     deps_.memory->record(msg.conversation_id, user_msg, bot_msg);
     // 记忆压缩已在 gather 前由 needs_compaction()/compact() 处理

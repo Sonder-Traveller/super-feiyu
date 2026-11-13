@@ -131,6 +131,43 @@ class WebSearchTool final : public ITool {
   Searcher search_;
 };
 
+// 网络热梗检索：本地库优先，未命中时可选联网补充。
+// 与 web_search 分开：热梗是高频、短小的查询，走本地库零成本；
+// 联网只在本地没有时才发生，且结果会写回本地。
+class MemeLookupTool final : public ITool {
+ public:
+  struct Hit {
+    std::string term;
+    std::string meaning;
+    std::string usage;
+  };
+  // 本地检索（同步、零成本）
+  using LocalSearcher = std::function<std::vector<Hit>(const std::string& query)>;
+  // 外部补充（可空；为空时纯本地）
+  using RemoteSearcher = std::function<std::vector<Hit>(const std::string& query)>;
+  // 写回本地库（可空）
+  using Importer = std::function<int(const std::vector<Hit>& hits)>;
+
+  MemeLookupTool(LocalSearcher local, RemoteSearcher remote, Importer importer)
+      : local_(std::move(local)),
+        remote_(std::move(remote)),
+        importer_(std::move(importer)) {}
+
+  [[nodiscard]] std::string name() const override { return "lookup_meme"; }
+  [[nodiscard]] std::string description() const override {
+    return "查询网络热梗/网络用语的含义和用法。"
+           "当对方用了你不认识的梗、或你想用某个梗但不确定含义时使用。"
+           "优先查本地库；本地没有且允许联网时会去搜索并记住。";
+  }
+  [[nodiscard]] std::string parameters_schema() const override;
+  Outcome run(const Call& call) override;
+
+ private:
+  LocalSearcher local_;
+  RemoteSearcher remote_;
+  Importer importer_;
+};
+
 }  // namespace fish::tool
 
 // ═══ 实现 ═══════════════════════════════════════════════
@@ -368,6 +405,70 @@ Outcome WebSearchTool::run(const Call& call) {
     if (!hits[i].snippet.empty()) s += "\n   " + hits[i].snippet;
     // 不发链接：QQ 平台会拦截含链接的消息
     if (!hits[i].url.empty()) s += "\n   来源编号 " + std::to_string(i + 1);
+    s += "\n";
+  }
+  out.ok = true;
+  out.content = detail::truncate(std::move(s));
+  return out;
+}
+
+// ── MemeLookupTool ──────────────────────────────────────
+
+std::string MemeLookupTool::parameters_schema() const {
+  return R"({
+    "type": "object",
+    "properties": {
+      "query": {"type": "string", "description": "要查的梗或网络用语"}
+    },
+    "required": ["query"]
+  })";
+}
+
+Outcome MemeLookupTool::run(const Call& call) {
+  Outcome out;
+  const auto args = detail::parse_args(call.arguments_json);
+  const std::string query = detail::get_str(args, "query");
+  if (query.empty()) {
+    out.error = "missing_query";
+    out.content = "需要提供 query 参数。";
+    return out;
+  }
+
+  // 1. 本地优先：热梗库是高频查询，走本地零成本零延迟
+  std::vector<Hit> hits;
+  if (local_) hits = local_(query);
+
+  std::string source = "本地库";
+
+  // 2. 本地没命中才联网（P12：像语音那样自动降级——
+  //    没有 remote 就静默用本地结果，不报错）
+  if (hits.empty() && remote_) {
+    auto remote_hits = remote_(query);
+    if (!remote_hits.empty()) {
+      hits = remote_hits;
+      source = "联网搜索";
+      // 3. 写回本地，下次直接用
+      if (importer_) {
+        const int added = importer_(hits);
+        if (added > 0) {
+          ::fish::log::log_line(::fish::log::LogLevel::kInfo, "tool", "meme_learned")
+              .field("query", query)
+              .field("added", static_cast<long long>(added));
+        }
+      }
+    }
+  }
+
+  if (hits.empty()) {
+    out.ok = true;
+    out.content = "没查到这个词的含义。可以问对方是什么意思。";
+    return out;
+  }
+
+  std::string s = "（来源：" + source + "）\n";
+  for (const auto& h : hits) {
+    s += h.term + "：" + h.meaning;
+    if (!h.usage.empty()) s += "\n  用法：" + h.usage;
     s += "\n";
   }
   out.ok = true;

@@ -194,6 +194,10 @@ fish::core::Error CapabilityProbe::save_cache(const Capabilities& caps) const {
 Capabilities CapabilityProbe::load_or_probe() {
   Capabilities cached;
   const bool have_cache = load_cache(&cached);
+
+  // P9 修复：多实例部署时避免重复探测。
+  // 先看缓存是否新鲜——新鲜就直接用，不做任何网络请求。
+  // 这样 N 个实例启动时只有一个会真正探测（其余读到它写的结果）。
   if (have_cache) {
     const auto age_days = (detail::now_unix() - cached.probed_at) / 86400;
     if (age_days < cfg_.ttl_days) {
@@ -212,6 +216,21 @@ Capabilities CapabilityProbe::load_or_probe() {
   }
 
   if (cfg_.probe_on_start) {
+    // 探测前再读一次缓存：可能别的实例刚刚探完并写了盘。
+    // 这个二次检查把「N 个实例同时启动」的重复探测降到最多 1-2 次。
+    Capabilities fresh;
+    if (load_cache(&fresh)) {
+      const auto age = (detail::now_unix() - fresh.probed_at) / 86400;
+      if (age < cfg_.ttl_days) {
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          caps_ = fresh;
+        }
+        ::fish::log::log_line(::fish::log::LogLevel::kInfo, "probe", "cache_fresh_race")
+            .field("age_days", static_cast<long long>(age));
+        return fresh;
+      }
+    }
     return probe_now();
   }
 

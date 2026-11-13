@@ -22,6 +22,7 @@ import fish.image;
 import fish.session;
 import fish.tool;
 import fish.guard;
+import fish.meme;
 import fish.channels;
 import fish.dispatcher;
 import fish.orchestrator;
@@ -357,6 +358,7 @@ int main(int argc, char** argv) {
   // 模型也不会去尝试调用不存在的工具。
   fish::tool::Registry tools;
   std::unique_ptr<fish::core::IWebSearch> search_holder;
+  std::unique_ptr<fish::meme::MemeStore> meme_store;
 
   // 记忆检索：用向量 + 关键词混合召回
   if (memory_ready) {
@@ -383,6 +385,20 @@ int main(int argc, char** argv) {
         }));
   }
 
+  // 网络热梗：本地库优先，未命中时可选联网并写回
+  {
+    fish::meme::MemeStore::Config meme_cfg;
+    meme_cfg.dir = cfg.get_or("meme.dir", "data/memes");
+    meme_cfg.max_results = static_cast<int>(cfg.get_int_or("meme.max_results", 5));
+    meme_store = std::make_unique<fish::meme::MemeStore>(meme_cfg);
+    auto e = meme_store->init();
+    if (!e.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "meme_init_failed")
+          .field("detail", e.detail);
+      meme_store.reset();
+    }
+  }
+
   // 网络搜索：只有配置了 provider 才注册
   if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
     auto searcher = fish::capability::make_search(search_cfg);
@@ -401,6 +417,54 @@ int main(int argc, char** argv) {
             return out;
           }));
     }
+  }
+
+  // 热梗查询：本地优先，联网作为可选补充
+  if (meme_store) {
+    auto* ms = meme_store.get();
+    auto* raw_search = search_holder.get();
+
+    fish::tool::MemeLookupTool::RemoteSearcher remote;
+    if (raw_search != nullptr) {
+      // 有搜索后端时才启用联网补充
+      remote = [raw_search](const std::string& query) {
+        std::vector<fish::tool::MemeLookupTool::Hit> out;
+        auto r = raw_search->search(query + " 梗 含义", 3);
+        if (r.ok()) {
+          for (const auto& h : *r.value) {
+            fish::tool::MemeLookupTool::Hit hit;
+            hit.term = query;
+            // 用搜索结果拼一个粗略解释
+            hit.meaning = h.title + (h.snippet.empty() ? "" : "。" + h.snippet);
+            hit.usage = h.url;
+            out.push_back(std::move(hit));
+          }
+        }
+        return out;
+      };
+    }
+
+    tools.add(std::make_shared<fish::tool::MemeLookupTool>(
+        [ms](const std::string& query) {
+          std::vector<fish::tool::MemeLookupTool::Hit> out;
+          for (const auto& e : ms->search(query)) {
+            out.push_back({e.term, e.meaning, e.usage});
+          }
+          return out;
+        },
+        remote,
+        [ms](const std::vector<fish::tool::MemeLookupTool::Hit>& hits) {
+          std::vector<fish::meme::Entry> entries;
+          for (const auto& h : hits) {
+            fish::meme::Entry e;
+            e.term = h.term;
+            e.meaning = h.meaning;
+            e.usage = h.usage;
+            e.origin = "web";
+            entries.push_back(std::move(e));
+          }
+          return ms->import_many(entries);
+        }));
   }
 
   fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "tools_ready")

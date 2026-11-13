@@ -20,6 +20,8 @@ module;
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -61,6 +63,48 @@ struct Config {
   int token_refresh_lead_ms{120000};  // 提前 2 分钟刷新
 };
 
+// 解析 ISO8601 时间（形如 "2026-11-13T15:57:48+08:00"）为 unix 毫秒。
+// 失败返回 0（调用方会退回本地接收时间）。
+// 不引入第三方日期库：格式固定，手写解析够用且无依赖。
+std::int64_t parse_iso8601_ms(const std::string& s) {
+  // 最少需要 "YYYY-MM-DDTHH:MM:SS"
+  if (s.size() < 19) return 0;
+  std::tm tm{};
+  int year = 0, mon = 0, day = 0, hour = 0, min = 0, sec = 0;
+  if (std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &year, &mon, &day, &hour, &min,
+                  &sec) != 6) {
+    return 0;
+  }
+  if (year < 1970 || mon < 1 || mon > 12 || day < 1 || day > 31) return 0;
+
+  tm.tm_year = year - 1900;
+  tm.tm_mon = mon - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = hour;
+  tm.tm_min = min;
+  tm.tm_sec = sec;
+
+  // timegm 按 UTC 解释；若带时区偏移需要补偿
+  std::time_t t = ::timegm(&tm);
+  if (t == static_cast<std::time_t>(-1)) return 0;
+
+  // 处理时区偏移：+08:00 / -05:00 / Z
+  const auto pos = s.find_last_of("Zz+-");
+  if (pos != std::string::npos && pos > 18) {
+    const char sign = s[pos];
+    if (sign == '+' || sign == '-') {
+      int oh = 0, om = 0;
+      if (std::sscanf(s.c_str() + pos + 1, "%2d:%2d", &oh, &om) == 2 ||
+          std::sscanf(s.c_str() + pos + 1, "%2d%2d", &oh, &om) == 2) {
+        const std::int64_t offset = (static_cast<std::int64_t>(oh) * 3600 + om * 60) *
+                                    (sign == '+' ? 1 : -1);
+        t -= static_cast<std::time_t>(offset);
+      }
+    }
+  }
+  return static_cast<std::int64_t>(t) * 1000;
+}
+
 // 入站附件（QQ 官方把图片/语音放在 attachments 数组里）
 struct Attachment {
   std::string content_type;   // image/jpeg、image/png、voice ...
@@ -86,6 +130,14 @@ struct Event {
   std::string conversation_id;   // "g:<openid>" 或 "<openid>"
   std::string sender_id;
   std::string sender_name;
+  // 群名片（群内昵称，可能与全局昵称不同）
+  std::string sender_group_card;
+  // 群内角色："owner" | "admin" | "member"
+  std::string sender_role;
+  // 群名 / 会话标题（群聊才有）
+  std::string conversation_title;
+  // 消息发送时刻（unix 毫秒），来自事件里的 timestamp
+  std::int64_t at_ms{0};
   std::string content;           // 已去掉 <@!xxx> 前缀
   bool is_group{false};
   bool mentioned{false};
@@ -412,15 +464,34 @@ void Client::parse_dispatch(const std::string& type, const json& d) {
   Event ev;
   ev.type = type;
 
+  // 消息时间：事件里带 timestamp（ISO8601），转成 unix 毫秒。
+  // 用事件时间而不是本地接收时间：网络延迟和补发消息都靠它才准。
+  if (d.contains("timestamp") && d["timestamp"].is_string()) {
+    ev.at_ms = parse_iso8601_ms(d["timestamp"].get<std::string>());
+  }
+
   if (type == "GROUP_AT_MESSAGE_CREATE") {
     ev.is_group = true;
     ev.mentioned = true;  // 该事件本身就是 @ 机器人
     ev.message_id = d.value("id", "");
     const std::string group = d.value("group_openid", "");
     ev.conversation_id = "g:" + group;
-    ev.sender_id = d.value("author", json::object()).value("id", "");
     if (d.contains("author") && d["author"].is_object()) {
-      ev.sender_name = d["author"].value("username", ev.sender_id);
+      const auto& a = d["author"];
+      ev.sender_id = a.value("id", "");
+      // member_openid 是群内稳定标识，优先用它
+      if (a.contains("member_openid") && a["member_openid"].is_string()) {
+        ev.sender_id = a["member_openid"].get<std::string>();
+      }
+      ev.sender_name = a.value("username", ev.sender_id);
+      // 群名片：群内显示名，可能与全局昵称不同
+      if (a.contains("member_nick") && a["member_nick"].is_string()) {
+        ev.sender_group_card = a["member_nick"].get<std::string>();
+      }
+    }
+    // 群内角色：QQ 可能在 member_role 或 roles 里给
+    if (d.contains("member_role") && d["member_role"].is_string()) {
+      ev.sender_role = d["member_role"].get<std::string>();
     }
     ev.content = strip_mention(d.value("content", ""));
   } else if (type == "C2C_MESSAGE_CREATE") {
@@ -433,6 +504,13 @@ void Client::parse_dispatch(const std::string& type, const json& d) {
     }
     ev.conversation_id = ev.sender_id;
     ev.sender_name = ev.sender_id;
+    if (d.contains("author") && d["author"].is_object()) {
+      const auto& a = d["author"];
+      // 私聊也尽量拿昵称
+      if (a.contains("username") && a["username"].is_string()) {
+        ev.sender_name = a["username"].get<std::string>();
+      }
+    }
     ev.content = strip_mention(d.value("content", ""));
   } else {
     return;  // 其他事件类型忽略

@@ -37,6 +37,11 @@ struct Message {
   // 若只存 "[发了一张照片]" 这样的文字标记，下一轮模型就真的
   // 看不到那张图了，会说出「我看不到自己照片长什么样」。
   std::vector<std::string> image_paths;
+  // 发言人信息（user 侧才有意义）。
+  // 群聊里必须保留：否则模型分不清是群里哪个人说的。
+  fish::core::Speaker speaker;
+  // 发送时刻（unix 毫秒），让模型理解"昨天""刚才"这类时间指代
+  std::int64_t at_ms{0};
 };
 
 struct Fact {
