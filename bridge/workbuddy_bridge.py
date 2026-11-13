@@ -172,6 +172,12 @@ def call_upstream(acc: Account, payload: dict, timeout: int) -> dict:
     usage = None
     model_name = body.get("model", DEFAULT_MODEL)
     finish = "stop"
+    # 工具调用必须按 index 累积：流式里 arguments 是分片到达的
+    # （第一片给 name + 部分 arguments，后续片只给 arguments 片段）。
+    # 早期只聚合 delta.content，tool_calls 整段被丢弃，
+    # 导致调用方只看到 finish_reason=tool_calls 却拿不到任何调用，
+    # 于是只能退回「让模型输出 [PHOTO] 文本标记」这种笨办法。
+    tool_calls: dict[int, dict] = {}
 
     with urllib.request.urlopen(req, timeout=timeout,
                                 context=ssl.create_default_context()) as resp:
@@ -193,9 +199,34 @@ def call_upstream(acc: Account, payload: dict, timeout: int) -> dict:
             for choice in chunk.get("choices") or []:
                 if choice.get("finish_reason"):
                     finish = choice["finish_reason"]
-                piece = (choice.get("delta") or {}).get("content")
+                delta = choice.get("delta") or {}
+
+                piece = delta.get("content")
                 if piece:
                     text_parts.append(piece)
+
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_calls.setdefault(
+                        idx,
+                        {"id": "", "type": "function",
+                         "function": {"name": "", "arguments": ""}},
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+
+    message: dict = {"role": "assistant", "content": "".join(text_parts)}
+    if tool_calls:
+        # 补 id：上游偶尔不给，调用方需要它来配对工具结果
+        for idx, slot in tool_calls.items():
+            if not slot["id"]:
+                slot["id"] = f"call_{idx}"
+        message["tool_calls"] = [tool_calls[k] for k in sorted(tool_calls)]
 
     return {
         "id": "wb-bridge",
@@ -204,7 +235,7 @@ def call_upstream(acc: Account, payload: dict, timeout: int) -> dict:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "".join(text_parts)},
+                "message": message,
                 "finish_reason": finish,
             }
         ],

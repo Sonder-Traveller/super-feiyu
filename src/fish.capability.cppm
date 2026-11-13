@@ -399,9 +399,12 @@ class HttpChat final : public fish::core::IChatModel {
 
     json msgs = json::array();
     if (dial_ == Dialect::kOpenAI) {
-      // system 单独置前，保证前缀缓存命中
-      msgs.push_back({{"role", "system"}, {"content", req.system_prompt}});
-    } else {
+      // system 单独置前，保证前缀缓存命中。
+      // 人格为空时不发这条消息：部分上游对空 content 会 400。
+      if (!req.system_prompt.empty()) {
+        msgs.push_back({{"role", "system"}, {"content", req.system_prompt}});
+      }
+    } else if (!req.system_prompt.empty()) {
       payload["system"] = req.system_prompt;
     }
     // 历史消息按「相邻同角色合并」的方式组装。

@@ -24,6 +24,7 @@ import fish.image;
 import fish.media;
 import fish.tool;
 import fish.guard;
+import fish.persona;
 
 export namespace fish::orchestrator {
 
@@ -96,6 +97,12 @@ class Pipeline {
     fish::core::IChatModel* chat{nullptr};
     fish::core::IEmbeddingModel* embedding{nullptr};
     fish::core::IPersona* persona{nullptr};
+    // 人格存储：按会话取人格。非空时优先于 persona->stable_prefix()。
+    //
+    // 为什么要这个：persona 是启动时固定的单一文本，无法按会话区分。
+    // 用户需要「一个统一默认人格 + 每个群/每个人可以单独设」，
+    // 所以人格文本改由 PersonaStore 按 conv_id 解析。
+    fish::persona::PersonaStore* personas{nullptr};
     fish::core::IReplyBudget* budget{nullptr};
     fish::core::ITextToSpeech* tts{nullptr};
     fish::core::ISpeechToText* stt{nullptr};
@@ -255,6 +262,10 @@ std::size_t ReplyBudget::sweep() {
 // ── LayeredPersona ──────────────────────────────────────
 LayeredPersona::LayeredPersona(std::string persona_text, std::string constraints) {
   // 顺序固定：约束在前、人格在后。顺序一变历史缓存全失效
+  if (constraints.empty()) {
+    prefix_ = std::move(persona_text);
+    return;
+  }
   std::ostringstream oss;
   oss << constraints << "\n\n" << persona_text;
   prefix_ = oss.str();
@@ -288,25 +299,30 @@ std::string LayeredPersona::dynamic_suffix(const fish::core::InboundMessage& msg
 
 Result<LayeredPersona> load_persona(const std::string& persona_path,
                                     const std::string& constraints_path) {
+  // 空文件是合法的：默认人格就是空的，由用户自己写。
+  // 这里只把「打不开」当错误，不把「内容为空」当错误。
   auto read_file = [](const std::string& path) -> Result<std::string> {
     std::ifstream in(path, std::ios::binary);
     if (!in) return Result<std::string>::fail(ErrorCode::kBadRequest, "cannot_open:" + path);
     std::ostringstream ss;
     ss << in.rdbuf();
-    auto text = ss.str();
-    if (text.empty()) {
-      return Result<std::string>::fail(ErrorCode::kBadRequest, "empty_file:" + path);
-    }
-    return Result<std::string>::ok(std::move(text));
+    return Result<std::string>::ok(ss.str());
   };
 
   auto p = read_file(persona_path);
   if (!p.ok()) return Result<LayeredPersona>::fail(p.error.code, p.error.detail);
-  auto c = read_file(constraints_path);
-  if (!c.ok()) return Result<LayeredPersona>::fail(c.error.code, c.error.detail);
 
-  return Result<LayeredPersona>::ok(
-      LayeredPersona(std::move(*p.value), std::move(*c.value)));
+  // 约束文件是可选的：不配置就只用人格文件。
+  // 早期把 rules.md 当必填，等于强制用户接受一套他没见过也没改过的规则；
+  // AstrBot / LangBot 都不内置这种东西，人设完全交给用户。
+  std::string constraints;
+  if (!constraints_path.empty()) {
+    auto c = read_file(constraints_path);
+    if (c.ok()) constraints = std::move(*c.value);
+    // 读不到就当没有，不阻断启动
+  }
+
+  return Result<LayeredPersona>::ok(LayeredPersona(std::move(*p.value), std::move(constraints)));
 }
 
 // ── Pipeline ────────────────────────────────────────────
@@ -660,8 +676,20 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   // 9. 模型调用（带降级 + 工具循环）
   fish::core::IChatModel::Request req;
   // system 只放稳定前缀：它必须逐字节不变，否则前缀缓存全失效（成本差 50 倍）。
-  req.system_prompt = deps_.persona->stable_prefix();
-
+  //
+  // 人格按会话解析：会话覆盖 → 全局默认 → 空。
+  // 空人格就不发 system 消息，模型以裸状态说话，由用户自己填。
+  if (deps_.personas != nullptr) {
+    auto p = deps_.personas->persona_for(msg.conversation_id);
+    if (p.ok()) req.system_prompt = std::move(*p.value);
+    else {
+      ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "persona_load_failed")
+          .field("detail", p.error.detail);
+      if (deps_.persona != nullptr) req.system_prompt = deps_.persona->stable_prefix();
+    }
+  } else if (deps_.persona != nullptr) {
+    req.system_prompt = deps_.persona->stable_prefix();
+  }
   req.user_blocks = std::move(*input.value);
   req.history = std::move(history);
 
@@ -675,13 +703,15 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   //
   // 注意：dynamic_suffix 还预留了【相关记忆】参数，但 MemoryContext 目前
   // 没有召回条目字段，传空串——不编造不存在的数据。
-  const std::string suffix = deps_.persona->dynamic_suffix(msg, "");
-  if (!suffix.empty()) {
-    fish::core::ContentBlock ctx_block;
-    ctx_block.kind = fish::core::BlockKind::kText;
-    ctx_block.text = suffix;
-    ctx_block.role = "user";
-    req.user_blocks.insert(req.user_blocks.begin(), std::move(ctx_block));
+  if (deps_.persona != nullptr) {
+    const std::string suffix = deps_.persona->dynamic_suffix(msg, "");
+    if (!suffix.empty()) {
+      fish::core::ContentBlock ctx_block;
+      ctx_block.kind = fish::core::BlockKind::kText;
+      ctx_block.text = suffix;
+      ctx_block.role = "user";
+      req.user_blocks.insert(req.user_blocks.begin(), std::move(ctx_block));
+    }
   }
 
   // 工具声明：只在注册表非空时带上

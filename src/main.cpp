@@ -23,6 +23,7 @@ import fish.session;
 import fish.tool;
 import fish.guard;
 import fish.meme;
+import fish.persona;
 import fish.channels;
 import fish.dispatcher;
 import fish.orchestrator;
@@ -175,12 +176,10 @@ int main(int argc, char** argv) {
       problems.push_back("channel.wechat.bot_token 为空");
     }
 
-    // 人格文件必须存在
+    // 人格文件必须存在；约束文件可选（不配就只用人格文件）
     {
       const auto pp = cfg.get_or("persona.persona_file", "persona/persona.md");
-      const auto rp = cfg.get_or("persona.rules_file", "persona/rules.md");
       if (!std::ifstream(pp)) problems.push_back("人格文件不存在: " + pp);
-      if (!std::ifstream(rp)) problems.push_back("约束文件不存在: " + rp);
     }
 
     // 用了真实 provider 就必须有 key
@@ -295,20 +294,54 @@ int main(int argc, char** argv) {
   }
 
   // ── 人格 ──
+  //
+  // 两级：全局默认 + 每会话覆盖。
+  //   全局默认的人格文本来自 persona.persona_file（首次启动时复制到
+  //   data/persona/default.md，之后用户直接改那个文件即可）。
+  //   会话覆盖由 PersonaStore 管，存 data/persona/sessions/<hash>.md。
   std::unique_ptr<fish::core::IPersona> persona_holder;
+  std::unique_ptr<fish::persona::PersonaStore> persona_store;
   {
+    fish::persona::PersonaStore::Config pc;
+    pc.dir = cfg.get_or("persona.store_dir", "data/persona");
+    persona_store = std::make_unique<fish::persona::PersonaStore>(pc);
+    auto pe = persona_store->init();
+    if (!pe.ok()) {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "persona_store_failed")
+          .field("detail", pe.detail);
+      persona_store.reset();
+    }
+
+    // 全局默认人格：data/persona/default.md 优先，没有就从配置指定的文件播种一次。
+    bool seeded = false;
+    if (persona_store != nullptr) {
+      auto cur = persona_store->default_persona();
+      if (cur.ok() && cur.value->empty()) {
+        const auto src = cfg.get_or("persona.persona_file", "persona/persona.md");
+        if (auto seed = fish::persona::read_text_file(src); seed.ok() && !seed.value->empty()) {
+          if (auto e = persona_store->set_default_persona(*seed.value); e.ok()) {
+            seeded = true;
+            fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "persona_seeded")
+                .field("from", src)
+                .field("bytes", static_cast<long long>(seed.value->size()));
+          }
+        }
+      }
+    }
+
+    // LayeredPersona 仍要存在：dynamic_suffix（时间/场景）由它提供。
+    // 它的 stable_prefix 只在 PersonaStore 不可用时兜底。
     auto pr = fish::orchestrator::load_persona(
         cfg.get_or("persona.persona_file", "persona/persona.md"),
-        cfg.get_or("persona.rules_file", "persona/rules.md"));
+        cfg.get_or("persona.rules_file", ""));
     if (pr.ok()) {
       persona_holder =
           std::make_unique<fish::orchestrator::LayeredPersona>(std::move(*pr.value));
     } else {
-      fish::log::log_line(fish::log::LogLevel::kError, "runtime", "persona_load_failed")
+      // 人格文件可以不存在（默认就是空的），这里只记一条日志，不阻断启动。
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "persona_empty")
           .field("detail", pr.error.detail);
-      if (!opt.self_test) return 1;
-      persona_holder = std::make_unique<fish::orchestrator::LayeredPersona>(
-          "你叫大肥鱼，说话简短自然。", "不要主动开启新话题。");
+      persona_holder = std::make_unique<fish::orchestrator::LayeredPersona>("", "");
     }
   }
 
@@ -515,6 +548,7 @@ int main(int argc, char** argv) {
   deps.chat = chat.get();
   deps.embedding = embedding.get();
   deps.persona = persona_holder.get();
+  deps.personas = persona_store.get();
   deps.budget = &budget;
   deps.tts = tts.get();
   deps.stt = stt.get();

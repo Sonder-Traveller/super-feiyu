@@ -93,5 +93,8 @@ max_replies = 4                # 单条入站最多回几条（QQ 官方：单�
 passive_window_ms = 300000     # 被动回复窗口；超过 80% 放弃，避免白发
 
 [persona]
+# 人格文件：写你的角色是什么样。改成自己喜欢的样子，重启生效。
+# 参考 persona/persona.example.md 里的写法说明。
 persona_file = "persona/persona.md"
-rules_file = "persona/rules.md"
+# 可选的额外约束文件。留空或删掉这一行都可以。
+# rules_file = "persona/rules.md"
