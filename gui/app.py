@@ -5,10 +5,10 @@
 Android/iOS：打包成 APP（flet build apk）
 
 设计要点：
+  - 连接地址由用户自己填完整 URL，不预置任何默认主机/端口
   - 宽屏（>=800px）左列表 + 右编辑；窄屏单栏切换
   - 网络请求在后台线程跑，不阻塞 UI
   - token 存本地，不硬编码
-  - 默认连 100.64.0.5:8765（Tailscale），可在界面里改
 """
 from __future__ import annotations
 
@@ -22,12 +22,14 @@ from pathlib import Path
 
 import flet as ft
 
-# ── 配置 ────────────────────────────────────────────────
-DEFAULT_HOST = os.environ.get("FEIYU_HOST", "100.64.0.5")
-DEFAULT_PORT = int(os.environ.get("FEIYU_PORT", "8765"))
+# 只保留环境变量覆盖能力，不设任何默认地址。
+# 没填 URL 就用不了——这是刻意的：控制面地址因部署而异，
+# 预置一个默认值只会让人误以为连上了。
+ENV_URL = os.environ.get("FEIYU_URL", "")
 
-# 移动端 Path.home() 可能不可写，做兜底
+
 def _data_dir() -> Path:
+    """找一个可写的本地目录存 token 和配置。移动端 Path.home() 可能不可写。"""
     for cand in (
         Path.home() / ".super-feiyu",
         Path(os.environ.get("FLET_APP_STORAGE_DATA", "/tmp")) / "super-feiyu",
@@ -49,13 +51,40 @@ TOKEN_FILE = DATA_DIR / "token"
 CONFIG_FILE = DATA_DIR / "config.json"
 
 
+def normalize_url(raw: str) -> str:
+    """把用户填的地址规范成 base URL。
+
+    接受这些写法：
+        http://host:port
+        host:port             → 补 http://
+        host                  → 补 http://，用默认端口
+        https://host
+
+    末尾多余的 / 和路径会被去掉（API 路径由代码拼）。
+    """
+    s = (raw or "").strip()
+    if not s:
+        raise ValueError("请填写控制面地址")
+    if "://" not in s:
+        s = "http://" + s
+    parsed = urllib.parse.urlsplit(s)
+    if not parsed.hostname:
+        raise ValueError("地址格式不对，应形如 http://主机:端口")
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("只支持 http:// 或 https://")
+    netloc = parsed.hostname
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return f"{parsed.scheme}://{netloc}"
+
+
 class ApiError(Exception):
     pass
 
 
 class Api:
-    def __init__(self, host: str, port: int, token: str) -> None:
-        self.base = f"http://{host}:{port}"
+    def __init__(self, base: str, token: str) -> None:
+        self.base = base.rstrip("/")
         self.token = token
 
     def _req(self, method: str, path: str, body: dict | None = None) -> dict:
@@ -79,14 +108,14 @@ class Api:
             except Exception:
                 pass
             raise ApiError(f"HTTP {e.code} {detail}") from e
-        except urllib.error.URLError as e:
-            raise ApiError(f"连不上 {self.base}") from e
+        except urllib.error.URLError:
+            raise ApiError(f"连不上 {self.base}") from None
         except Exception as e:
             raise ApiError(str(e)) from e
         try:
             return json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
-            raise ApiError("响应不是 JSON")
+            raise ApiError("响应不是 JSON") from None
 
     def health(self) -> dict:
         return self._req("GET", "/healthz")
@@ -157,8 +186,7 @@ def main(page: ft.Page) -> None:
     page.theme = ft.Theme(color_scheme_seed=ft.Colors.BLUE)
 
     state = {
-        "host": cfg.get("host", DEFAULT_HOST),
-        "port": cfg.get("port", DEFAULT_PORT),
+        "url": cfg.get("url", ENV_URL),
         "token": load_token(),
         "api": None,
         "sessions": cfg.get("sessions", []),
@@ -193,7 +221,6 @@ def main(page: ft.Page) -> None:
     clear_btn = ft.TextButton("清除覆盖", on_click=lambda e: _clear())
 
     snack = ft.SnackBar(content=ft.Text(""))
-
     busy = ft.ProgressRing(width=16, height=16, stroke_width=2, visible=False)
 
     # ── 工具函数 ──
@@ -217,7 +244,6 @@ def main(page: ft.Page) -> None:
         return f"{key}　—　只影响这个会话"
 
     def _run_async(fn, on_done=None) -> None:
-        """后台线程跑网络请求，避免卡 UI。"""
         busy.visible = True
         page.update()
 
@@ -225,7 +251,7 @@ def main(page: ft.Page) -> None:
             err = None
             try:
                 fn()
-            except ApiError as e:
+            except (ApiError, ValueError) as e:
                 err = str(e)
             except Exception as e:
                 err = str(e)
@@ -245,16 +271,15 @@ def main(page: ft.Page) -> None:
     def _refresh_status() -> None:
         def do():
             state["api"].health()
-            state["connected"] = True
 
         def done(err):
             if err:
                 status_dot.bgcolor = ft.Colors.RED_500
-                status_text.value = err[:50]
+                status_text.value = err[:60]
                 state["connected"] = False
             else:
                 status_dot.bgcolor = ft.Colors.GREEN_500
-                status_text.value = f"已连接 {state['host']}:{state['port']}"
+                status_text.value = f"已连接 {state['api'].base}"
                 state["connected"] = True
             page.update()
 
@@ -336,8 +361,7 @@ def main(page: ft.Page) -> None:
 
     def _persist() -> None:
         save_config({
-            "host": state["host"],
-            "port": state["port"],
+            "url": state["url"],
             "sessions": state["sessions"],
         })
 
@@ -418,44 +442,64 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def _connect(e=None) -> None:
-        host = (host_field.value or "").strip() or DEFAULT_HOST
-        try:
-            port = int((port_field.value or "").strip() or DEFAULT_PORT)
-        except ValueError:
-            _toast("端口必须是数字", ok=False)
-            return
+        raw = (url_field.value or "").strip()
         token = (token_field.value or "").strip()
+
+        try:
+            base = normalize_url(raw)
+        except ValueError as ex:
+            _toast(str(ex), ok=False)
+            return
         if not token:
             _toast("token 不能为空", ok=False)
             return
 
-        state["host"] = host
-        state["port"] = port
+        state["url"] = base
         state["token"] = token
-        state["api"] = Api(host, port, token)
+        state["api"] = Api(base, token)
+        url_field.value = base
         save_token(token)
         _persist()
 
+        def do():
+            state["api"].health()
+
         def done(err):
             if err:
+                status_dot.bgcolor = ft.Colors.RED_500
+                status_text.value = err[:60]
+                state["connected"] = False
+                page.update()
                 _toast(f"连接失败：{err}", ok=False)
                 return
+            status_dot.bgcolor = ft.Colors.GREEN_500
+            status_text.value = f"已连接 {base}"
+            state["connected"] = True
+            page.update()
             _load_current()
             _rebuild_session_list()
 
-        _refresh_status()
-        # 状态刷新是异步的，这里稍等再拉数据
-        threading.Timer(0.6, lambda: _load_current()).start()
+        _run_async(do, done)
 
     # ── 布局 ──
 
-    host_field = ft.TextField(label="主机", value=state["host"], dense=True,
-                              expand=True, text_size=13)
-    port_field = ft.TextField(label="端口", value=str(state["port"]), dense=True,
-                              width=100, text_size=13)
-    token_field = ft.TextField(label="Token", value=state["token"], dense=True,
-                               password=True, can_reveal_password=True,
-                               expand=True, text_size=13)
+    url_field = ft.TextField(
+        label="控制面地址",
+        value=state["url"],
+        hint_text="http://主机:端口",
+        dense=True,
+        expand=True,
+        text_size=13,
+    )
+    token_field = ft.TextField(
+        label="Token",
+        value=state["token"],
+        dense=True,
+        password=True,
+        can_reveal_password=True,
+        expand=True,
+        text_size=13,
+    )
     new_conv = ft.TextField(
         label="会话 ID",
         hint_text="群聊 g:群号 / 私聊 openid",
@@ -471,7 +515,7 @@ def main(page: ft.Page) -> None:
     settings_panel = ft.Container(
         content=ft.Column(
             [
-                ft.Row([host_field, port_field], spacing=8),
+                ft.Row([url_field], spacing=8),
                 ft.Row([token_field], spacing=8),
                 ft.Row([busy, connect_btn], alignment=ft.MainAxisAlignment.END,
                        spacing=10),
@@ -587,7 +631,9 @@ def main(page: ft.Page) -> None:
 
     _rebuild_session_list()
     _layout()
-    if state["token"]:
+
+    # 有完整配置才自动连；否则等用户填
+    if state["url"] and state["token"]:
         _connect()
 
 
