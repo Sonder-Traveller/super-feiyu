@@ -18,6 +18,8 @@ module;
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -917,6 +919,54 @@ std::string md5_hex(const std::string& data) {
   return out;
 }
 
+// 把 mp3 转成微信能播放的 silk。
+//
+// 微信客户端的语音气泡只认 silk（腾讯自有格式），mp3 的 voice_item
+// 服务端收下（HTTP 200）但客户端不渲染——实测「发了但看不到」。
+// 转换链：mp3 → 24kHz 单声道 PCM（ffmpeg）→ silk（python pilk，
+// tencent=True 生成微信兼容头）。任一步失败返回空串，调用方退回 mp3。
+std::string mp3_to_silk(const std::string& mp3_path, int* out_duration_ms) {
+  const std::string pcm_path = mp3_path + ".pcm";
+  const std::string silk_path = mp3_path + ".silk";
+
+  // 1) mp3 → pcm s16le 24kHz mono
+  {
+    const std::string cmd = "ffmpeg -y -loglevel error -i \"" + mp3_path +
+                            "\" -ar 24000 -ac 1 -f s16le \"" + pcm_path + "\" 2>/dev/null";
+    if (std::system(cmd.c_str()) != 0) return {};
+  }
+  // 2) pcm → silk（pilk 的 tencent=True 加微信需要的头）
+  {
+    const std::string cmd = "python3 -c \"import pilk; pilk.encode('" + pcm_path +
+                            "', '" + silk_path + "', pcm_rate=24000, tencent=True)\" 2>/dev/null";
+    if (std::system(cmd.c_str()) != 0) {
+      std::remove(pcm_path.c_str());
+      return {};
+    }
+  }
+  std::remove(pcm_path.c_str());
+
+  // 3) silk 时长（毫秒），voice_item.playtime 用
+  {
+    const std::string cmd = "python3 -c \"import pilk; print(pilk.get_duration('" +
+                            silk_path + "'))\" 2>/dev/null";
+    FILE* p = ::popen(cmd.c_str(), "r");
+    if (p != nullptr) {
+      char buf[32] = {};
+      if (std::fgets(buf, sizeof(buf), p) != nullptr) {
+        *out_duration_ms = std::atoi(buf);
+      }
+      ::pclose(p);
+    }
+  }
+
+  std::ifstream in(silk_path, std::ios::binary);
+  if (!in) return {};
+  std::string out((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::remove(silk_path.c_str());
+  return out;
+}
+
 // 随机 16 字节的 hex 字符串（32 字符）。filekey / aeskey 共用。
 std::string random_hex32() {
   static thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -1146,17 +1196,37 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
 
     if (block.kind == fish::core::BlockKind::kVoice) {
       // 语音：media_type=4 上传，voice_item type=3。
-      // TTS 输出 mp3（encode_type=7）。playtime 没法从 mp3 头精确取，
-      // 用码率估算：edge-tts 默认 24kHz，约 32kbps → 时长 ≈ bytes/4000 毫秒。
-      std::ifstream v_file(block.media_url, std::ios::binary);
-      if (!v_file) {
-        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat", "voice_read_failed")
-            .field("path", block.media_url);
-        continue;
+      // TTS 输出是 mp3，但微信客户端语音气泡只认 silk——mp3 会被
+      // 服务端收下（HTTP 200）却不渲染。先转 silk（encode_type=6），
+      // 转换失败再退回 mp3（总比没有强）。
+      int playtime_ms = 0;
+      std::string silk = mp3_to_silk(block.media_url, &playtime_ms);
+      std::string upload_path = block.media_url;
+      int encode_type = 6;
+      std::string format_note = "silk";
+      if (silk.empty()) {
+        // 退回 mp3 原样上传
+        std::ifstream chk(block.media_url, std::ios::binary | std::ios::ate);
+        if (!chk) {
+          ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat", "voice_read_failed")
+              .field("path", block.media_url);
+          continue;
+        }
+        playtime_ms = static_cast<int>(chk.tellg() / 4);
+        encode_type = 7;
+        format_note = "mp3_fallback";
       }
-      std::string plain((std::istreambuf_iterator<char>(v_file)),
-                        std::istreambuf_iterator<char>());
+
+      std::string plain;
+      if (!silk.empty()) {
+        plain = std::move(silk);
+      } else {
+        std::ifstream v_file(block.media_url, std::ios::binary);
+        plain.assign((std::istreambuf_iterator<char>(v_file)),
+                     std::istreambuf_iterator<char>());
+      }
       if (plain.size() < 100) continue;
+      if (playtime_ms <= 0) playtime_ms = static_cast<int>(plain.size() / 4);
 
       const std::string filekey_hex = random_hex32();
       const std::string aeskey_hex = random_hex32();
@@ -1167,8 +1237,6 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
       }
       const std::string cipher = aes_128_ecb_encrypt(plain, aes_key);
       if (cipher.empty()) continue;
-
-      const int playtime_ms = static_cast<int>(plain.size() / 4);
 
       json up_req{
           {"aeskey", aeskey_hex},
@@ -1253,7 +1321,7 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
                               {{"encrypt_query_param", encrypted_param},
                                {"aes_key", aes_key_b64_of_hex},
                                {"encrypt_type", 1}}},
-                             {"encode_type", 7},
+                             {"encode_type", encode_type},
                              {"bits_per_sample", 16},
                              {"sample_rate", 24000},
                              {"playtime", playtime_ms}}}}})}}},
@@ -1272,7 +1340,8 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
       }
       ::fish::log::log_line(::fish::log::LogLevel::kInfo, "wechat", "voice_sent")
           .field("bytes", static_cast<long long>(plain.size()))
-          .field("ms", static_cast<long long>(playtime_ms));
+          .field("ms", static_cast<long long>(playtime_ms))
+          .field("format", format_note);
     }
   }
   return Error::none();

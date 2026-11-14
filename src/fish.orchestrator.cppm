@@ -752,14 +752,20 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
   // 11-12. 组装出站，按预算逐条发送
   std::vector<fish::core::ContentBlock> outgoing;
-  fish::core::ContentBlock text_block;
-  text_block.kind = fish::core::BlockKind::kText;
-  text_block.text = reply_text;
-  // 只有图片、没有文字时，发一个极短的话兜底（空文本会被通道丢弃）
-  if (text_block.text.empty() && (!tool_images.empty() || !tool_voices.empty())) {
-    text_block.text = "喏";
+
+  // 语音优先：本轮有语音就不发文字——同一段话「文字一条+语音一条」
+  // 是重复轰炸（用户明确不要）。语音内容已经涵盖 reply_text 的主体。
+  // 文字只在没有任何语音时发出。
+  if (tool_voices.empty()) {
+    fish::core::ContentBlock text_block;
+    text_block.kind = fish::core::BlockKind::kText;
+    text_block.text = reply_text;
+    // 只有图片、没有文字时，发一个极短的话兜底（空文本会被通道丢弃）
+    if (text_block.text.empty() && !tool_images.empty()) {
+      text_block.text = "喏";
+    }
+    if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
   }
-  if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
 
   // 工具搜到的图片：直接发出去。
     for (const auto& path : tool_images) {
