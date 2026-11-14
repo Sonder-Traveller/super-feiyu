@@ -144,6 +144,10 @@ class Api:
     def put_config(self, payload: dict) -> dict:
         return self._req("PUT", "/v1/config", payload, timeout=20)
 
+    def restart(self) -> dict:
+        """触发服务优雅重启（systemd 拉起新进程）。保存关键配置后调用。"""
+        return self._req("POST", "/v1/restart", {}, timeout=10)
+
     # 渠道
     def qq_test(self, app_id: str = "", app_secret: str = "") -> dict:
         body = {}
@@ -672,15 +676,21 @@ def main(page: ft.Page) -> None:
             payload["channel"]["wechat"]["bot_token"] = wx_token.value.strip()
 
         def do():
-            return api.put_config(payload)
+            r = api.put_config(payload)
+            # 渠道凭据/开关必须重启进程才生效；保存后直接触发重启
+            api.restart()
+            return r
 
         def done(err, result):
             if err:
                 _toast(f"保存失败：{err}", ok=False)
                 return
-            restart = result.get("restart_required") if result else False
-            _toast("渠道配置已保存" + ("，需重启服务生效" if restart else ""))
-            _load_config_silent()
+            _toast("已保存，服务正在重启（约 5 秒）…")
+            def later():
+                import time
+                time.sleep(5)
+                _connect_silent()
+            threading.Thread(target=later, daemon=True).start()
 
         _run_async(do, done)
 
@@ -832,8 +842,20 @@ def main(page: ft.Page) -> None:
 
     def _qq_bind_done(r: dict) -> None:
         app_id = r.get("app_id", "")
-        _toast(f"QQ 绑定成功（AppID {app_id}），已自动启用", ok=True)
-        _load_config_silent()
+        _toast(f"QQ 绑定成功（AppID {app_id}），服务重启中…", ok=True)
+
+        def later():
+            import time
+            time.sleep(4)
+            api = state["api"]
+            if api is not None:
+                try:
+                    api.restart()
+                except Exception:
+                    pass
+            time.sleep(5)
+            _connect_silent()
+        threading.Thread(target=later, daemon=True).start()
 
     def _wx_login() -> None:
         api = state["api"]
@@ -870,8 +892,20 @@ def main(page: ft.Page) -> None:
         _run_async(do, done)
 
     def _wx_login_done(r: dict) -> None:
-        _toast("微信登录成功，已自动启用", ok=True)
-        _load_config_silent()
+        _toast("微信登录成功，服务重启中…", ok=True)
+
+        def later():
+            import time
+            time.sleep(4)
+            api = state["api"]
+            if api is not None:
+                try:
+                    api.restart()
+                except Exception:
+                    pass
+            time.sleep(5)
+            _connect_silent()
+        threading.Thread(target=later, daemon=True).start()
 
     def channels_view() -> ft.Control:
         btn_style = ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12))
@@ -919,68 +953,150 @@ def main(page: ft.Page) -> None:
         ], spacing=0, scroll=ft.ScrollMode.AUTO, expand=True)
 
     # ═══ 页 4：模型 ═══════════════════════════════════════
-    model_fields: dict[str, ft.TextField] = {}
+    # 设计：提供方用下拉选择，选谁就只出现谁需要的字段。
+    # base_url/model 由后端预设表决定，用户不填不看不见。
+    # 底层模型锁定 deepseek-flash，页面上只读展示。
+    chat_presets: list[dict] = []      # 从 GET /v1/config 的 presets 拿
+    model_locked = "deepseek-flash"
 
-    def _mf(name: str, label: str, password: bool = False, hint: str = "") -> ft.TextField:
-        f = field(label, "", password=password, hint=hint)
-        model_fields[name] = f
-        return f
+    # ── 对话：提供方下拉 ──
+    chat_provider_dd = ft.Dropdown(
+        label="提供方", dense=True, expand=True, text_size=13,
+        border_color=BORDER, focused_border_color=BRAND,
+        options=[], hint_text="选择对话模型从哪里来",
+        on_select=lambda e: _chat_provider_changed(),
+    )
+    chat_key = field("API Key", "", password=True)
+    chat_key_hint = ft.Text("", size=11.5, color=TEXT_SUB)
+    chat_workbuddy_row = ft.Column([], spacing=8)
+    chat_lock_note = ft.Text("", size=12, color=TEXT_HINT)
 
-    chat_provider = _mf("chat.provider", "Provider")
-    chat_url = _mf("chat.base_url", "Base URL")
-    chat_model = _mf("chat.model", "模型")
-    chat_effort = _mf("chat.reasoning_effort", "思考强度", hint="low/medium/high/max")
-    chat_key = _mf("chat.api_key", "API Key", password=True)
+    # ── 思考强度：固定 high（产品决定），只读展示 ──
+    chat_effort_note = ft.Text("思考强度：high（锁定，不可调）", size=12,
+                               color=TEXT_HINT)
 
-    emb_provider = _mf("embedding.provider", "Provider")
-    emb_url = _mf("embedding.base_url", "Base URL")
-    emb_model = _mf("embedding.model", "模型")
-    emb_key = _mf("embedding.api_key", "API Key", password=True)
+    # ── 其他能力：也简化成下拉 ──
+    emb_provider_dd = ft.Dropdown(
+        label="向量提供方", dense=True, expand=True, text_size=13,
+        border_color=BORDER, options=[
+            ft.dropdown.Option("siliconflow", "硅基流动（免费 bge-m3）"),
+            ft.dropdown.Option("openai", "OpenAI 兼容"),
+        ],
+    )
+    emb_key = field("API Key", "", password=True)
 
-    stt_provider = _mf("stt.provider", "Provider")
-    stt_url = _mf("stt.base_url", "Base URL")
-    stt_model = _mf("stt.model", "模型")
-    stt_key = _mf("stt.api_key", "API Key", password=True)
+    stt_provider_dd = ft.Dropdown(
+        label="语音识别提供方", dense=True, expand=True, text_size=13,
+        border_color=BORDER, options=[
+            ft.dropdown.Option("siliconflow", "硅基流动（SenseVoice 免费）"),
+        ],
+    )
+    stt_key = field("API Key", "", password=True)
 
-    tts_provider = _mf("tts.provider", "Provider")
-    tts_voice = _mf("tts.voice", "音色")
+    tts_provider_dd = ft.Dropdown(
+        label="语音合成提供方", dense=True, expand=True, text_size=13,
+        border_color=BORDER, options=[
+            ft.dropdown.Option("edge", "Edge TTS（免费）"),
+            ft.dropdown.Option("siliconflow", "硅基流动"),
+        ],
+    )
 
-    search_provider = _mf("search.provider", "Provider",
-                          hint="deepseek/tavily/generic/none")
-    search_url = _mf("search.base_url", "Base URL")
-    search_key = _mf("search.api_key", "API Key", password=True)
+    search_provider_dd = ft.Dropdown(
+        label="搜索提供方", dense=True, expand=True, text_size=13,
+        border_color=BORDER, options=[
+            ft.dropdown.Option("none", "不启用"),
+            ft.dropdown.Option("deepseek", "DeepSeek 官方"),
+            ft.dropdown.Option("tavily", "Tavily"),
+        ],
+    )
+    search_key = field("API Key", "", password=True)
+
+    # provider 字符串 → 下拉显示。chat 当前是 openai（桥接）时映射回 workbuddy
+    CHAT_PROVIDER_ALIAS = {"openai": "workbuddy", "workbuddy": "workbuddy",
+                           "deepseek": "deepseek", "siliconflow": "siliconflow"}
+
+    def _chat_provider_changed() -> None:
+        """切换提供方：只显示该提供方需要的输入。"""
+        p = chat_provider_dd.value or ""
+        # workbuddy：无需 key，显示扫码提示
+        is_wb = (p == "workbuddy")
+        chat_key.visible = not is_wb
+        chat_workbuddy_row.visible = is_wb
+        hint = ""
+        for preset in chat_presets:
+            if preset.get("provider") == p:
+                hint = preset.get("api_key_hint", "")
+                break
+        chat_key_hint.value = hint
+        page.update()
 
     def _fill_models_from_config() -> None:
         c = state["config"]
         if not c:
             return
         cap = c.get("capability", {})
-        vals = {
-            "chat.provider": cap.get("chat", {}).get("provider", ""),
-            "chat.base_url": cap.get("chat", {}).get("base_url", ""),
-            "chat.model": cap.get("chat", {}).get("model", ""),
-            "chat.reasoning_effort": cap.get("chat", {}).get("reasoning_effort", ""),
-            "chat.api_key": "",
-            "embedding.provider": cap.get("embedding", {}).get("provider", ""),
-            "embedding.base_url": cap.get("embedding", {}).get("base_url", ""),
-            "embedding.model": cap.get("embedding", {}).get("model", ""),
-            "embedding.api_key": "",
-            "stt.provider": cap.get("stt", {}).get("provider", ""),
-            "stt.base_url": cap.get("stt", {}).get("base_url", ""),
-            "stt.model": cap.get("stt", {}).get("model", ""),
-            "stt.api_key": "",
-            "tts.provider": cap.get("tts", {}).get("provider", ""),
-            "tts.voice": cap.get("tts", {}).get("voice", ""),
-            "search.provider": cap.get("search", {}).get("provider", ""),
-            "search.base_url": cap.get("search", {}).get("base_url", ""),
-            "search.api_key": "",
-        }
-        for name, f in model_fields.items():
-            f.value = vals.get(name, "")
-        chat_key.hint_text = "已设置，留空不动" if cap.get("chat", {}).get("api_key_set") else "未设置"
-        emb_key.hint_text = "已设置，留空不动" if cap.get("embedding", {}).get("api_key_set") else "未设置"
-        stt_key.hint_text = "已设置，留空不动" if cap.get("stt", {}).get("api_key_set") else "未设置"
-        search_key.hint_text = "已设置，留空不动" if cap.get("search", {}).get("api_key_set") else "未设置"
+        chat = cap.get("chat", {})
+
+        # 预设列表从服务端拿（含 api_key_hint）
+        nonlocal chat_presets, model_locked
+        chat_presets = chat.get("presets", []) or []
+        model_locked = chat.get("model_locked", "deepseek-flash")
+        if chat_provider_dd.options:
+            pass  # options 只在首次填
+        else:
+            labels = {"workbuddy": "WorkBuddy（扫码登录，本机桥接）",
+                      "deepseek": "DeepSeek 官方（填 API Key）",
+                      "siliconflow": "硅基流动（填 API Key）"}
+            chat_provider_dd.options = [
+                ft.dropdown.Option(p.get("provider", ""),
+                                   labels.get(p.get("provider", ""),
+                                              p.get("provider", "")))
+                for p in chat_presets
+            ]
+
+        # 当前 provider → 下拉值（openai 是桥接的 dialect 名，映射回 workbuddy）
+        cur = CHAT_PROVIDER_ALIAS.get(chat.get("provider", ""), "")
+        chat_provider_dd.value = cur or None
+        chat_lock_note.value = f"底层模型：{model_locked}（锁定，不可更换）"
+        chat_effort_note.value = "思考强度：high（锁定，不可调）"
+
+        # workbuddy 特殊：显示桥接状态
+        wb = chat.get("base_url", "")
+        is_wb = (cur == "workbuddy")
+        chat_key.visible = not is_wb
+        chat_workbuddy_row.controls = [
+            ft.Text(f"桥接地址：{wb}", size=12, color=TEXT_SUB),
+            ft.Text("桥接层由 super-feiyu 启动脚本管理，无需填 Key。",
+                    size=12, color=TEXT_SUB),
+        ]
+        chat_workbuddy_row.visible = is_wb
+        hint = ""
+        for preset in chat_presets:
+            if preset.get("provider") == cur:
+                hint = preset.get("api_key_hint", "")
+        chat_key_hint.value = hint
+
+        # 其余能力
+        emb = cap.get("embedding", {})
+        emb_provider_dd.value = emb.get("provider") or None
+        emb_key.value = ""
+        stt = cap.get("stt", {})
+        stt_provider_dd.value = stt.get("provider") or None
+        stt_key.value = ""
+        tts = cap.get("tts", {})
+        tts_provider_dd.value = tts.get("provider") or None
+        s = cap.get("search", {})
+        search_provider_dd.value = s.get("provider") or None
+        search_key.value = ""
+
+        chat_key.hint_text = ("已设置，留空不动" if chat.get("api_key_set")
+                              else "未设置")
+        emb_key.hint_text = ("已设置，留空不动" if emb.get("api_key_set")
+                             else "未设置")
+        stt_key.hint_text = ("已设置，留空不动" if stt.get("api_key_set")
+                             else "未设置")
+        search_key.hint_text = ("已设置，留空不动" if s.get("api_key_set")
+                                else "未设置")
         page.update()
 
     def _save_models() -> None:
@@ -989,43 +1105,53 @@ def main(page: ft.Page) -> None:
             _toast("还没连接", ok=False)
             return
 
-        def cap(section: str, key: str) -> str:
-            f = model_fields[f"{section}.{key}"]
-            return (f.value or "").strip()
+        payload: dict = {"capability": {}}
+        chat_payload: dict = {}
+        p = chat_provider_dd.value
+        if p:
+            # provider 发预设名，后端展开成 dialect+base_url+model
+            chat_payload["provider"] = p
+        if (chat_key.value or "").strip():
+            chat_payload["api_key"] = chat_key.value.strip()
+        if chat_payload:
+            payload["capability"]["chat"] = chat_payload
 
-        payload = {"capability": {
-            "chat": {"provider": cap("chat", "provider"),
-                     "base_url": cap("chat", "base_url"),
-                     "model": cap("chat", "model"),
-                     "reasoning_effort": cap("chat", "reasoning_effort")},
-            "embedding": {"provider": cap("embedding", "provider"),
-                          "base_url": cap("embedding", "base_url"),
-                          "model": cap("embedding", "model")},
-            "stt": {"provider": cap("stt", "provider"),
-                    "base_url": cap("stt", "base_url"),
-                    "model": cap("stt", "model")},
-            "tts": {"provider": cap("tts", "provider"),
-                    "voice": cap("tts", "voice")},
-            "search": {"provider": cap("search", "provider"),
-                       "base_url": cap("search", "base_url")},
-        }}
-        # 密钥只在用户真的填了新值时才发；留空一律不发（= 不修改）
-        for sec, keyf in (("chat", "api_key"), ("embedding", "api_key"),
-                          ("stt", "api_key"), ("search", "api_key")):
-            v = cap(sec, keyf)
-            if v:
-                payload["capability"][sec][keyf] = v
+        if emb_provider_dd.value:
+            payload["capability"]["embedding"] = {"provider": emb_provider_dd.value}
+        if (emb_key.value or "").strip():
+            payload["capability"].setdefault("embedding", {})["api_key"] = emb_key.value.strip()
+        if stt_provider_dd.value:
+            payload["capability"]["stt"] = {"provider": stt_provider_dd.value}
+        if (stt_key.value or "").strip():
+            payload["capability"].setdefault("stt", {})["api_key"] = stt_key.value.strip()
+        if tts_provider_dd.value:
+            payload["capability"]["tts"] = {"provider": tts_provider_dd.value}
+        if search_provider_dd.value:
+            payload["capability"]["search"] = {"provider": search_provider_dd.value}
+        if (search_key.value or "").strip():
+            payload["capability"].setdefault("search", {})["api_key"] = search_key.value.strip()
+
+        if not payload["capability"]:
+            _toast("没有改动", ok=True)
+            return
 
         def do():
-            return api.put_config(payload)
+            r = api.put_config(payload)
+            # 配置类改动都需要重启进程才生效；直接触发重启
+            api.restart()
+            return r
 
         def done(err, result):
             if err:
                 _toast(f"保存失败：{err}", ok=False)
                 return
-            restart = result.get("restart_required") if result else False
-            _toast("模型配置已保存" + ("，需重启服务生效" if restart else ""))
-            _load_config_silent()
+            _toast("已保存，服务正在重启（约 5 秒）…")
+            # 等几秒后重新连接并刷新
+            def later():
+                import time
+                time.sleep(5)
+                _connect_silent()
+            threading.Thread(target=later, daemon=True).start()
 
         _run_async(do, done)
 
@@ -1034,33 +1160,36 @@ def main(page: ft.Page) -> None:
             section_title("模型", "capability"),
             ft.Container(height=6),
             glass(ft.Column([
-                section_title("对话（chat）", ""),
-                ft.Row([chat_provider, chat_model], spacing=10),
-                ft.Row([chat_url], spacing=10),
-                ft.Row([chat_effort, chat_key], spacing=10),
+                section_title("对话提供方", ""),
+                chat_provider_dd,
+                chat_workbuddy_row,
+                chat_key,
+                chat_key_hint,
+                chat_lock_note,
+                chat_effort_note,
             ], spacing=10)),
             ft.Container(height=14),
             glass(ft.Column([
-                section_title("向量（embedding）", ""),
-                ft.Row([emb_provider, emb_model], spacing=10),
-                ft.Row([emb_url, emb_key], spacing=10),
+                section_title("向量（记忆检索用）", ""),
+                emb_provider_dd,
+                emb_key,
             ], spacing=10)),
             ft.Container(height=14),
             glass(ft.Column([
-                section_title("语音识别（stt）", ""),
-                ft.Row([stt_provider, stt_model], spacing=10),
-                ft.Row([stt_url, stt_key], spacing=10),
+                section_title("语音识别", ""),
+                stt_provider_dd,
+                stt_key,
             ], spacing=10)),
             ft.Container(height=14),
             glass(ft.Column([
-                section_title("语音合成（tts）", ""),
-                ft.Row([tts_provider, tts_voice], spacing=10),
+                section_title("语音合成", ""),
+                tts_provider_dd,
             ], spacing=10)),
             ft.Container(height=14),
             glass(ft.Column([
-                section_title("搜索（search）", ""),
-                ft.Row([search_provider], spacing=10),
-                ft.Row([search_url, search_key], spacing=10),
+                section_title("网络搜索", ""),
+                search_provider_dd,
+                search_key,
             ], spacing=10)),
             ft.Container(height=14),
             ft.Row([
@@ -1091,6 +1220,32 @@ def main(page: ft.Page) -> None:
         _run_async(do, done)
 
     # ═══ 连接 ═════════════════════════════════════════════
+
+    def _connect_silent() -> None:
+        """重启服务后的静默重连：不弹 toast，成功就刷新数据。"""
+        base = state.get("url", "")
+        token = state.get("token", "")
+        if not base or not token:
+            return
+        state["api"] = Api(base, token)
+
+        def do():
+            state["api"].health()
+
+        def done(err, _):
+            if err:
+                status_dot.bgcolor = DANGER
+                status_text.value = "重启中…"
+                page.update()
+                return
+            status_dot.bgcolor = OK_GREEN
+            status_text.value = f"已连接 {base}"
+            state["connected"] = True
+            page.update()
+            _load_config_silent()
+            _refresh_runtime()
+
+        _run_async(do, done)
 
     def _connect(e=None) -> None:
         raw = (url_field.value or "").strip()

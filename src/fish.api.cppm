@@ -90,6 +90,10 @@ class Server {
     status_cb_ = std::move(cb);
   }
 
+  // 注册重启回调。POST /v1/restart 时调用（异步线程里），
+  // main 里实现成 raise(SIGTERM)，让 systemd Restart=always 接住拉起新进程。
+  void set_restart_callback(std::function<void()> cb) { restart_cb_ = std::move(cb); }
+
  private:
   void accept_loop();
   void handle_connection(int fd);
@@ -103,6 +107,7 @@ class Server {
   std::map<std::string, Handler> routes_;   // "GET /x" → handler
   std::mutex routes_mu_;
   std::function<std::string()> status_cb_;
+  std::function<void()> restart_cb_;
 
   // 启动时刻，用来算 uptime
   std::chrono::steady_clock::time_point started_at_{std::chrono::steady_clock::now()};
@@ -604,6 +609,22 @@ Response Server::builtin_route(const Request& req) {
         return r;
       }
       r.body = *j.value;
+      return r;
+    }
+    // ── 重启服务 ──
+    // 扫码绑定/改配置后，通道凭据要重启进程才生效。GUI 调这个接口
+    // 触发优雅退出（SIGTERM），systemd Restart=always 拉起新进程。
+    if (req.method == "POST" && path == "/v1/restart") {
+      Response r;
+      r.body = R"({"ok":true,"detail":"restarting"})";
+      if (restart_cb_) {
+        // 先应答再重启，否则客户端收不到响应
+        auto cb = restart_cb_;
+        std::thread([cb]() {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+          cb();
+        }).detach();
+      }
       return r;
     }
   }

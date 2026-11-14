@@ -22,11 +22,15 @@ module;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
+
+#include <openssl/evp.h>
+#include <openssl/md5.h>
 
 export module fish.channels;
 
@@ -802,7 +806,8 @@ fish::core::ChannelCapability WeChatIlinkChannel::capability() const noexcept {
   fish::core::ChannelCapability cap;
   cap.supports_group = false;
   cap.supports_private = true;
-  cap.supports_image_out = false;
+  // 出站图片已实现：getuploadurl → AES-128-ECB → CDN → image_item。
+  cap.supports_image_out = true;
   cap.supports_voice_out = false;
   cap.supports_voice_in = false;
   cap.max_replies_per_message = 100;
@@ -871,32 +876,271 @@ Result<fish::core::InboundMessage> WeChatIlinkChannel::poll() {
   return Result<fish::core::InboundMessage>::fail(ErrorCode::kTimeout, "no_message");
 }
 
+// ── 微信媒体辅助（匿名命名空间）────────────────────────
+namespace {
+
+// AES-128-ECB + PKCS7 加密（微信 CDN 上传要求）。
+// 返回密文；失败返回空串。
+std::string aes_128_ecb_encrypt(const std::string& plain, const unsigned char key[16]) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) return {};
+  std::string out(plain.size() + 16, '\0');
+  int len = 0;
+  int total = 0;
+  bool ok = EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr) == 1;
+  // PKCS7 padding 是 ECB 的默认行为
+  ok = ok && EVP_CIPHER_CTX_set_padding(ctx, 1) == 1;
+  ok = ok && EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char*>(out.data()), &len,
+                               reinterpret_cast<const unsigned char*>(plain.data()),
+                               static_cast<int>(plain.size())) == 1;
+  if (ok) total = len;
+  ok = ok && EVP_EncryptFinal_ex(ctx, reinterpret_cast<unsigned char*>(out.data()) + total,
+                                 &len) == 1;
+  if (ok) total += len;
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) return {};
+  out.resize(static_cast<std::size_t>(total));
+  return out;
+}
+
+std::string md5_hex(const std::string& data) {
+  unsigned char digest[MD5_DIGEST_LENGTH];
+  ::MD5(reinterpret_cast<const unsigned char*>(data.data()), data.size(), digest);
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  out.reserve(MD5_DIGEST_LENGTH * 2);
+  for (unsigned char c : digest) {
+    out += hex[c >> 4];
+    out += hex[c & 0x0F];
+  }
+  return out;
+}
+
+// 随机 16 字节的 hex 字符串（32 字符）。filekey / aeskey 共用。
+std::string random_hex32() {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  out.reserve(32);
+  for (int i = 0; i < 16; ++i) {
+    const auto b = static_cast<unsigned char>(rng() & 0xFF);
+    out += hex[b >> 4];
+    out += hex[b & 0x0F];
+  }
+  return out;
+}
+
+// X-WECHAT-UIN：随机 uint32 十进制字符串再 base64
+std::string random_wechat_uin() {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  const std::uint32_t v = static_cast<std::uint32_t>(rng() & 0xFFFFFFFFULL);
+  const std::string dec = std::to_string(v);
+  // 小型 base64（只编码一次，无依赖）
+  static const char* table =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  const std::size_t n = dec.size();
+  for (std::size_t i = 0; i < n; i += 3) {
+    const int b0 = static_cast<unsigned char>(dec[i]);
+    const int b1 = (i + 1 < n) ? static_cast<unsigned char>(dec[i + 1]) : 0;
+    const int b2 = (i + 2 < n) ? static_cast<unsigned char>(dec[i + 2]) : 0;
+    const int triple = (b0 << 16) | (b1 << 8) | b2;
+    out += table[(triple >> 18) & 63];
+    out += table[(triple >> 12) & 63];
+    out += (i + 1 < n) ? std::string(1, table[(triple >> 6) & 63]) : "=";
+    out += (i + 2 < n) ? std::string(1, table[triple & 63]) : "=";
+  }
+  return out;
+}
+
+}  // namespace
+
 Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
   if (!connected_) return Error::make(ErrorCode::kUpstreamUnavailable, "not_connected");
+  if (msg.context_token.empty()) {
+    return Error::make(ErrorCode::kBadRequest, "wechat_missing_context_token");
+  }
 
+  const std::string base = cfg_.bot_base_url.empty() ? cfg_.base_url : cfg_.bot_base_url;
+  const std::string auth_headers_token = cfg_.bot_token;
+
+  // 文本和图片分开发（协议建议：一条请求只发一个 item，兼容性最好）。
   for (const auto& block : msg.blocks) {
-    if (block.kind != fish::core::BlockKind::kText) continue;
-    if (msg.context_token.empty()) {
-      return Error::make(ErrorCode::kBadRequest, "wechat_missing_context_token");
-    }
-    json payload{
-        {"msg",
-         {{"from_user_id", ""},
-          {"to_user_id", msg.conversation_id},
-          {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
-          {"message_type", 2},
-          {"message_state", 2},
-          {"context_token", msg.context_token},
-          {"item_list", json::array({{{"type", 1}, {"text_item", {{"text", block.text}}}}})}}},
-        {"base_info", {{"channel_version", cfg_.channel_version}}}};
+    if (block.kind == fish::core::BlockKind::kText) {
+      if (block.text.empty()) continue;
+      json payload{
+          {"msg",
+           {{"from_user_id", ""},
+            {"to_user_id", msg.conversation_id},
+            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"message_type", 2},
+            {"message_state", 2},
+            {"context_token", msg.context_token},
+            {"item_list", json::array({{{"type", 1}, {"text_item", {{"text", block.text}}}}})}}},
+          {"base_info", {{"channel_version", cfg_.channel_version}}}};
 
-    const std::string base = cfg_.bot_base_url.empty() ? cfg_.base_url : cfg_.bot_base_url;
-    auto resp = fish::capability::HttpClient::instance().post_json(
-        base + "/ilink/bot/sendmessage",
-        {{"AuthorizationType", "ilink_bot_token"},
-         {"Authorization", "Bearer " + cfg_.bot_token}},
-        payload.dump(), 20000);
-    if (!resp.ok()) return Error::make(resp.error.code, resp.error.detail);
+      auto resp = fish::capability::HttpClient::instance().post_json(
+          base + "/ilink/bot/sendmessage",
+          {{"AuthorizationType", "ilink_bot_token"},
+           {"Authorization", "Bearer " + auth_headers_token},
+           {"X-WECHAT-UIN", random_wechat_uin()}},
+          payload.dump(), 20000);
+      if (!resp.ok()) return Error::make(resp.error.code, resp.error.detail);
+      continue;
+    }
+
+    if (block.kind == fish::core::BlockKind::kImage) {
+      // 图片：getuploadurl → AES-128-ECB 加密 → CDN 上传 → image_item。
+      // media_url 是本地路径（形象库 / 生图缓存）。
+      std::ifstream img_file(block.media_url, std::ios::binary);
+      if (!img_file) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat", "image_read_failed")
+            .field("path", block.media_url);
+        continue;  // 单张失败不拖累整条回复
+      }
+      std::string plain((std::istreambuf_iterator<char>(img_file)),
+                        std::istreambuf_iterator<char>());
+      if (plain.empty()) continue;
+
+      // 1) 生成 filekey / aeskey（16 字节 → 32 hex 字符）
+      const std::string filekey_hex = random_hex32();
+      const std::string aeskey_hex = random_hex32();
+      unsigned char aes_key[16];
+      for (int i = 0; i < 16; ++i) {
+        const auto byte = std::stoul(aeskey_hex.substr(i * 2, 2), nullptr, 16);
+        aes_key[i] = static_cast<unsigned char>(byte);
+      }
+
+      // 2) AES-128-ECB 加密
+      const std::string cipher = aes_128_ecb_encrypt(plain, aes_key);
+      if (cipher.empty()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "image_encrypt_failed");
+        continue;
+      }
+
+      // 3) getuploadurl
+      const std::string md5hex = md5_hex(plain);
+      json up_req{
+          {"aeskey", aeskey_hex},
+          {"filekey", filekey_hex},
+          {"filesize", cipher.size()},
+          {"media_type", 1},
+          {"no_need_thumb", true},
+          {"rawfilemd5", md5hex},
+          {"rawsize", plain.size()},
+          {"to_user_id", msg.conversation_id},
+          {"base_info", {{"channel_version", cfg_.channel_version}}}};
+      auto up_url = fish::capability::HttpClient::instance().post_json(
+          base + "/ilink/bot/getuploadurl",
+          {{"AuthorizationType", "ilink_bot_token"},
+           {"Authorization", "Bearer " + auth_headers_token},
+           {"Content-Type", "application/json"},
+           {"X-WECHAT-UIN", random_wechat_uin()}},
+          up_req.dump(), 20000);
+      if (!up_url.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "getuploadurl_failed")
+            .field("detail", up_url.error.detail);
+        continue;
+      }
+      std::string upload_param;
+      try {
+        const auto j = json::parse(up_url.value->body);
+        upload_param = j.value("upload_param", "");
+      } catch (const std::exception& e) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "upload_param_parse").field("detail", e.what());
+        continue;
+      }
+      if (upload_param.empty()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "upload_param_empty");
+        continue;
+      }
+
+      // 4) CDN 上传（POST 二进制密文）。响应头 x-encrypted-param 是关键。
+      std::string cdn_url =
+          "https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=" +
+          fish::capability::url_encode(upload_param) + "&filekey=" + filekey_hex;
+      auto cdn = fish::capability::HttpClient::instance().perform(
+          {.method = "UPLOAD",
+           .custom_verb = "POST",
+           .url = cdn_url,
+           .headers = {{"Content-Type", "application/octet-stream"}},
+           .body = cipher,
+           .timeout_ms = 60000,
+           .max_retries = 1});
+      if (!cdn.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat", "cdn_upload_failed")
+            .field("detail", cdn.error.detail);
+        continue;
+      }
+      std::string encrypted_param;
+      {
+        // header 键统一转小写了
+        const auto it = cdn.value->headers.find("x-encrypted-param");
+        if (it != cdn.value->headers.end()) encrypted_param = it->second;
+      }
+      if (encrypted_param.empty()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "cdn_missing_encrypted_param");
+        continue;
+      }
+
+      // 5) sendmessage：type=2 image_item。
+      //    aes_key 用 base64(hex string) 形式（官方 openclaw 的出站约定）：
+      //    先把 hex 字符串当字节，再 base64 —— 32 字节明文 → 44 字符 base64。
+      std::string aes_key_b64_of_hex;
+      {
+        static const char* table =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const std::string& s = aeskey_hex;  // 32 个 ASCII 字符
+        for (std::size_t i = 0; i < s.size(); i += 3) {
+          const int b0 = static_cast<unsigned char>(s[i]);
+          const int b1 = (i + 1 < s.size()) ? static_cast<unsigned char>(s[i + 1]) : 0;
+          const int b2 = (i + 2 < s.size()) ? static_cast<unsigned char>(s[i + 2]) : 0;
+          const int triple = (b0 << 16) | (b1 << 8) | b2;
+          aes_key_b64_of_hex += table[(triple >> 18) & 63];
+          aes_key_b64_of_hex += table[(triple >> 12) & 63];
+          aes_key_b64_of_hex += (i + 1 < s.size()) ? std::string(1, table[(triple >> 6) & 63]) : "=";
+          aes_key_b64_of_hex += (i + 2 < s.size()) ? std::string(1, table[triple & 63]) : "=";
+        }
+      }
+
+      json payload{
+          {"msg",
+           {{"from_user_id", ""},
+            {"to_user_id", msg.conversation_id},
+            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"message_type", 2},
+            {"message_state", 2},
+            {"context_token", msg.context_token},
+            {"item_list",
+             json::array({{{"type", 2},
+                           {"image_item",
+                            {{"media",
+                              {{"encrypt_query_param", encrypted_param},
+                               {"aes_key", aes_key_b64_of_hex},
+                               {"encrypt_type", 1}}},
+                             {"mid_size", cipher.size()}}}}})}}},
+          {"base_info", {{"channel_version", cfg_.channel_version}}}};
+
+      auto send = fish::capability::HttpClient::instance().post_json(
+          base + "/ilink/bot/sendmessage",
+          {{"AuthorizationType", "ilink_bot_token"},
+           {"Authorization", "Bearer " + auth_headers_token},
+           {"X-WECHAT-UIN", random_wechat_uin()}},
+          payload.dump(), 20000);
+      if (!send.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "image_send_failed")
+            .field("detail", send.error.detail);
+        continue;
+      }
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "wechat", "image_sent")
+          .field("bytes", static_cast<long long>(plain.size()));
+    }
   }
   return Error::none();
 }

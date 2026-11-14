@@ -721,6 +721,13 @@ int main(int argc, char** argv) {
 
         api_server = std::make_unique<fish::api::Server>(ac, persona_store.get(),
                                                          control.get());
+        // /v1/restart：优雅退出自己，systemd Restart=always 拉起新进程。
+        // 扫码绑定/改配置后凭据要重启才生效，GUI 调这个接口即可。
+        api_server->set_restart_callback([]() {
+          ::fish::log::log_line(fish::log::LogLevel::kInfo, "api",
+                                "restart_requested");
+          std::raise(SIGTERM);
+        });
         // /v1/status 的通道信息：用回调注入，api 模块不需要认识 ChannelStats
         api_server->set_status_provider([&stats, &channel_names]() {
           std::string out = "[";

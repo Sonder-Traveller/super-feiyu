@@ -29,6 +29,8 @@ export namespace fish::capability {
 
 struct HttpRequest {
   std::string method{"POST"};
+  // UPLOAD 方法时真正发的 HTTP verb（CDN 上传是 POST）。
+  std::string custom_verb;
   std::string url;
   std::map<std::string, std::string> headers;
   std::string body;
@@ -36,6 +38,27 @@ struct HttpRequest {
   int max_retries{2};
   bool want_binary{false};
 };
+
+// URL 查询参数转义（空格/+/斜杠/等号等）。微信 CDN 上传的
+// encrypted_query_param 里有 '=' 和 '/'，必须转义。
+inline std::string url_encode(const std::string& s) {
+  static const char* hex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size() * 3);
+  for (unsigned char c : s) {
+    const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                      c == '~';
+    if (safe) {
+      out += static_cast<char>(c);
+    } else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
 
 struct HttpResult {
   int status{0};
@@ -560,7 +583,16 @@ class HttpChat final : public fish::core::IChatModel {
                                     std::string("parse:") + e.what());
     }
 
-    if (out.text.empty()) {
+    // 空文本只有在「也没有工具调用」时才算失败。
+    //
+    // OpenAI 协议里，模型决定调工具时 content 通常就是空的、
+    // finish_reason 为 tool_calls，这是完全正常的响应。
+    // 早期只看 text.empty() 就判 kUpstreamUnavailable，导致
+    // 「模型想调工具」被当成上游故障，日志里同时出现
+    //   tool_calls count=1
+    //   chat_degraded detail=empty_completion
+    // 用户看到的就是「我卡了一下」，工具永远不生效。
+    if (out.text.empty() && out.tool_calls.empty()) {
       return Result<Response>::fail(ErrorCode::kUpstreamUnavailable, "empty_completion");
     }
 
@@ -1501,6 +1533,14 @@ Result<HttpResult> HttpClient::perform(const HttpRequest& req, CircuitBreaker* b
       curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(req.body.size()));
     } else if (req.method == "GET") {
       curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    } else if (req.method == "UPLOAD") {
+      // 带二进制 body 的自定义方法/POST：微信 CDN 上传用。
+      // CUSTOMREQUEST + POSTFIELDS 而不是 CURLOPT_UPLOAD——后者会强制
+      // 使用上传回调流式读取，跟已有的 write_cb 回应路径冲突。
+      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,
+                       req.custom_verb.empty() ? "POST" : req.custom_verb.c_str());
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req.body.data());
+      curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(req.body.size()));
     } else {
       curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, req.method.c_str());
     }
@@ -1589,19 +1629,24 @@ Result<std::string> HttpClient::download(const std::string& url, std::size_t max
 
 // ── 工厂 ────────────────────────────────────────────────
 Result<std::unique_ptr<fish::core::IChatModel>> make_chat(const ChatConfig& cfg) {
+  // "workbuddy" 是 "openai" 的别名：桥接层就是 OpenAI 兼容协议。
+  // 控制面预设展开应该总是写 openai，但配置文件是用户手可编辑的，
+  // 写了别名也要能跑，不能因为一个名字让服务起不来。
+  std::string dialect_provider = cfg.provider;
+  if (dialect_provider == "workbuddy") dialect_provider = "openai";
   static const std::set<std::string> kOk{"deepseek", "openai", "anthropic", "siliconflow",
                                          "ollama"};
-  if (!kOk.count(cfg.provider)) {
+  if (!kOk.count(dialect_provider)) {
     return Result<std::unique_ptr<fish::core::IChatModel>>::fail(
         ErrorCode::kUnsupported,
         "unknown chat provider '" + cfg.provider + "'. supported: " + chat_provider_list());
   }
-  if (cfg.api_key.empty() && cfg.provider != "ollama") {
+  if (cfg.api_key.empty() && dialect_provider != "ollama") {
     return Result<std::unique_ptr<fish::core::IChatModel>>::fail(ErrorCode::kUnauthorized,
                                                                  "chat api_key empty");
   }
   return Result<std::unique_ptr<fish::core::IChatModel>>::ok(std::make_unique<HttpChat>(
-      cfg, dialect_of(cfg.provider), &breaker_for(cfg.provider, "chat")));
+      cfg, dialect_of(dialect_provider), &breaker_for(cfg.provider, "chat")));
 }
 
 Result<std::unique_ptr<fish::core::IEmbeddingModel>> make_embedding(const EmbeddingConfig& cfg) {

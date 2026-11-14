@@ -710,13 +710,42 @@ fish::core::Error ControlService::set_secret(const std::string& section,
 // 密钥项的 key 后缀自动是 "_set"，值是「是否非空」。
 namespace {
 
-enum class FieldKind { kString, kInt, kBool, kSecret };
+enum class FieldKind { kString, kInt, kBool, kSecret, kLocked };
 
 struct FieldDef {
   const char* section;
   const char* key;
   FieldKind kind;
 };
+
+// 提供方预设。GUI 只选提供方，base_url / model 由这里定，用户不填。
+//
+// 底层模型锁定：deepseek-flash。不管接哪家提供方，换的只是「从哪里
+// 拿到这个模型」，模型本身不换——这是产品决定，不是技术限制。
+struct ProviderPreset {
+  const char* provider;     // GUI 下拉里的选项值
+  const char* base_url;
+  const char* model;        // 固定 deepseek-flash
+  const char* api_key_hint; // GUI 提示文案
+};
+
+constexpr ProviderPreset kChatPresets[] = {
+    // WorkBuddy：本机桥接层，key 随便填（桥不校验）。GUI 里走扫码。
+    {"workbuddy", "http://127.0.0.1:18091/v1", "fast-model", "桥接层不校验，扫码登录即可"},
+    {"deepseek", "https://api.deepseek.com", "deepseek-flash", "sk-开头的 DeepSeek API Key"},
+    {"siliconflow", "https://api.siliconflow.cn/v1", "deepseek-flash", "sk-开头的硅基流动 Key"},
+};
+
+// 接入方式统一是 OpenAI 兼容协议；provider 字段只决定 dialect，
+// 对 OpenAI 兼容端点一律写 "openai"。
+constexpr const char* kChatDialect = "openai";
+
+const ProviderPreset* find_chat_preset(const std::string& provider) {
+  for (const auto& p : kChatPresets) {
+    if (provider == p.provider) return &p;
+  }
+  return nullptr;
+}
 
 constexpr FieldDef kFields[] = {
     // 通道
@@ -735,7 +764,7 @@ constexpr FieldDef kFields[] = {
     {"capability.chat", "provider", FieldKind::kString},
     {"capability.chat", "base_url", FieldKind::kString},
     {"capability.chat", "model", FieldKind::kString},
-    {"capability.chat", "reasoning_effort", FieldKind::kString},
+    {"capability.chat", "reasoning_effort", FieldKind::kLocked},
     {"capability.chat", "api_key", FieldKind::kSecret},
     {"capability.embedding", "provider", FieldKind::kString},
     {"capability.embedding", "base_url", FieldKind::kString},
@@ -856,8 +885,26 @@ fish::core::Result<std::string> ControlService::config_json() {
       case FieldKind::kSecret:
         (*node)[std::string(f.key) + "_set"] = !resolved(f.section, f.key).empty();
         break;
+      case FieldKind::kLocked:
+        // 锁定字段：原样返回（GUI 显示成只读），PUT 拒绝改。
+        (*node)[f.key] = cf.get_or(f.section, f.key, "");
+        break;
     }
   }
+
+  // chat 的提供方预设：GUI 按 provider 下拉选择，下拉项和当前选中的
+  // 提供方信息都从这里拿，前端不用硬编码表。
+  {
+    json& chat = root["capability"]["chat"];
+    json items = json::array();
+    for (const auto& p : kChatPresets) {
+      items.push_back({{"provider", p.provider},
+                       {"api_key_hint", p.api_key_hint}});
+    }
+    chat["presets"] = items;
+    chat["model_locked"] = "deepseek-flash";
+  }
+
   return fish::core::Result<std::string>::ok(root.dump());
 }
 
@@ -888,6 +935,37 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
   flatten_json("", in, &flat);
 
   for (const auto& [full, val] : flat) {
+    // 特例优先：chat.provider 发的是预设名（workbuddy / deepseek /
+    // siliconflow），展开成 dialect + base_url + model。
+    // 这个分支必须在 FieldDef 匹配之前——"deepseek" 同时也是合法的
+    // dialect 值，先匹配到 FieldDef 就只会改 provider 一个字段，
+    // base_url/model 不动，用户切了提供方实际连的还是老地址。
+    if (full == "capability.chat.provider" && val.is_string()) {
+      const std::string name = val.get<std::string>();
+      if (const auto* preset = find_chat_preset(name)) {
+        if (cf.get_or("capability.chat", "provider", "") != kChatDialect) {
+          cf.set("capability.chat", "provider", kChatDialect);
+          changed->push_back("capability.chat.provider");
+          dirty = true;
+          restart = true;
+        }
+        if (cf.get_or("capability.chat", "base_url", "") != preset->base_url) {
+          cf.set("capability.chat", "base_url", preset->base_url);
+          changed->push_back("capability.chat.base_url");
+          dirty = true;
+          restart = true;
+        }
+        const std::string want_model = preset->model;
+        if (cf.get_or("capability.chat", "model", "") != want_model) {
+          cf.set("capability.chat", "model", want_model);
+          changed->push_back("capability.chat.model");
+          dirty = true;
+          restart = true;
+        }
+        continue;
+      }
+    }
+
     const FieldDef* def = nullptr;
     for (const auto& f : kFields) {
       if (full == f.section + std::string(".") + f.key) {
@@ -899,6 +977,17 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
       // 不静默忽略：用户以为改成功了最难查
       return fish::core::Error::make(fish::core::ErrorCode::kBadRequest,
                                      "unknown_field:" + full);
+    }
+
+    // 模型锁定：直接改 capability.chat.model 一律拒绝
+    if (full == "capability.chat.model") {
+      return fish::core::Error::make(fish::core::ErrorCode::kBadRequest,
+                                     "model_locked:deepseek-flash");
+    }
+    // 思考强度锁死 high：产品决定，不允许切换
+    if (full == "capability.chat.reasoning_effort") {
+      return fish::core::Error::make(fish::core::ErrorCode::kBadRequest,
+                                     "effort_locked:high");
     }
 
     // 密钥三态：__keep__ 不动，空串清除，其余覆盖
