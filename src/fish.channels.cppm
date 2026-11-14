@@ -1004,6 +1004,22 @@ std::string random_wechat_uin() {
   return out;
 }
 
+// 生成全局唯一的 client_id。
+//
+// 踩过的坑：原来用 "openclaw-weixin-" + std::rand()，但全程没调过
+// srand()，rand() 每个进程都从同一条序列开始（1804289383, 846930886…）。
+// 服务重启后 client_id 就复用之前已经用过的值，微信按幂等性判定为
+// 重复消息：HTTP 200 + 返回 message_id，但消息被静默丢弃，客户端收不到。
+// 现在用「时间戳(ms) + 随机数」，跨进程、跨重启都不会重复。
+std::string unique_client_id() {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+  const auto salt = static_cast<unsigned long long>(rng() & 0xFFFFFFFFULL);
+  return "openclaw-weixin-" + std::to_string(ms) + "-" + std::to_string(salt);
+}
+
 }  // namespace
 
 Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
@@ -1023,7 +1039,7 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
           {"msg",
            {{"from_user_id", ""},
             {"to_user_id", msg.conversation_id},
-            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"client_id", unique_client_id()},
             {"message_type", 2},
             {"message_state", 2},
             {"context_token", msg.context_token},
@@ -1163,7 +1179,7 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
           {"msg",
            {{"from_user_id", ""},
             {"to_user_id", msg.conversation_id},
-            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"client_id", unique_client_id()},
             {"message_type", 2},
             {"message_state", 2},
             {"context_token", msg.context_token},
@@ -1310,7 +1326,7 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
           {"msg",
            {{"from_user_id", ""},
             {"to_user_id", msg.conversation_id},
-            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"client_id", unique_client_id()},
             {"message_type", 2},
             {"message_state", 2},
             {"context_token", msg.context_token},
