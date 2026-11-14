@@ -808,7 +808,8 @@ fish::core::ChannelCapability WeChatIlinkChannel::capability() const noexcept {
   cap.supports_private = true;
   // 出站图片已实现：getuploadurl → AES-128-ECB → CDN → image_item。
   cap.supports_image_out = true;
-  cap.supports_voice_out = false;
+  // 出站语音已实现：getuploadurl(media_type=4) → AES → CDN → voice_item(encode_type=7 mp3)。
+  cap.supports_voice_out = true;
   cap.supports_voice_in = false;
   cap.max_replies_per_message = 100;
   return cap;
@@ -1140,6 +1141,138 @@ Error WeChatIlinkChannel::send(const fish::core::OutboundMessage& msg, int) {
       }
       ::fish::log::log_line(::fish::log::LogLevel::kInfo, "wechat", "image_sent")
           .field("bytes", static_cast<long long>(plain.size()));
+      continue;
+    }
+
+    if (block.kind == fish::core::BlockKind::kVoice) {
+      // 语音：media_type=4 上传，voice_item type=3。
+      // TTS 输出 mp3（encode_type=7）。playtime 没法从 mp3 头精确取，
+      // 用码率估算：edge-tts 默认 24kHz，约 32kbps → 时长 ≈ bytes/4000 毫秒。
+      std::ifstream v_file(block.media_url, std::ios::binary);
+      if (!v_file) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat", "voice_read_failed")
+            .field("path", block.media_url);
+        continue;
+      }
+      std::string plain((std::istreambuf_iterator<char>(v_file)),
+                        std::istreambuf_iterator<char>());
+      if (plain.size() < 100) continue;
+
+      const std::string filekey_hex = random_hex32();
+      const std::string aeskey_hex = random_hex32();
+      unsigned char aes_key[16];
+      for (int i = 0; i < 16; ++i) {
+        aes_key[i] = static_cast<unsigned char>(
+            std::stoul(aeskey_hex.substr(i * 2, 2), nullptr, 16));
+      }
+      const std::string cipher = aes_128_ecb_encrypt(plain, aes_key);
+      if (cipher.empty()) continue;
+
+      const int playtime_ms = static_cast<int>(plain.size() / 4);
+
+      json up_req{
+          {"aeskey", aeskey_hex},
+          {"filekey", filekey_hex},
+          {"filesize", cipher.size()},
+          {"media_type", 4},
+          {"no_need_thumb", true},
+          {"rawfilemd5", md5_hex(plain)},
+          {"rawsize", plain.size()},
+          {"to_user_id", msg.conversation_id},
+          {"base_info", {{"channel_version", cfg_.channel_version}}}};
+      auto up_url = fish::capability::HttpClient::instance().post_json(
+          base + "/ilink/bot/getuploadurl",
+          {{"AuthorizationType", "ilink_bot_token"},
+           {"Authorization", "Bearer " + auth_headers_token},
+           {"Content-Type", "application/json"},
+           {"X-WECHAT-UIN", random_wechat_uin()}},
+          up_req.dump(), 20000);
+      if (!up_url.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "voice_uploadurl_failed").field("detail", up_url.error.detail);
+        continue;
+      }
+      std::string upload_param;
+      try {
+        upload_param = json::parse(up_url.value->body).value("upload_param", "");
+      } catch (...) {
+      }
+      if (upload_param.empty()) continue;
+
+      std::string cdn_url =
+          "https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=" +
+          fish::capability::url_encode(upload_param) + "&filekey=" + filekey_hex;
+      auto cdn = fish::capability::HttpClient::instance().perform(
+          {.method = "UPLOAD",
+           .custom_verb = "POST",
+           .url = cdn_url,
+           .headers = {{"Content-Type", "application/octet-stream"}},
+           .body = cipher,
+           .timeout_ms = 60000,
+           .max_retries = 1});
+      if (!cdn.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "voice_cdn_failed").field("detail", cdn.error.detail);
+        continue;
+      }
+      std::string encrypted_param;
+      const auto it = cdn.value->headers.find("x-encrypted-param");
+      if (it != cdn.value->headers.end()) encrypted_param = it->second;
+      if (encrypted_param.empty()) continue;
+
+      // aes_key 同图片：base64(hex string)
+      std::string aes_key_b64_of_hex;
+      {
+        static const char* table =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const std::string& s = aeskey_hex;
+        for (std::size_t i = 0; i < s.size(); i += 3) {
+          const int b0 = static_cast<unsigned char>(s[i]);
+          const int b1 = (i + 1 < s.size()) ? static_cast<unsigned char>(s[i + 1]) : 0;
+          const int b2 = (i + 2 < s.size()) ? static_cast<unsigned char>(s[i + 2]) : 0;
+          const int triple = (b0 << 16) | (b1 << 8) | b2;
+          aes_key_b64_of_hex += table[(triple >> 18) & 63];
+          aes_key_b64_of_hex += table[(triple >> 12) & 63];
+          aes_key_b64_of_hex += (i + 1 < s.size()) ? std::string(1, table[(triple >> 6) & 63]) : "=";
+          aes_key_b64_of_hex += (i + 2 < s.size()) ? std::string(1, table[triple & 63]) : "=";
+        }
+      }
+
+      json payload{
+          {"msg",
+           {{"from_user_id", ""},
+            {"to_user_id", msg.conversation_id},
+            {"client_id", "openclaw-weixin-" + std::to_string(std::rand())},
+            {"message_type", 2},
+            {"message_state", 2},
+            {"context_token", msg.context_token},
+            {"item_list",
+             json::array({{{"type", 3},
+                           {"voice_item",
+                            {{"media",
+                              {{"encrypt_query_param", encrypted_param},
+                               {"aes_key", aes_key_b64_of_hex},
+                               {"encrypt_type", 1}}},
+                             {"encode_type", 7},
+                             {"bits_per_sample", 16},
+                             {"sample_rate", 24000},
+                             {"playtime", playtime_ms}}}}})}}},
+          {"base_info", {{"channel_version", cfg_.channel_version}}}};
+
+      auto send = fish::capability::HttpClient::instance().post_json(
+          base + "/ilink/bot/sendmessage",
+          {{"AuthorizationType", "ilink_bot_token"},
+           {"Authorization", "Bearer " + auth_headers_token},
+           {"X-WECHAT-UIN", random_wechat_uin()}},
+          payload.dump(), 20000);
+      if (!send.ok()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "wechat",
+                              "voice_send_failed").field("detail", send.error.detail);
+        continue;
+      }
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "wechat", "voice_sent")
+          .field("bytes", static_cast<long long>(plain.size()))
+          .field("ms", static_cast<long long>(playtime_ms));
     }
   }
   return Error::none();

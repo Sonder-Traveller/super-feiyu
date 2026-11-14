@@ -294,6 +294,15 @@ std::string LayeredPersona::dynamic_suffix(const fish::core::InboundMessage& msg
 
   // 红线放最后：近因效应，执行力最强
   oss << "\n【本轮红线】只回这一条，不要主动开启新话题；不超过两句；不要暴露你是 AI。";
+
+  // 输出能力说明：模型不知道自己能发语音/图，必须明确告诉它标记语法。
+  // 没有这段，[VOICE]/[PHOTO] 机制永远不会被触发（实测教训）。
+  oss << "\n\n【输出标记】在回复文本里嵌入这些标记即可触发对应动作：\n"
+      << "- [VOICE]：把这条回复用语音发出。适合语气需要、或对方在语音场景时用；"
+      << "标记放在回复开头，标记后的文字就是要念的内容，仍保持你的说话风格。\n"
+      << "- [PHOTO]：从你的形象库发一张符合上下文的图。\n"
+      << "- [PHOTO: 描述]：库里没有合适的就现场生成。\n"
+      << "普通聊天不要每条都带标记，真需要时才用。";
   return oss.str();
 }
 
@@ -721,6 +730,9 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
   auto resp = deps_.chat->complete(req);
 
+  // 工具要求发出的图片（search_images 等），在工具循环里累加
+  std::vector<std::string> tool_images;
+
   // 工具循环：模型要求调用工具 → 执行 → 把结果作为 user 消息追加 → 再问
   // 最多 max_tool_rounds 轮，防止模型陷入死循环。
   int tool_round = 0;
@@ -742,6 +754,12 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
           .field("tool", call.name)
           .field("ok", outcome.ok)
           .field("round", static_cast<long long>(tool_round));
+
+      // 工具主动要求发出去的图片（如 search_images 找到的立绘）。
+      // 由管线负责上传，模型只负责说话——否则它会把文件路径当正文念出来。
+      for (const auto& p : outcome.image_paths) {
+        if (!p.empty()) tool_images.push_back(p);
+      }
 
       tool_block += "【工具调用】" + call.name + "\n";
       tool_block += "【返回】" + outcome.content + "\n\n";
@@ -819,8 +837,24 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   text_block.kind = fish::core::BlockKind::kText;
   text_block.text = reply_text;
   // 只有图片、没有文字时，发一个极短的话兜底（空文本会被通道丢弃）
-  if (text_block.text.empty() && wants_photo) text_block.text = "喏";
+  if (text_block.text.empty() && (wants_photo || !tool_images.empty())) {
+    text_block.text = "喏";
+  }
   if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
+
+  // 工具搜到的图片：直接发出去，不需要模型再写 [PHOTO] 标记。
+  // 放在 [PHOTO] 处理之前，保证「模型调了 search_images」时一定有图可发。
+  for (const auto& path : tool_images) {
+    fish::core::ContentBlock img;
+    img.kind = fish::core::BlockKind::kImage;
+    img.media_url = path;
+    img.mime = "image/png";
+    img.role = "assistant";
+    outbound_images.push_back(path);
+    outgoing.push_back(std::move(img));
+    ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "photo_attached")
+        .field("source", "tool");
+  }
 
   // 图片：先查形象库（零成本、形象稳定），没有再现场生成。
   // 支持多张：每个 [PHOTO] 标记对应一张，按顺序发送。
