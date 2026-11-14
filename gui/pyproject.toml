@@ -1,0 +1,21 @@
+[project]
+name = "super-feiyu-control"
+version = "0.1.0"
+description = "super-feiyu 控制面 —— 管理机器人的人格设定"
+requires-python = ">=3.10"
+dependencies = [
+    "flet==1.1.2",
+]
+
+[tool.flet]
+org = "com.sonder"
+product = "super-feiyu"
+company = "Sonder-Traveller"
+copyright = "GPL-3.0"
+
+[tool.flet.app]
+path = "."
+
+[tool.flet.android]
+# 只打 arm64，体积小一半；需要 32 位就加 armeabi-v7a
+# （通过命令行 --arch 指定，这里留注释）

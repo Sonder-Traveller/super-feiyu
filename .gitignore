@@ -43,6 +43,21 @@ config.local.json
 config.toml
 secrets*.json
 
+# APK 签名密钥：泄露等于别人能签你的包
+keys/
+*.keystore
+*.jks
+keystore.properties
+*.p12
+*.pfx
+
+# 打包产物与缓存
+gui/build/
+gui/.venv/
+gui/manifest.json
+*.apk
+*.aab
+
 # 运行时数据
 # 注意：必须写成 data/* 而不是 data/，
 # 否则 git 不会进入被忽略的目录，下面的 ! 否定规则就失效了。
