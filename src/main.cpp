@@ -413,32 +413,15 @@ int main(int argc, char** argv) {
         }));
   }
 
-  // 本地图片检索：按标签在形象库里找
+  // 本地图片：把整个形象库交给模型自己挑，不做关键词匹配
   {
     tools.add(std::make_shared<fish::tool::ImageSearchTool>(
-      [&portraits](const std::string& query) {
+      [&portraits]() {
         std::vector<fish::tool::ImageSearchTool::Hit> out;
-        for (const auto& p : portraits.find_by_tag(query)) {
+        for (const auto& p : portraits.all()) {
           out.push_back({p.path, p.caption});
         }
         return out;
-      },
-      // 告诉模型形象库有哪些场景标签可查（没匹配到时用）
-      [&portraits]() {
-        std::set<std::string> uniq;
-        for (const auto& p : portraits.all()) {
-          for (const auto& t : p.tags) {
-            if (!t.empty()) uniq.insert(t);
-          }
-        }
-        std::string s;
-        std::size_t n = 0;
-        for (const auto& t : uniq) {
-          if (n++ >= 24) break;
-          if (!s.empty()) s += "、";
-          s += t;
-        }
-        return s;
       }));
   }
 

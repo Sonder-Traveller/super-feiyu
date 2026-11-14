@@ -66,9 +66,6 @@ class PortraitStore {
   // 库为空时返回空 Portrait。
   Portrait pick(const std::string& hint, PickStrategy strategy) const;
 
-  // 按标签找（供模型主动查「有没有吃东西的图」）
-  std::vector<Portrait> find_by_tag(const std::string& tag) const;
-
   // 追加一张（生成或用户上传后调用），同时落 manifest
   fish::core::Error add(const Portrait& p);
 
@@ -292,24 +289,6 @@ std::vector<Portrait> PortraitStore::all() const {
   return items_;
 }
 
-std::vector<Portrait> PortraitStore::find_by_tag(const std::string& tag) const {
-  std::vector<Portrait> out;
-  if (tag.empty()) return out;
-  std::lock_guard<std::mutex> lock(mu_);
-  // 标签双向子串匹配。模型给的是自然语言（"吃饭"），标签是短词（"吃,饭"），
-  // 能对上就返回全部匹配项，由调用方（工具层）决定怎么呈现。
-  // 匹配不到就返回空——**不做随机兜底**：发哪张图该由模型看着候选
-  // 自己决定，程序猜一个随机图是替模型做主。
-  for (const auto& p : items_) {
-    for (const auto& t : p.tags) {
-      if (t.find(tag) != std::string::npos || tag.find(t) != std::string::npos) {
-        out.push_back(p);
-        break;
-      }
-    }
-  }
-  return out;
-}
 
 Portrait PortraitStore::pick(const std::string& hint, PickStrategy strategy) const {
   std::lock_guard<std::mutex> lock(mu_);
