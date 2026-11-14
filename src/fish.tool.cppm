@@ -114,7 +114,11 @@ class ImageSearchTool final : public ITool {
     std::string caption;
   };
   using Searcher = std::function<std::vector<Hit>(const std::string& query)>;
-  explicit ImageSearchTool(Searcher s) : search_(std::move(s)) {}
+  // 列出形象库当前的场景标签（没匹配到图时告诉模型能查什么）
+  using TagLister = std::function<std::string()>;
+
+  explicit ImageSearchTool(Searcher s, TagLister t = {})
+      : search_(std::move(s)), list_tags_(std::move(t)) {}
 
   // 一次最多发几张。形象库是本地文件，一次发太多会刷屏，
   // 也容易被平台判成异常。
@@ -122,18 +126,23 @@ class ImageSearchTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
-    return "发一张你自己的图片给对方。在自己形象库里按场景/标签找，"
-           "找到的图会随回复一起发出。适合对方想看你、或聊到相关场景时用。\n"
-           "参数说明：query 填**具体场景词**（如「吃饭」「生气」「发呆」「睡觉」），"
-           "不要填「照片」「图片」「你的样子」这种泛指词——形象库按场景标签索引，"
-           "泛指词匹配不到标签。\n"
-           "即使 query 没匹配到，也会随便发一张库里的图，所以放心调用。";
+    return "发一张你自己的图片给对方。先按场景词查形象库，"
+           "查到多张时会列出候选让你挑，你再带 index 调一次就发出去。\n"
+           "用法：\n"
+           "1) send_image(query=\"吃饭\")  → 返回候选列表带 [0][1]…\n"
+           "2) send_image(query=\"吃饭\", index=1) → 发出第 1 张\n"
+           "query 填**具体场景词**（吃饭/生气/发呆/睡觉/笑），"
+           "别填「照片」「图片」「你的样子」这种泛指词——库按场景标签索引，泛指词匹配不到。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
 
+  // 模型指定 index 时的发送路径（由 run() 内部按参数分流）
+  Outcome run_pick(const Call& call);
+
  private:
   Searcher search_;
+  TagLister list_tags_;
 };
 
 // 语音发送：把一段文字合成语音发给对方
@@ -437,7 +446,10 @@ std::string ImageSearchTool::parameters_schema() const {
   return R"({
     "type": "object",
     "properties": {
-      "query": {"type": "string", "description": "场景或标签，如「吃东西」「生气」"}
+      "query": {"type": "string",
+                "description": "具体场景词，如「吃饭」「生气」「发呆」「睡觉」「笑」"},
+      "index": {"type": "integer",
+                "description": "候选列表里的序号。不填则只返回候选让你挑；填了就发那一张"}
     },
     "required": ["query"]
   })";
@@ -452,25 +464,82 @@ Outcome ImageSearchTool::run(const Call& call) {
     out.content = "需要提供 query 参数。";
     return out;
   }
+  // 带了 index 就是「我已经挑好了，发这张」
+  if (args.contains("index")) return run_pick(call);
   std::vector<Hit> hits;
   if (search_) hits = search_(query);
 
   if (hits.empty()) {
+    // 没匹配到就如实告诉模型，并把形象库能提供什么说清楚，
+    // 让它自己决定换个词再查、还是直接文字回复。
+    // 不替它随机挑图——发哪张是它的表达意图。
+    std::string s = "按「" + query + "」没找到匹配的图。\n";
+    if (list_tags_) {
+      const std::string tags = list_tags_();
+      if (!tags.empty()) {
+        s += "形象库里现有的场景标签：" + tags + "\n";
+        s += "可以换个更具体的场景词再调用一次，或者就直接用文字回话。";
+      }
+    }
     out.ok = true;
-    out.content = "形象库里没有匹配的图片。可以就这样回话，别编造照片内容。";
+    out.content = detail::truncate(std::move(s));
     return out;
   }
 
-  // 取第一张作为要发出去的图。
-  // 工具结果里**不要再给路径**：模型会把路径当正文念出来，
-  // 用户看到的是 "data/memory/portraits/xxx.png" 这种字符串。
-  // 只告诉它「发了什么」，路径由 image_paths 交给管线处理。
-  const auto& pick = hits.front();
-  out.image_paths.push_back(pick.path);
+  // 把候选交给模型自己选：列出每张的内容描述，让它指定 index。
+  // 只有一张时直接发，省一次往返。
+  if (hits.size() == 1) {
+    const auto& pick = hits.front();
+    out.image_paths.push_back(pick.path);
+    std::string s = "已经找到并发出下面这张图（你不用再描述路径）：\n";
+    s += "  图片内容：" + (pick.caption.empty() ? std::string("一张照片") : pick.caption) + "\n";
+    s += "  请用一两句自然的话带过，不要写出文件路径，也不要描述你没看到过的画面细节。\n";
+    out.ok = true;
+    out.content = detail::truncate(std::move(s));
+    return out;
+  }
 
-  std::string s = "已经找到并发出下面这张图（你不用再描述路径）：\n";
-  s += "  图片内容：" + (pick.caption.empty() ? std::string("一张照片") : pick.caption) + "\n";
-  s += "  请用一两句自然的话带过，不要写出文件路径，也不要描述你没看到过的画面细节。\n";
+  // 多张候选：告诉模型有哪些，让它带上 index 再调一次。
+  std::string s = "找到 " + std::to_string(hits.size()) + " 张匹配的图：\n";
+  const std::size_t show = std::min<std::size_t>(hits.size(), 8);
+  for (std::size_t i = 0; i < show; ++i) {
+    s += "  [" + std::to_string(i) + "] " +
+         (hits[i].caption.empty() ? "一张照片" : hits[i].caption) + "\n";
+  }
+  if (hits.size() > show) {
+    s += "  …共 " + std::to_string(hits.size()) + " 张\n";
+  }
+  s += "选一张最合适的，带 index 参数再调用一次 send_image。";
+  out.ok = true;
+  out.content = detail::truncate(std::move(s));
+  return out;
+}
+
+// index 版本：模型已经看过候选，指定要哪张
+Outcome ImageSearchTool::run_pick(const Call& call) {
+  Outcome out;
+  const auto args = detail::parse_args(call.arguments_json);
+  const std::string query = detail::get_str(args, "query");
+  const std::string idx_s = detail::get_str(args, "index");
+  std::vector<Hit> hits;
+  if (search_ && !query.empty()) hits = search_(query);
+  if (hits.empty()) {
+    out.ok = true;
+    out.content = "没找到匹配的图，直接用文字回话吧。";
+    return out;
+  }
+  std::size_t idx = 0;
+  try {
+    idx = static_cast<std::size_t>(std::stoul(idx_s));
+  } catch (...) {
+    idx = 0;
+  }
+  if (idx >= hits.size()) idx = 0;
+  const auto& pick = hits[idx];
+  out.image_paths.push_back(pick.path);
+  std::string s = "已经发出这张图：「" +
+                  (pick.caption.empty() ? std::string("一张照片") : pick.caption) +
+                  "」。用一两句自然的话带过，不要写文件路径。";
   out.ok = true;
   out.content = detail::truncate(std::move(s));
   return out;

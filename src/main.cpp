@@ -9,6 +9,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -421,6 +422,23 @@ int main(int argc, char** argv) {
           out.push_back({p.path, p.caption});
         }
         return out;
+      },
+      // 告诉模型形象库有哪些场景标签可查（没匹配到时用）
+      [&portraits]() {
+        std::set<std::string> uniq;
+        for (const auto& p : portraits.all()) {
+          for (const auto& t : p.tags) {
+            if (!t.empty()) uniq.insert(t);
+          }
+        }
+        std::string s;
+        std::size_t n = 0;
+        for (const auto& t : uniq) {
+          if (n++ >= 24) break;
+          if (!s.empty()) s += "、";
+          s += t;
+        }
+        return s;
       }));
   }
 
