@@ -76,7 +76,8 @@ class Registry {
   [[nodiscard]] bool empty() const;
   [[nodiscard]] std::size_t size() const;
   // 生成 OpenAI tools 数组（空注册表返回空数组）
-  [[nodiscard]] std::string openai_tools_json() const;
+  [[nodiscard]] std::string openai_tools_json(
+      const std::function<bool(const std::string&)>& filter = {}) const;
   Outcome run(const Call& call);
 
  private:
@@ -121,8 +122,12 @@ class ImageSearchTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
-    return "发一张你自己的图片给对方。在自己的形象库里按场景/标签找，"
-           "找到的图会随你的回复一起发出。适合对方想看你、或聊到相关场景时用。";
+    return "发一张你自己的图片给对方。在自己形象库里按场景/标签找，"
+           "找到的图会随回复一起发出。适合对方想看你、或聊到相关场景时用。\n"
+           "参数说明：query 填**具体场景词**（如「吃饭」「生气」「发呆」「睡觉」），"
+           "不要填「照片」「图片」「你的样子」这种泛指词——形象库按场景标签索引，"
+           "泛指词匹配不到标签。\n"
+           "即使 query 没匹配到，也会随便发一张库里的图，所以放心调用。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -333,11 +338,14 @@ std::size_t Registry::size() const {
   return tools_.size();
 }
 
-std::string Registry::openai_tools_json() const {
+std::string Registry::openai_tools_json(const std::function<bool(const std::string&)>& filter) const {
   json arr = json::array();
   {
     std::lock_guard<std::mutex> lock(mu_);
     for (const auto& [name, tool] : tools_) {
+      // 按通道能力过滤：微信不支持语音气泡，就不该把 send_voice 暴露给它。
+      // 模型看不到工具就不会调，避免白跑一次 TTS 再被静默丢弃。
+      if (filter && !filter(name)) continue;
       json params;
       try {
         params = json::parse(tool->parameters_schema());

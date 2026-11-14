@@ -648,9 +648,17 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     }
   }
 
-  // 工具声明：只在注册表非空时带上
+  // 工具声明：只在注册表非空时带上。
+  // 按通道能力过滤掉该通道做不了的：微信的 bot 外发语音气泡客户端不渲染
+  // （腾讯 iLink 限制），所以不把 send_voice 暴露给微信——模型看不到就不会调，
+  // 省一次 TTS 合成，也不会出现「说了要发语音但用户什么也没收到」。
   if (deps_.tools != nullptr && !deps_.tools->empty()) {
-    req.tools_json = deps_.tools->openai_tools_json();
+    const bool voice_ok = cap.supports_voice_out;
+    req.tools_json = deps_.tools->openai_tools_json(
+        [voice_ok](const std::string& name) {
+          if (name == "send_voice" && !voice_ok) return false;
+          return true;
+        });
   }
 
   auto resp = deps_.chat->complete(req);
