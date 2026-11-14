@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -26,6 +27,7 @@ import fish.guard;
 import fish.meme;
 import fish.persona;
 import fish.api;
+import fish.control;
 import fish.channels;
 import fish.dispatcher;
 import fish.orchestrator;
@@ -413,13 +415,13 @@ int main(int argc, char** argv) {
   // 本地图片检索：按标签在形象库里找
   {
     tools.add(std::make_shared<fish::tool::ImageSearchTool>(
-        [&portraits](const std::string& query) {
-          std::vector<std::string> out;
-          for (const auto& p : portraits.find_by_tag(query)) {
-            out.push_back(p.path + " | " + p.caption);
-          }
-          return out;
-        }));
+      [&portraits](const std::string& query) {
+        std::vector<fish::tool::ImageSearchTool::Hit> out;
+        for (const auto& p : portraits.find_by_tag(query)) {
+          out.push_back({p.path, p.caption});
+        }
+        return out;
+      }));
   }
 
   // 网络热梗：本地库优先，未命中时可选联网并写回
@@ -673,12 +675,22 @@ int main(int argc, char** argv) {
       .field("config", opt.config_path)
       .field("channels", static_cast<long long>(channels.size()));
 
+  // ── 每通道收消息统计 ──
+  // 声明提前到 API 启动之前：/v1/status 要读它，回调捕获的是指针表，
+  // 通道线程在后面才往里填。
+  std::vector<std::unique_ptr<ChannelStats>> stats;
+  stats.reserve(channels.size());
+  for (std::size_t i = 0; i < channels.size(); ++i) {
+    stats.push_back(std::make_unique<ChannelStats>());
+  }
+
   // ── 控制面 API ──
   //
-  // 只暴露 API，不带 UI，供另一个进程管理人格。
+  // 只暴露 API，不带 UI，供另一个进程管理人格 / 配置 / 扫码登录。
   // 默认不启动（port=0），要开就在配置里写：
   //   [api] port = 8765
   // token 从环境变量读（FEIYU_API_TOKEN），不写进配置和代码。
+  std::unique_ptr<fish::control::ControlService> control;
   std::unique_ptr<fish::api::Server> api_server;
   {
     const auto port = static_cast<int>(cfg.get_int_or("api.port", 0));
@@ -698,7 +710,32 @@ int main(int argc, char** argv) {
         // 不静默降级成无鉴权：宁可不起，也不能裸奔
         api_server.reset();
       } else {
-        api_server = std::make_unique<fish::api::Server>(ac, persona_store.get());
+        // 控制面要能改 config.toml 和 .env.local，所以必须知道它们的真实路径。
+        // .env.local 与 config.toml 同目录（部署脚本保证这一点）。
+        fish::control::ControlService::Config cc;
+        cc.config_path = opt.config_path;
+        cc.env_path = (std::filesystem::path(opt.config_path).parent_path() /
+                       ".env.local")
+                          .string();
+        control = std::make_unique<fish::control::ControlService>(cc);
+
+        api_server = std::make_unique<fish::api::Server>(ac, persona_store.get(),
+                                                         control.get());
+        // /v1/status 的通道信息：用回调注入，api 模块不需要认识 ChannelStats
+        api_server->set_status_provider([&stats, &channel_names]() {
+          std::string out = "[";
+          for (std::size_t i = 0; i < channel_names.size(); ++i) {
+            if (i > 0) out += ",";
+            out += R"({"name":")" + channel_names[i] + R"(","connected":true,"received":)";
+            out += std::to_string(i < stats.size() ? stats[i]->polled.load() : 0);
+            out += R"(,"errors":)";
+            out += std::to_string(i < stats.size() ? stats[i]->errors.load() : 0);
+            out += "}";
+          }
+          out += "]";
+          return out;
+        });
+
         auto ae = api_server->start();
         if (!ae.ok()) {
           fish::log::log_line(fish::log::LogLevel::kError, "api", "start_failed")
@@ -712,7 +749,9 @@ int main(int argc, char** argv) {
   // ── 调度器：通道线程只 poll，处理在线程池里跑 ──
   // 这样慢的模型调用不会阻塞收消息，多会话可真正并行。
   fish::session::SessionRegistry sessions;
-  fish::dispatcher::Dispatcher dispatcher({.threads = 0});
+  // 线程数从配置读，0 表示自动（min(核数, 8)，至少 2）
+  fish::dispatcher::Dispatcher dispatcher(
+      {.threads = static_cast<std::size_t>(cfg.get_int_or("dispatcher.threads", 0))});
 
   {
     // handler 捕获各通道指针，按 session 的 channel 名找到对应通道
@@ -737,13 +776,9 @@ int main(int argc, char** argv) {
 
   // ── 每通道一个收消息线程 ──
   std::vector<std::thread> workers;
-  std::vector<std::unique_ptr<ChannelStats>> stats;
-  stats.reserve(channels.size());
 
   for (std::size_t i = 0; i < channels.size(); ++i) {
-    auto st = std::make_unique<ChannelStats>();
-    auto* st_ptr = st.get();
-    stats.push_back(std::move(st));
+    auto* st_ptr = stats[i].get();
 
     fish::core::IChannel* raw = channels[i].get();
     const std::string name = channel_names[i];

@@ -13,6 +13,7 @@ module;
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <atomic>
 #include <functional>
@@ -28,6 +29,7 @@ export module fish.api;
 import fish.core;
 import fish.log;
 import fish.persona;
+import fish.control;
 
 export namespace fish::api {
 
@@ -59,11 +61,14 @@ class Server {
     std::string bind_addr{"127.0.0.1"};
     int port{0};          // 0 = 不启动
     AuthConfig auth;
+    // 版本号与启动时刻，/healthz 与 /v1/status 要报
+    std::string version{"0.2.0"};
   };
 
   using Handler = std::function<Response(const Request&)>;
 
-  Server(Config cfg, fish::persona::PersonaStore* store);
+  Server(Config cfg, fish::persona::PersonaStore* store,
+         fish::control::ControlService* control = nullptr);
   ~Server();
 
   Server(const Server&) = delete;
@@ -79,6 +84,12 @@ class Server {
   // 注册额外路由（保留扩展位）
   void route(const std::string& method, const std::string& path, Handler h);
 
+  // 注册运行时状态回调，供 /v1/status 返回通道连接情况。
+  // 用回调而不是持有 dispatcher：api 不该知道 dispatcher 存在。
+  void set_status_provider(std::function<std::string()> cb) {
+    status_cb_ = std::move(cb);
+  }
+
  private:
   void accept_loop();
   void handle_connection(int fd);
@@ -88,8 +99,13 @@ class Server {
 
   Config cfg_;
   fish::persona::PersonaStore* store_{nullptr};
+  fish::control::ControlService* control_{nullptr};
   std::map<std::string, Handler> routes_;   // "GET /x" → handler
   std::mutex routes_mu_;
+  std::function<std::string()> status_cb_;
+
+  // 启动时刻，用来算 uptime
+  std::chrono::steady_clock::time_point started_at_{std::chrono::steady_clock::now()};
 
   int listen_fd_{-1};
   int actual_port_{0};
@@ -157,7 +173,7 @@ std::string json_escape(const std::string& s) {
 
 // 从简单 JSON 对象里取一个字符串字段。
 // 只处理 {"key":"value"} 这种扁平结构——控制面参数就是这么多，
-// 上完整 JSON 解析器不值当。value 支持常规转义。
+// 上完整 JSON 解析器不值当。value 支持常规转义，包括 \uXXXX。
 bool json_get_string(const std::string& json, const std::string& key, std::string* out) {
   const std::string needle = "\"" + key + "\"";
   auto pos = json.find(needle);
@@ -166,6 +182,40 @@ bool json_get_string(const std::string& json, const std::string& key, std::strin
   if (pos == std::string::npos) return false;
   pos = json.find('"', pos);
   if (pos == std::string::npos) return false;
+
+  // 把 \uXXXX 的一个码元转成数值，失败返回 -1
+  const auto hex4 = [&json](std::size_t at) -> long {
+    if (at + 4 > json.size()) return -1;
+    long v = 0;
+    for (std::size_t k = 0; k < 4; ++k) {
+      const char h = json[at + k];
+      v <<= 4;
+      if (h >= '0' && h <= '9') v |= (h - '0');
+      else if (h >= 'a' && h <= 'f') v |= (h - 'a' + 10);
+      else if (h >= 'A' && h <= 'F') v |= (h - 'A' + 10);
+      else return -1;
+    }
+    return v;
+  };
+
+  // 码点 → UTF-8
+  const auto append_utf8 = [](std::string& s, unsigned cp) {
+    if (cp <= 0x7F) {
+      s += static_cast<char>(cp);
+    } else if (cp <= 0x7FF) {
+      s += static_cast<char>(0xC0 | (cp >> 6));
+      s += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+      s += static_cast<char>(0xE0 | (cp >> 12));
+      s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+      s += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+      s += static_cast<char>(0xF0 | (cp >> 18));
+      s += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+      s += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+      s += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+  };
 
   std::string val;
   for (std::size_t i = pos + 1; i < json.size(); ++i) {
@@ -176,9 +226,33 @@ bool json_get_string(const std::string& json, const std::string& key, std::strin
         case 'n': val += '\n'; break;
         case 'r': val += '\r'; break;
         case 't': val += '\t'; break;
+        case 'b': val += '\b'; break;
+        case 'f': val += '\f'; break;
         case '"': val += '"'; break;
         case '\\': val += '\\'; break;
         case '/': val += '/'; break;
+        case 'u': {
+          // 关键：早期没处理 \u，`default: val += n` 把 'u' 当普通字符加进去，
+          // "\u4e2d" 变成字面量 "u4e2d" —— 中文全部变成乱码。
+          const long hi = hex4(i + 1);
+          if (hi < 0) {
+            val += 'u';   // 非法转义，原样保留
+            break;
+          }
+          i += 4;
+          unsigned cp = static_cast<unsigned>(hi);
+          // 代理对：\uD800-\uDBFF 后面必须跟 \uDC00-\uDFFF
+          if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < json.size() &&
+              json[i + 1] == '\\' && json[i + 2] == 'u') {
+            const long lo = hex4(i + 3);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+              cp = 0x10000 + ((cp - 0xD800) << 10) + static_cast<unsigned>(lo - 0xDC00);
+              i += 6;
+            }
+          }
+          append_utf8(val, cp);
+          break;
+        }
         default: val += n;
       }
       continue;
@@ -278,8 +352,9 @@ std::string build_response(const Response& resp) {
 
 // ── Server ──────────────────────────────────────────────
 
-Server::Server(Config cfg, fish::persona::PersonaStore* store)
-    : cfg_(std::move(cfg)), store_(store) {}
+Server::Server(Config cfg, fish::persona::PersonaStore* store,
+               fish::control::ControlService* control)
+    : cfg_(std::move(cfg)), store_(store), control_(control) {}
 
 Server::~Server() { stop(); }
 
@@ -388,7 +463,150 @@ bool Server::check_auth(const Request& req) const {
 Response Server::builtin_route(const Request& req) {
   const std::string path = path_only(req.path);
 
+  // ── 健康检查与版本 ──
   // /healthz 在 dispatch 里已处理（免鉴权），这里不再重复。
+  if (req.method == "GET" && path == "/v1/status") {
+    const auto up = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - started_at_)
+                        .count();
+    std::string body = R"({"version":")" + json_escape(cfg_.version) +
+                       R"(","uptime_s":)" + std::to_string(up) + R"(,"channels":)";
+    body += status_cb_ ? status_cb_() : "[]";
+    body += "}";
+    Response r;
+    r.body = std::move(body);
+    return r;
+  }
+
+  // ── 配置读写 ──
+  if (control_ != nullptr) {
+    if (req.method == "GET" && path == "/v1/config") {
+      auto j = control_->config_json();
+      Response r;
+      if (!j.ok()) {
+        r.status = 500;
+        r.body = R"({"error":"config_read_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "PUT" && path == "/v1/config") {
+      std::vector<std::string> changed;
+      bool restart = false;
+      auto e = control_->apply_config_json(req.body, &changed, &restart);
+      Response r;
+      if (!e.ok()) {
+        r.status = (e.code == fish::core::ErrorCode::kBadRequest) ? 400 : 500;
+        std::string items;
+        for (const auto& c : changed) {
+          if (!items.empty()) items += ",";
+          items += R"(")" + json_escape(c) + R"(")";
+        }
+        r.body = R"({"error":"config_write_failed","detail":")" +
+                 json_escape(e.detail) + R"(","changed":[)" + items + "]}";
+        return r;
+      }
+      std::string items;
+      for (const auto& c : changed) {
+        if (!items.empty()) items += ",";
+        items += R"(")" + json_escape(c) + R"(")";
+      }
+      r.body = std::string(R"({"ok":true,"changed":[)") + items +
+               R"(],"restart_required":)" + (restart ? "true" : "false") + "}";
+      return r;
+    }
+
+    // ── 渠道测试 ──
+    if (req.method == "POST" && path == "/v1/channel/qq/test") {
+      std::string app_id, app_secret;
+      json_get_string(req.body, "app_id", &app_id);
+      json_get_string(req.body, "app_secret", &app_secret);
+      if (app_secret == "__keep__") app_secret.clear();
+      auto j = control_->qq_test(app_id, app_secret);
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"ok":false,"error":"upstream","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "POST" && path == "/v1/channel/wechat/test") {
+      std::string tok;
+      json_get_string(req.body, "bot_token", &tok);
+      if (tok == "__keep__") tok.clear();
+      auto j = control_->wechat_test(tok);
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"ok":false,"error":"upstream","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    // ── QQ 扫码 ──
+    if (req.method == "POST" && path == "/v1/channel/qq/qr") {
+      std::string source;
+      json_get_string(req.body, "source", &source);
+      auto j = control_->qq_qr_create(source);
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"error":"qr_create_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "GET" && path == "/v1/channel/qq/qr/status") {
+      auto j = control_->qq_qr_status(query_param(req.path, "task_id"));
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"status":"error","detail":")" + json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    // ── 微信扫码 ──
+    if (req.method == "POST" && path == "/v1/channel/wechat/qr") {
+      auto j = control_->wechat_qr_create();
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"error":"qr_create_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "GET" && path == "/v1/channel/wechat/qr/status") {
+      auto j = control_->wechat_qr_status(query_param(req.path, "qrcode"));
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"status":"error","detail":")" + json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+  }
 
   if (store_ == nullptr) {
     Response r;
@@ -510,8 +728,12 @@ Response Server::dispatch(const Request& req) {
   // 而 /healthz 不泄露任何信息（固定返回 ok）。
   // 放在鉴权检查之前，否则监控永远只能拿到 401。
   if (req.method == "GET" && path_only(req.path) == "/healthz") {
+    const auto up = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - started_at_)
+                        .count();
     Response r;
-    r.body = R"({"ok":true})";
+    r.body = R"({"ok":true,"version":")" + json_escape(cfg_.version) +
+             R"(","uptime_s":)" + std::to_string(up) + "}";
     return r;
   }
 

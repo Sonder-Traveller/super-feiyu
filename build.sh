@@ -18,11 +18,11 @@ OUT="${OUT:-build}"
 # 加大 ulimit -s 也没用 —— 是编译器处理相对路径时的 bug，不是代码问题。
 OUT_ABS="$(cd "$SRC_DIR" && mkdir -p "$OUT" && cd "$OUT" && pwd)"
 
-INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc \
+INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc -Ithird_party/qrcodegen \
      -Ithird_party/thread-pool/pool/include)
 # 编译顺序：依赖在前。
 # persona / api 只依赖 core + log，所以排在 capability 之后、orchestrator 之前。
-MODULES=(core log config memory capability probe media image meme persona api session tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
+MODULES=(core log config memory capability probe media image meme persona control api session tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
 
 if [[ "${1:-}" == "--clean" ]]; then
   rm -rf "$OUT"
@@ -52,6 +52,15 @@ for m in "${MODULES[@]}"; do
   FM+=("-fmodule-file=fish.$m=$OUT_ABS/pcm/fish.$m.pcm")
 done
 
+# 第三方普通 TU（非模块）：qrcodegen 是 MIT 的单文件实现，
+# 不改成模块——改动它就得跟上游同步维护，得不偿失。
+EXTRA_OBJS=()
+for f in third_party/qrcodegen/qrcodegen.cpp; do
+  obj="$OUT/obj/$(basename "${f%.cpp}").o"
+  "$CXX" -std=c++20 -Ithird_party/qrcodegen -c "$f" -o "$obj"
+  EXTRA_OBJS+=("$obj")
+done
+
 echo "==> 3/4 编译主程序与测试"
 "$CXX" -std=c++20 "${INC[@]}" "${FM[@]}" -c src/main.cpp -o "$OUT/obj/main.o"
 
@@ -74,10 +83,10 @@ done
 echo "    编译了 ${#COMPILED_TESTS[@]} 个测试: ${COMPILED_TESTS[*]}"
 
 echo "==> 4/4 链接"
-LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -lpthread -Wl,-rpath,"$PREFIX/lib")
-"$CXX" "$OUT/obj/main.o" "$OUT"/obj/fish.*.o -o "$OUT/super-feiyu" "${LIBS[@]}"
+LIBS=(-L"$PREFIX/lib" -lcurl -lsqlite3 -lz -lcrypto -lpthread -Wl,-rpath,"$PREFIX/lib")
+"$CXX" "$OUT/obj/main.o" "$OUT"/obj/fish.*.o "${EXTRA_OBJS[@]}" -o "$OUT/super-feiyu" "${LIBS[@]}"
 for t in "${COMPILED_TESTS[@]}"; do
-  "$CXX" "$OUT/obj/$t.o" "$OUT"/obj/fish.*.o -o "$OUT/$t" "${LIBS[@]}"
+  "$CXX" "$OUT/obj/$t.o" "$OUT"/obj/fish.*.o "${EXTRA_OBJS[@]}" -o "$OUT/$t" "${LIBS[@]}"
 done
 
 echo
