@@ -546,16 +546,18 @@ int main(int argc, char** argv) {
       .field("count", static_cast<long long>(tools.size()));
 
   // ── 安全防护 ──
+  // 长度上限默认 0（不限制）。模型上下文 1M tokens，用户在正常使用中
+  // 发的消息、模型给的回复都不该被程序砍。需要时由配置显式设值。
   fish::guard::InputGuard::Config guard_in_cfg;
   guard_in_cfg.max_bytes =
-      static_cast<std::size_t>(cfg.get_int_or("guard.max_input_bytes", 8000));
+      static_cast<std::size_t>(cfg.get_int_or("guard.max_input_bytes", 0));
   guard_in_cfg.detect_injection = cfg.get_bool_or("guard.detect_injection", true);
   guard_in_cfg.reject_injection = cfg.get_bool_or("guard.reject_injection", true);
   fish::guard::InputGuard input_guard(guard_in_cfg);
 
   fish::guard::OutputGuard::Config guard_out_cfg;
   guard_out_cfg.max_bytes =
-      static_cast<std::size_t>(cfg.get_int_or("guard.max_output_bytes", 4000));
+      static_cast<std::size_t>(cfg.get_int_or("guard.max_output_bytes", 0));
   guard_out_cfg.redact_secrets = cfg.get_bool_or("guard.redact_secrets", true);
   guard_out_cfg.strip_links = cfg.get_bool_or("guard.strip_links", true);
   fish::guard::OutputGuard output_guard(guard_out_cfg);
@@ -577,7 +579,7 @@ int main(int argc, char** argv) {
   deps.portraits = &portraits;
   deps.media = &media_cache;
   deps.tools = &tools;
-  deps.max_tool_rounds = static_cast<int>(cfg.get_int_or("tool.max_rounds", 3));
+  deps.max_tool_rounds = static_cast<int>(cfg.get_int_or("tool.max_rounds", 0));
   deps.input_guard = &input_guard;
   deps.output_guard = &output_guard;
   deps.rate_limiter = &rate_limiter;

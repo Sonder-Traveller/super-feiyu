@@ -118,10 +118,6 @@ class ImageSearchTool final : public ITool {
 
   explicit ImageSearchTool(Lister l) : list_(std::move(l)) {}
 
-  // 一次最多发几张。形象库是本地文件，一次发太多会刷屏，
-  // 也容易被平台判成异常。
-  static constexpr int kMaxSend = 1;
-
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
     return "从你自己的形象库里挑一张图发给对方。\n"
@@ -283,15 +279,14 @@ constexpr const char* kSourceWarning =
     "5. 不确定就说不确定。编一个答案被拆穿，比直接说不知道难看得多。";
 
 // 工具结果给模型看之前的截断，避免超长内容污染上下文
-constexpr std::size_t kMaxContentBytes = 4000;
-
-std::string truncate(std::string s, std::size_t limit = kMaxContentBytes) {
-  if (s.size() <= limit) return s;
-  // 按 UTF-8 边界回退，避免截断半个汉字
-  std::size_t cut = limit;
-  while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
-  s.resize(cut);
-  s += "\n…（内容过长已截断）";
+// 工具结果不截断。
+//
+// 原来有个 4000 字节上限（后来加到 256KB），对「形象库清单」这种需要
+// 完整列举的结果都是错的：截断了模型就以为库里就这么多，找不到用户要的图。
+// 模型上下文 1M tokens，工具结果几万字节完全不是负担——上限应该由
+// 上下文预算决定，不该在工具层拍一个数字。
+// 这里只保留一个恒等包装，调用点不用改，也不再有截断行为。
+std::string truncate(std::string s, std::size_t /*unused*/ = 0) {
   return s;
 }
 
@@ -475,17 +470,14 @@ Outcome ImageSearchTool::run(const Call& call) {
   // 没给 index：把完整清单交给模型，让它自己挑。
   // 这里不做任何关键词匹配、不做随机兜底——发哪张是模型的表达意图，
   // 我们只负责把「有哪些图、每张是什么内容」如实摆出来。
+  //
+  // 全量列出：模型上下文 1M tokens，129 条清单约 5KB，完全不值得截断。
+  // 截断反而让模型以为「库里就这么多」，找不到用户想要的那张。
   if (idx_in < 0) {
     std::string s = "形象库共 " + std::to_string(all.size()) + " 张，清单：\n";
-    // 全量列出会撑长上下文（100+ 张）。截到 60 条，仍远超一次对话需要。
-    const std::size_t show = std::min<std::size_t>(all.size(), 60);
-    for (std::size_t i = 0; i < show; ++i) {
+    for (std::size_t i = 0; i < all.size(); ++i) {
       s += "[" + std::to_string(i) + "] " +
            (all[i].caption.empty() ? "一张照片" : all[i].caption) + "\n";
-    }
-    if (all.size() > show) {
-      s += "…还有 " + std::to_string(all.size() - show) + " 张（序号 " +
-           std::to_string(show) + " 起）\n";
     }
     s += "选一张最合适的，带 index 参数再调用一次 send_image。";
     out.ok = true;

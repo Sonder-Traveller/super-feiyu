@@ -110,8 +110,12 @@ class Pipeline {
     fish::image::PortraitStore* portraits{nullptr};  // 形象库（可为空）
     // 工具注册表：模型可主动调用（网络搜索 / 图片检索 / 记忆检索）
     fish::tool::Registry* tools{nullptr};
-    // 单轮最多几次工具调用，防止无限循环
-    int max_tool_rounds{3};
+    // 单轮最多几次工具调用。0 = 不限制。
+    //
+    // 之前固定 3 轮，模型「先查清单再挑图」这种正常两步操作
+    // 加上重试就容易被卡断。需要几轮该由模型自己判断——
+    // 真死循环的话上游会先报错，不需要我们拍一个数字。
+    int max_tool_rounds{0};
     // 安全防护
     fish::guard::InputGuard* input_guard{nullptr};
     fish::guard::OutputGuard* output_guard{nullptr};
@@ -668,10 +672,15 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   std::vector<std::string> tool_voices;
 
   // 工具循环：模型要求调用工具 → 执行 → 把结果作为 user 消息追加 → 再问
-  // 最多 max_tool_rounds 轮，防止模型陷入死循环。
+  // max_tool_rounds = 0 表示不限制轮数，由模型自己决定什么时候停。
+  // 保留 64 轮这个硬兜底只为防止上游 bug 导致真正的死循环
+  // （正常对话连 5 轮都用不到）。
   int tool_round = 0;
+  constexpr int kHardSafetyRounds = 64;
   while (resp.ok() && resp.value->wants_tools() &&
-         deps_.tools != nullptr && tool_round < deps_.max_tool_rounds) {
+         deps_.tools != nullptr &&
+         (deps_.max_tool_rounds <= 0 ? tool_round < kHardSafetyRounds
+                                     : tool_round < deps_.max_tool_rounds)) {
     ++tool_round;
 
     // 把「模型想调用什么」和「工具返回了什么」拼成下一轮的上下文。

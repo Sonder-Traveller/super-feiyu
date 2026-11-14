@@ -43,8 +43,11 @@ struct Verdict {
 class InputGuard {
  public:
   struct Config {
-    // 单条消息最大字节数（防止超长内容打爆上下文）
-    std::size_t max_bytes{8000};
+    // 单条消息最大字节数。0 = 不限制（默认）。
+    //
+    // 模型上下文 1M tokens，用户发长文是正常需求，不该在程序里砍。
+    // 只在需要防打爆时由配置显式设置。
+    std::size_t max_bytes{0};
     // 是否检测提示注入
     bool detect_injection{true};
     // 命中注入时的策略：true=拒绝，false=降级处理（保留但加防护前缀）
@@ -67,8 +70,11 @@ class InputGuard {
 class OutputGuard {
  public:
   struct Config {
-    // 单条回复最大字节数
-    std::size_t max_bytes{4000};
+    // 单条回复最大字节数。0 = 不限制（默认）。
+    //
+    // 回复多长是模型自己的判断，之前 4000 字节（约 1300 汉字）
+    // 会把正常的长回答截断，用户体验很差。
+    std::size_t max_bytes{0};
     // 是否脱敏（API key、token、绝对路径等）
     bool redact_secrets{true};
     // 是否拦截链接（QQ 平台会因链接拒绝整条消息）
@@ -205,8 +211,8 @@ Verdict InputGuard::check(const fish::core::InboundMessage& msg) const {
     if (b.kind == fish::core::BlockKind::kText) text += b.text;
   }
 
-  // 1. 长度限制
-  if (text.size() > cfg_.max_bytes) {
+  // 1. 长度限制（max_bytes = 0 表示不限制）
+  if (cfg_.max_bytes > 0 && text.size() > cfg_.max_bytes) {
     v.allow = false;
     v.rule = "too_long";
     ::fish::log::log_line(::fish::log::LogLevel::kWarn, "guard", "input_blocked")
@@ -267,8 +273,8 @@ std::string OutputGuard::sanitize(const std::string& text) const {
     }
   }
 
-  // 3. 长度截断
-  if (out.size() > cfg_.max_bytes) {
+  // 3. 长度截断（max_bytes = 0 表示不限制）
+  if (cfg_.max_bytes > 0 && out.size() > cfg_.max_bytes) {
     std::size_t cut = cfg_.max_bytes;
     while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80) --cut;
     out.resize(cut);
