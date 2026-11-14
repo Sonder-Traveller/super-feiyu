@@ -535,24 +535,42 @@ void ConfigFile::set(const std::string& section, const std::string& key,
 }
 
 fish::core::Error ConfigFile::save() {
-  const std::string tmp = path_ + ".tmp";
+  // 原位写入 + 写前备份。
+  //
+  // 为什么不是「写 .tmp 再 rename」：
+  //   systemd ProtectSystem=strict 用 bind mount 放行单个文件时，
+  //   rename 替换操作的是父目录（unlink + link），目录没放行 → EROFS；
+  //   tmp 放 data/ 再 rename 又跨 bind 挂载 → EXDEV。两条路都死。
+  //   文件级白名单只支持原位写。
+  //
+  // 原子性补偿：写前把旧内容备份到 data/config.toml.bak（data/ 可写），
+  // 写失败时留有完整旧版可人工恢复。
   {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    // 1) 备份旧文件（失败不阻塞写：备份只是补偿措施）
+    std::error_code ec;
+    const auto parent = fs::path(path_).parent_path();
+    const auto bak_dir = parent / "data";
+    if (fs::exists(bak_dir, ec)) {
+      std::ifstream src(path_, std::ios::binary);
+      if (src) {
+        std::ofstream bak(bak_dir / "config.toml.bak",
+                          std::ios::binary | std::ios::trunc);
+        bak << src.rdbuf();
+      }
+    }
+
+    // 2) 原位截断重写
+    std::ofstream out(path_, std::ios::binary | std::ios::trunc);
     if (!out) {
       return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                     "config_write_failed:" + tmp);
+                                     "config_write_failed:" + path_);
     }
     for (const auto& l : lines_) out << l << '\n';
+    out.flush();
     if (!out) {
       return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                     "config_write_failed:" + tmp);
+                                     "config_write_failed:" + path_);
     }
-  }
-  std::error_code ec;
-  fs::rename(tmp, path_, ec);
-  if (ec) {
-    return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                   "config_rename_failed:" + ec.message());
   }
   return fish::core::Error::none();
 }
@@ -605,25 +623,34 @@ void EnvFile::set(const std::string& name, const std::string& value) {
 }
 
 fish::core::Error EnvFile::save() {
-  const std::string tmp = path_ + ".tmp";
+  // 原位写入（理由同 ConfigFile::save：文件级白名单不支持 rename 替换）。
+  // 写前备份到 data/.env.local.bak。写后强制 600。
   {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    std::error_code ec;
+    const auto parent = fs::path(path_).parent_path();
+    const auto bak_dir = parent / "data";
+    if (fs::exists(bak_dir, ec)) {
+      std::ifstream src(path_, std::ios::binary);
+      if (src) {
+        std::ofstream bak(bak_dir / ".env.local.bak",
+                          std::ios::binary | std::ios::trunc);
+        bak << src.rdbuf();
+      }
+    }
+
+    std::ofstream out(path_, std::ios::binary | std::ios::trunc);
     if (!out) {
       return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                     "env_write_failed:" + tmp);
+                                     "env_write_failed:" + path_);
     }
     for (const auto& l : lines_) out << l << '\n';
+    out.flush();
     if (!out) {
       return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                     "env_write_failed:" + tmp);
+                                     "env_write_failed:" + path_);
     }
   }
   std::error_code ec;
-  fs::rename(tmp, path_, ec);
-  if (ec) {
-    return fish::core::Error::make(fish::core::ErrorCode::kInternal,
-                                   "env_rename_failed:" + ec.message());
-  }
   // 密钥文件必须 600：同机其他用户读不到
   fs::permissions(path_, fs::perms::owner_read | fs::perms::owner_write,
                   fs::perm_options::replace, ec);
@@ -798,9 +825,19 @@ fish::core::Result<std::string> ControlService::config_json() {
     for (const auto& s : segs) node = &((*node)[s]);
 
     switch (f.kind) {
-      case FieldKind::kString:
-        (*node)[f.key] = cf.get_or(f.section, f.key, "");
+      case FieldKind::kString: {
+        // 字符串值若是 ${VAR} 占位符，返回解析后的实际值。
+        // 直接暴露 "${QQ_APP_ID}" 原文会让 GUI 把占位符当成配置内容
+        // 展示/回写，回写一次就把 ${VAR} 变成死字符串，环境变量从此失效。
+        const auto raw = cf.get(f.section, f.key);
+        if (raw && !raw->empty() && raw->size() > 4 && (*raw)[0] == '$' &&
+            (*raw)[1] == '{' && raw->back() == '}') {
+          (*node)[f.key] = resolved(f.section, f.key);
+        } else {
+          (*node)[f.key] = raw.value_or("");
+        }
         break;
+      }
       case FieldKind::kInt: {
         const auto raw = cf.get_or(f.section, f.key, "0");
         long long v = 0;
@@ -904,6 +941,13 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
         break;
       case FieldKind::kSecret:
         break;  // 上面已处理
+    }
+
+    // config.toml 里是 ${VAR} 占位符的键，写回时只有值真的变了才落盘。
+    // GUI 会把 GET 到的解析值原样 PUT 回来；如果和当前解析值一致，
+    // 绝不能把占位符覆盖成字面值，否则环境变量引用被杀死。
+    if (def->kind == FieldKind::kString && cf.env_var_of(def->section, def->key)) {
+      if (resolved(def->section, def->key) == text) continue;
     }
 
     if (cf.get_or(def->section, def->key, "") == text) continue;  // 无变化不记
