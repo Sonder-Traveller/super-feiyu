@@ -424,6 +424,21 @@ int main(int argc, char** argv) {
       }));
   }
 
+  // 语音发送：把模型给的一句话交给 TTS 合成，mp3 路径由工具交给管线。
+  // TTS 未启用时工具不可注册——模型看不到用不了，也不会白调。
+  if (tts != nullptr) {
+    tools.add(std::make_shared<fish::tool::SendVoiceTool>(
+        [tts_ptr = tts.get()](const std::string& text) -> std::string {
+          auto audio = tts_ptr->synthesize(text);
+          if (!audio.ok()) {
+            fish::log::log_line(fish::log::LogLevel::kWarn, "tool", "tts_failed")
+                .field("detail", audio.error.detail);
+            return {};
+          }
+          return *audio.value;
+        }));
+  }
+
   // 网络热梗：本地库优先，未命中时可选联网并写回
   {
     fish::meme::MemeStore::Config meme_cfg;

@@ -43,6 +43,18 @@ struct Outcome {
   std::string content;
   // 失败原因（仅日志用，不直接给模型）
   std::string error;
+  // 要随回复一起发出去的本地图片路径（可为空）。
+  //
+  // 为什么加这个：search_images 找到了图，但结果只是一行文本路径，
+  // 模型会把路径当正文念出来（「喏，`data/memory/portraits/x.png`」），
+  // 用户看到的是路径字符串而不是图片。
+  // 现在工具可以把「这张图要发出去」明确告诉管线，
+  // 由管线负责真正上传，模型只负责说话。
+  std::vector<std::string> image_paths;
+  // 要随回复一起发出去的本地语音文件路径。
+  // send_voice 工具用：TTS 合成落盘后把路径交给管线，
+  // 管线按通道能力决定是否真的能发（微信/QQ 已支持 mp3）。
+  std::vector<std::string> voice_paths;
 };
 
 // 工具定义
@@ -95,18 +107,54 @@ class MemorySearchTool final : public ITool {
 // 本地图片检索：在形象库里按标签/描述找图
 class ImageSearchTool final : public ITool {
  public:
-  using Searcher = std::function<std::vector<std::string>(const std::string& query)>;
+  // 一条命中的图片：路径 + 说明
+  struct Hit {
+    std::string path;
+    std::string caption;
+  };
+  using Searcher = std::function<std::vector<Hit>(const std::string& query)>;
   explicit ImageSearchTool(Searcher s) : search_(std::move(s)) {}
-  [[nodiscard]] std::string name() const override { return "search_images"; }
+
+  // 一次最多发几张。形象库是本地文件，一次发太多会刷屏，
+  // 也容易被平台判成异常。
+  static constexpr int kMaxSend = 1;
+
+  [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
-    return "在自己的形象库里按场景/标签查找图片。"
-           "当需要发一张符合当前情境的照片时使用。";
+    return "发一张你自己的图片给对方。在自己的形象库里按场景/标签找，"
+           "找到的图会随你的回复一起发出。适合对方想看你、或聊到相关场景时用。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
 
  private:
   Searcher search_;
+};
+
+// 语音发送：把一段文字合成语音发给对方
+//
+// 为什么做成工具而不是 [VOICE] 文本标记：
+//   标记方案要求模型在正文里嵌特殊字符串，管线再解析剥离——
+//   模型有时会把标记当台词抄出来（实测气泡里出现字面 "[VOICE]"），
+//   还要记忆里额外处理。工具调用是结构化的，参数即内容，
+//   成功/失败有明确反馈，记忆侧也干净。
+class SendVoiceTool final : public ITool {
+ public:
+  // TTS 合成回调：文本 → mp3 本地路径。由 main 注入（tool 不依赖 capability）。
+  using Synthesizer = std::function<std::string(const std::string& text)>;
+  explicit SendVoiceTool(Synthesizer s) : synth_(std::move(s)) {}
+
+  [[nodiscard]] std::string name() const override { return "send_voice"; }
+  [[nodiscard]] std::string description() const override {
+    return "把一句话用你的声音发给对方。适合语气需要、对方在用语音聊天、"
+           "或唱一句歌词的场合。参数就是你要念出来的话，"
+           "会用你自己的说话风格念。不要长篇大论，一两句为宜。";
+  }
+  [[nodiscard]] std::string parameters_schema() const override;
+  Outcome run(const Call& call) override;
+
+ private:
+  Synthesizer synth_;
 };
 
 // 网络搜索：查外部信息
@@ -396,18 +444,69 @@ Outcome ImageSearchTool::run(const Call& call) {
     out.content = "需要提供 query 参数。";
     return out;
   }
-  std::vector<std::string> hits;
+  std::vector<Hit> hits;
   if (search_) hits = search_(query);
 
   if (hits.empty()) {
     out.ok = true;
-    out.content = "形象库里没有匹配的图片。";
+    out.content = "形象库里没有匹配的图片。可以就这样回话，别编造照片内容。";
     return out;
   }
-  std::string s = "找到以下图片（路径 | 说明）：\n";
-  for (const auto& h : hits) s += "  " + h + "\n";
+
+  // 取第一张作为要发出去的图。
+  // 工具结果里**不要再给路径**：模型会把路径当正文念出来，
+  // 用户看到的是 "data/memory/portraits/xxx.png" 这种字符串。
+  // 只告诉它「发了什么」，路径由 image_paths 交给管线处理。
+  const auto& pick = hits.front();
+  out.image_paths.push_back(pick.path);
+
+  std::string s = "已经找到并发出下面这张图（你不用再描述路径）：\n";
+  s += "  图片内容：" + (pick.caption.empty() ? std::string("一张照片") : pick.caption) + "\n";
+  s += "  请用一两句自然的话带过，不要写出文件路径，也不要描述你没看到过的画面细节。\n";
   out.ok = true;
   out.content = detail::truncate(std::move(s));
+  return out;
+}
+
+// ── SendVoiceTool ───────────────────────────────────────
+
+std::string SendVoiceTool::parameters_schema() const {
+  return R"({
+    "type": "object",
+    "properties": {
+      "text": {"type": "string", "description": "要念出来的话，一两句以内，保持你的说话风格"}
+    },
+    "required": ["text"]
+  })";
+}
+
+Outcome SendVoiceTool::run(const Call& call) {
+  Outcome out;
+  const auto args = detail::parse_args(call.arguments_json);
+  const std::string text = detail::get_str(args, "text");
+  if (text.empty()) {
+    out.error = "missing_text";
+    out.content = "需要提供 text 参数。";
+    return out;
+  }
+  if (text.size() > 300) {
+    out.content = "要念的话太长了，语音只适合一两句。请用普通文本回复剩下的内容。";
+    out.ok = false;
+    return out;
+  }
+
+  const std::string path = synth_ ? synth_(text) : std::string();
+  if (path.empty()) {
+    out.ok = false;
+    out.error = "tts_failed";
+    out.content = "语音合成失败。请直接用文字回复，不要提语音的事。";
+    return out;
+  }
+
+  out.voice_paths.push_back(path);
+  out.ok = true;
+  out.content = "语音已经发出，内容是：「" + text + "」。"
+                "接下来可以再用文字补一句，也可以就此打住。";
   return out;
 }
 

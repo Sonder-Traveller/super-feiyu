@@ -150,7 +150,6 @@ class Pipeline {
 };
 
 // 解析回复里的图片标记，**支持多个**。
-//   [PHOTO]           → spec 为空（用形象库现成图）
 //   [PHOTO: 描述]      → spec 为描述（现场生成）
 // 一次回复里可以写多行，按出现顺序全部收集，并把标记从正文里删掉。
 //
@@ -158,7 +157,6 @@ class Pipeline {
 // 双向都要：出站能发多张，入站能收多张（入站本来就是 vector，不受限）。
 //
 // 导出是为了可测：这是纯函数，测试直接喂字符串断言结果。
-std::vector<std::string> extract_photo_markers(std::string& text);
 
 }  // namespace fish::orchestrator
 
@@ -295,14 +293,6 @@ std::string LayeredPersona::dynamic_suffix(const fish::core::InboundMessage& msg
   // 红线放最后：近因效应，执行力最强
   oss << "\n【本轮红线】只回这一条，不要主动开启新话题；不超过两句；不要暴露你是 AI。";
 
-  // 输出能力说明：模型不知道自己能发语音/图，必须明确告诉它标记语法。
-  // 没有这段，[VOICE]/[PHOTO] 机制永远不会被触发（实测教训）。
-  oss << "\n\n【输出标记】在回复文本里嵌入这些标记即可触发对应动作：\n"
-      << "- [VOICE]：把这条回复用语音发出。适合语气需要、或对方在语音场景时用；"
-      << "标记放在回复开头，标记后的文字就是要念的内容，仍保持你的说话风格。\n"
-      << "- [PHOTO]：从你的形象库发一张符合上下文的图。\n"
-      << "- [PHOTO: 描述]：库里没有合适的就现场生成。\n"
-      << "普通聊天不要每条都带标记，真需要时才用。";
   return oss.str();
 }
 
@@ -350,53 +340,6 @@ void Pipeline::maintenance() {
   }
 }
 
-// 解析回复里的图片标记，**支持多个**（声明处有完整说明）。
-std::vector<std::string> extract_photo_markers(std::string& text) {
-  std::vector<std::string> specs;
-  const std::string open = "[PHOTO";
-
-  std::size_t search_from = 0;
-  while (true) {
-    const auto pos = text.find(open, search_from);
-    if (pos == std::string::npos) break;
-
-    const auto close = text.find(']', pos);
-    if (close == std::string::npos) break;
-
-    const std::string inner = text.substr(pos + open.size(), close - pos - open.size());
-    // inner 形如 "" 或 ": 描述"；不是这两种就说明不是标记，跳过继续找
-    if (!inner.empty() && inner[0] != ':') {
-      search_from = pos + open.size();
-      continue;
-    }
-
-    std::string spec;
-    if (!inner.empty()) {
-      std::string s = inner.substr(1);
-      const auto b = s.find_first_not_of(" \t");
-      if (b != std::string::npos) spec = s.substr(b);
-    }
-    specs.push_back(std::move(spec));
-
-    // 删掉标记本身（含其后紧跟的一个换行，避免留下空行）
-    std::size_t erase_len = close - pos + 1;
-    while (close + erase_len < text.size() &&
-           (text[close + erase_len] == '\n' || text[close + erase_len] == ' ')) {
-      ++erase_len;
-    }
-    text.erase(pos, erase_len);
-    search_from = pos;   // 删除后原位置继续找，可能有连续标记
-  }
-
-  // 清理首尾空行
-  while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
-  const auto nb = text.find_first_not_of(" \t\n");
-  if (nb != std::string::npos) text = text.substr(nb);
-  else text.clear();
-
-  return specs;
-}
-
 // 把时间戳转成人类可读的相对/绝对描述，用于提示词。
 // 模型不理解 unix 时间戳，但理解"昨天""3 小时前"。
 // 超过 7 天用绝对日期，避免"很久以前"这种模糊表述。
@@ -429,24 +372,6 @@ std::string format_relative_time(std::int64_t at_ms) {
   std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1,
                 tm.tm_mday);
   return buf;
-}
-
-// 解析回复里的语音标记。
-//   [VOICE]  → 返回 true，并把标记从文本里删掉
-//
-// 设计：和 [PHOTO] 一样是显式标记，不是"有 TTS 就每条都发"。
-// 语音是重资源（合成耗时、占配额、用户侧还得点开听），
-// 应该只在语气需要时用，比如"懒得打字"的场合。
-bool extract_voice_marker(std::string& text) {
-  const std::string marker = "[VOICE]";
-  const auto pos = text.find(marker);
-  if (pos == std::string::npos) return false;
-  text.erase(pos, marker.size());
-  // 清理残留空白
-  while (!text.empty() && (text.back() == '\n' || text.back() == ' ')) text.pop_back();
-  const auto nb = text.find_first_not_of(" \t\n");
-  if (nb != std::string::npos) text = text.substr(nb);
-  return true;
 }
 
 Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
@@ -730,8 +655,9 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
   auto resp = deps_.chat->complete(req);
 
-  // 工具要求发出的图片（search_images 等），在工具循环里累加
+  // 工具要求发出的图片/语音（send_image / send_voice），在工具循环里累加
   std::vector<std::string> tool_images;
+  std::vector<std::string> tool_voices;
 
   // 工具循环：模型要求调用工具 → 执行 → 把结果作为 user 消息追加 → 再问
   // 最多 max_tool_rounds 轮，防止模型陷入死循环。
@@ -755,10 +681,14 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
           .field("ok", outcome.ok)
           .field("round", static_cast<long long>(tool_round));
 
-      // 工具主动要求发出去的图片（如 search_images 找到的立绘）。
+      // 工具主动要求发出去的图片（如 send_image 找到的立绘）。
       // 由管线负责上传，模型只负责说话——否则它会把文件路径当正文念出来。
       for (const auto& p : outcome.image_paths) {
         if (!p.empty()) tool_images.push_back(p);
+      }
+      // 工具合成的语音（send_voice），同样交给管线发送。
+      for (const auto& p : outcome.voice_paths) {
+        if (!p.empty()) tool_voices.push_back(p);
       }
 
       tool_block += "【工具调用】" + call.name + "\n";
@@ -793,34 +723,23 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   }
 
   // 9.8 输出防护：脱敏 + 去链接 + 长度截断
-  // 放在解析 [PHOTO] 之前：链接会被 QQ 拦截，先清掉再判断图片标记。
   if (deps_.output_guard != nullptr) {
     reply_text = deps_.output_guard->sanitize(reply_text);
   }
 
-  // 9.5 解析图片标记：[PHOTO] 取库存图，[PHOTO: 描述] 现场生成
-  // 支持多个标记，按出现顺序逐张发送。
-  const std::vector<std::string> photo_specs = extract_photo_markers(reply_text);
-  const bool wants_photo = !photo_specs.empty();
+  // 图片/语音全部走工具调用（send_image / send_voice），
+  // 没有 [PHOTO]/[VOICE] 文本标记了——标记会被模型当台词抄出来
+  // （实测气泡里出现字面 "[VOICE]"），工具调用是结构化的，没这个问题。
+  // 模型在工具结果文本里已被告知「图/语音已发出」，这里只负责挂 media 块。
 
-  // 记忆里要记「实际发出去的东西」，而不是模型原始输出。
-  // 模型输出 "[PHOTO]" 时，用户实际看到的是「喏」+ 一张图；
-  // 若把剥离后的空 reply_text 存进去，下一轮模型就不知道自己发过图，
-  // 会说出「我看不到自己发出去的东西」这种话。
-  //
-  // 标记格式必须让模型**无法当成台词模仿**：
-  // 早期用 "[发了一张自己的照片]"，结果模型把它当输出格式照抄，
-  // 在正文里写出「再试一次。[发了一张自己的照片]」这种动作描写。
-  // 改成「（附了一张图）」这种圆括号旁注 + 明确「这不是台词」的措辞。
+  // 记忆里记「实际发出去的东西」。用户指定的格式：[图片] 描述 / [语音] 内容。
   std::string remembered_reply = reply_text;
-  if (wants_photo) {
-    if (remembered_reply.empty()) remembered_reply = "喏";
-    // 多张时逐张记，别把 N 张压成一句
-    for (const auto& spec : photo_specs) {
-      remembered_reply += spec.empty()
-                              ? "（系统附了一张图）"
-                              : "（系统附了一张图：" + spec + "）";
-    }
+  for (const auto& path : tool_images) {
+    // 图的 caption 模型已经在工具结果里看到；记忆存路径便于之后重读
+    remembered_reply += " [图片] " + path;
+  }
+  for (std::size_t vi = 0; vi < tool_voices.size(); ++vi) {
+    remembered_reply += " [语音] （发了一条语音）";
   }
 
   // 出站图片的本地路径，稍后一起写进记忆。
@@ -837,14 +756,13 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
   text_block.kind = fish::core::BlockKind::kText;
   text_block.text = reply_text;
   // 只有图片、没有文字时，发一个极短的话兜底（空文本会被通道丢弃）
-  if (text_block.text.empty() && (wants_photo || !tool_images.empty())) {
+  if (text_block.text.empty() && (!tool_images.empty() || !tool_voices.empty())) {
     text_block.text = "喏";
   }
   if (!text_block.text.empty()) outgoing.push_back(std::move(text_block));
 
-  // 工具搜到的图片：直接发出去，不需要模型再写 [PHOTO] 标记。
-  // 放在 [PHOTO] 处理之前，保证「模型调了 search_images」时一定有图可发。
-  for (const auto& path : tool_images) {
+  // 工具搜到的图片：直接发出去。
+    for (const auto& path : tool_images) {
     fish::core::ContentBlock img;
     img.kind = fish::core::BlockKind::kImage;
     img.media_url = path;
@@ -855,81 +773,17 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
     ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "photo_attached")
         .field("source", "tool");
   }
-
-  // 图片：先查形象库（零成本、形象稳定），没有再现场生成。
-  // 支持多张：每个 [PHOTO] 标记对应一张，按顺序发送。
-  for (const auto& photo_spec : photo_specs) {
-    std::string photo_url;
-    std::string photo_src;
-
-    if (photo_spec.empty() && deps_.portraits != nullptr) {
-      const auto p = deps_.portraits->pick(query, fish::image::PickStrategy::kTagMatch);
-      if (!p.path.empty()) {
-        photo_url = p.path;
-        photo_src = "library";
-      }
-    }
-
-    if (photo_url.empty() && deps_.image != nullptr) {
-      fish::core::IImageModel::Request ireq;
-      ireq.prompt = photo_spec.empty()
-                        ? "一只蓝色的鲸鱼娘，日常抓拍，自然光线，手机随手拍的质感"
-                        : photo_spec;
-      auto gen = deps_.image->generate(ireq);
-      if (gen.ok()) {
-        photo_url = gen.value->image_url;
-        photo_src = "generated";
-        // 生成的图也进库，下次同类场景直接复用
-        if (deps_.portraits != nullptr && !photo_url.empty()) {
-          fish::image::Portrait np;
-          np.path = photo_url;
-          np.caption = photo_spec;
-          np.source = "generated";
-          deps_.portraits->add(np);
-        }
-      } else {
-        ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "image_failed")
-            .field("detail", gen.error.detail);
-      }
-    }
-
-    if (!photo_url.empty()) {
-      // 本地路径直接交给通道：QQ 官方支持二进制直传（file_data），
-      // 不需要公网 URL，也不需要开放任何端口。
-      fish::core::ContentBlock img;
-      img.kind = fish::core::BlockKind::kImage;
-      img.media_url = photo_url;
-      img.mime = "image/png";
-      img.role = "assistant";
-      outbound_images.push_back(photo_url);   // 记忆里要存路径
-      outgoing.push_back(std::move(img));
-      ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "photo_attached")
-          .field("source", photo_src);
-    }
-  }
-
-  // 语音：只在模型主动要求时发，不是每条都发。
-  //
-  // 之前是「只要 TTS 可用就每条都合成语音」，结果每条消息都带一段语音，
-  // 既吵又浪费配额。改成和图片一样的标记机制：模型用 [VOICE] 表示
-  // "这条我想用语音说"，通常用于语气需要表达的场合。
-  const bool wants_voice = extract_voice_marker(reply_text);
-  const bool voice_ok = wants_voice && deps_.tts != nullptr &&
-                        cap.supports_voice_out && !wants_photo &&
-                        (msg.kind == fish::core::ChatKind::kPrivate || deps_.group_voice);
-  if (voice_ok) {
-    auto audio = deps_.tts->synthesize(reply_text);
-    if (audio.ok()) {
-      fish::core::ContentBlock voice;
-      voice.kind = fish::core::BlockKind::kVoice;
-      voice.media_url = std::move(*audio.value);
-      voice.mime = "audio/mpeg";
-      outgoing.push_back(std::move(voice));
-      ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "voice_attached");
-    } else {
-      ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "tts_failed")
-          .field("detail", audio.error.detail);
-    }
+  // 语音：send_voice 工具合成的 mp3，直接挂 voice 块。
+  // 群聊也发——用不用由模型通过工具调用决定，不再按群/私聊硬限制。
+  for (const auto& path : tool_voices) {
+    fish::core::ContentBlock voice;
+    voice.kind = fish::core::BlockKind::kVoice;
+    voice.media_url = path;
+    voice.mime = "audio/mpeg";
+    voice.role = "assistant";
+    outgoing.push_back(std::move(voice));
+    ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "voice_attached")
+        .field("source", "tool");
   }
 
   // 出站条数上限。
