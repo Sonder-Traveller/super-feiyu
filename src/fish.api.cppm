@@ -669,6 +669,18 @@ bool Server::check_auth(const Request& req) const {
   }
   if (cfg_.auth.token.empty()) return false;
 
+  // 浏览器地址栏支持：?token=xxx 与 Authorization: Bearer 等价。
+  //
+  // 为什么需要：控制面是给操作者直接用的，浏览器地址栏塞不了自定义
+  // header，没有这个就只能 curl。凭据端点（返回明文 token 的那个）
+  // 仍然只认 header——query 参数会进浏览器历史和服务器日志，泄露面大。
+  {
+    const std::string qt = query_param(req.path, "token", false);
+    if (!qt.empty() && !cred_path && constant_time_equal(qt, cfg_.auth.token)) {
+      return true;
+    }
+  }
+
   const auto it = req.headers.find("authorization");
   if (it == req.headers.end()) return false;
 

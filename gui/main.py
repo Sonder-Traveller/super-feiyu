@@ -1229,6 +1229,29 @@ def main(page: ft.Page) -> None:
 
     tts_provider_dd = _mk_provider_dd("语音合成提供方", "tts_provider", "tts")
     tts_key = field("API Key", "", password=True)
+    # 音色下拉：只有 deepseek 提供方才有两个可选音色（官方 voice_id）。
+    # 其它提供方的音色是各自的长名字（edge 的 zh-CN-Xxx、火山的 ID），
+    # 手填进 config.toml 即可，不做下拉。
+    tts_voice_dd = ft.Dropdown(
+        label="音色", dense=True, text_size=13, border_color=BORDER,
+        options=[ft.dropdown.Option("stella", "stella · 海星（女声）"),
+                 ft.dropdown.Option("tide", "tide · 暗潮（男声）")],
+        visible=False,
+    )
+
+    def _sync_tts_voice_dd(p: str, current_voice: str = "") -> None:
+        """按 TTS 提供方显隐音色下拉（仅 deepseek 显示）。"""
+        tts_voice_dd.visible = (p == "deepseek")
+        if p == "deepseek":
+            # 现有配置里的 voice 是 stella/tide 就带上；空或别的厂商音色 → 默认 stella
+            tts_voice_dd.value = current_voice if current_voice in ("stella", "tide") else "stella"
+
+    def _on_tts_provider(e) -> None:
+        # 先按新 provider 同步音色下拉，再走通用的 key 清绑逻辑
+        _sync_tts_voice_dd(e.control.value or "")
+        _on_cap_provider("tts", e.control)
+
+    tts_provider_dd.on_select = _on_tts_provider
 
     search_provider_dd = _mk_provider_dd("搜索提供方", "search_provider", "search")
     search_key = field("API Key", "", password=True)
@@ -1407,6 +1430,8 @@ def main(page: ft.Page) -> None:
         tts_provider_dd.value = tts.get("provider") or None
         tts_key.value = ""
         tts_key.visible = not tts.get("key_ready", tts.get("api_key_set", False))
+        # 音色下拉：deepseek 时显示并带上 config 里的现值；其它提供方隐藏
+        _sync_tts_voice_dd(tts.get("provider") or "", tts.get("voice") or "")
         s = cap.get("search", {})
         search_provider_dd.value = s.get("provider") or None
         search_key.value = ""
@@ -1493,6 +1518,9 @@ def main(page: ft.Page) -> None:
         cap_payload("embedding", emb_provider_dd, emb_key)
         cap_payload("stt", stt_provider_dd, stt_key)
         cap_payload("tts", tts_provider_dd, tts_key)
+        # deepseek 提供方时把选中的音色一起保存（写进 capability.tts.voice）
+        if (tts_provider_dd.value == "deepseek" and tts_voice_dd.visible):
+            payload["capability"]["tts"]["voice"] = tts_voice_dd.value or "stella"
         cap_payload("search", search_provider_dd, search_key)
         cap_payload("document", doc_provider_dd, doc_key)
 
@@ -1564,6 +1592,7 @@ def main(page: ft.Page) -> None:
             glass(ft.Column([
                 section_title("语音合成", ""),
                 tts_provider_dd,
+                tts_voice_dd,
                 tts_key,
             ], spacing=10)),
             ft.Container(height=14),

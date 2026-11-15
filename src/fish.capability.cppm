@@ -1602,6 +1602,80 @@ class HttpTts final : public fish::core::ITextToSpeech {
   CircuitBreaker* breaker_;
 };
 
+// DeepSeek 官方语音合成（/v1/tools/tts）。
+//
+// 与 OpenAI 风格的 /audio/speech 完全不同——之前把 deepseek 走进 HttpTts
+// 请求的是 https://api.deepseek.com/audio/speech，官方没有这个端点，
+// 直接 404（实测复现）。差异点：
+//   - 端点：POST {base}/v1/tools/tts
+//   - 字段：text（不是 input）、voice_id（不是 voice，只有 stella/tide）
+//   - 格式：wav / pcm，音频在响应体里**流式**返回（curl 层面仍是
+//     一次完整 body，want_binary 收完即可）
+//   - 语种自动识别，没有语种参数；不支持语速调节
+//
+// 计费按字符（汉字算 2），单次最多 10 000 计费字符 / 30 分钟音频。
+// 文档：https://api-docs.deepseek.com/zh-cn/guides/tts
+class DeepseekTts final : public fish::core::ITextToSpeech {
+ public:
+  DeepseekTts(TtsConfig cfg, CircuitBreaker* b) : cfg_(std::move(cfg)), breaker_(b) {}
+
+  Result<std::string> synthesize(const std::string& text) override {
+    if (text.empty()) {
+      return Result<std::string>::fail(ErrorCode::kBadRequest, "tts_empty_text");
+    }
+
+    json payload;
+    payload["text"] = text;
+    // 音色：voice 字段就是 voice_id。空 → stella（官方默认）。
+    // GUI 侧给两个可选项（stella 女声 / tide 男声），值直接透传。
+    payload["voice_id"] = cfg_.voice.empty() ? "stella" : cfg_.voice;
+    // 官方只出 wav / pcm。QQ 上传收 mp3 最稳，先拿 wav 再用 ffmpeg 转
+    //（发出去之前由 ensure_format / 通道层处理）。
+    const std::string fmt = cfg_.format.empty() ? "wav" : cfg_.format;
+    payload["format"] = fmt == "pcm" ? "pcm" : "wav";
+    // QQ 语音气泡里 Markdown 符号念出来很难听，统一开启过滤
+    payload["filter_markdown"] = true;
+
+    HttpRequest req;
+    req.url = tts_endpoint();
+    req.headers = {{"Content-Type", "application/json"}};
+    if (!cfg_.api_key.empty()) {
+      req.headers["Authorization"] = "Bearer " + cfg_.api_key;
+    }
+    req.body = payload.dump();
+    req.timeout_ms = cfg_.timeout_ms > 0 ? cfg_.timeout_ms : 120000;
+    req.max_retries = 1;
+    req.want_binary = true;
+
+    auto resp = HttpClient::instance().perform(req, breaker_);
+    if (!resp.ok()) return Result<std::string>::fail(resp.error.code, resp.error.detail);
+    // 流式断流（文档明确说提前结束的响应视为失败）：
+    // wav 至少要 RIFF 头 + data 块，几百字节以下基本是坏的
+    if (resp.value->bytes.size() < 256) {
+      return Result<std::string>::fail(ErrorCode::kUpstreamUnavailable,
+                                       "tts_stream_truncated:" +
+                                           std::to_string(resp.value->bytes.size()) + "B");
+    }
+    return write_audio(resp.value->bytes, "wav");
+  }
+
+ private:
+  std::string tts_endpoint() const {
+    // base_url 为空 → 官方默认；配置里带不带 /v1 都能对上
+    const std::string base =
+        cfg_.base_url.empty() ? "https://api.deepseek.com" : cfg_.base_url;
+    if (!cfg_.path.empty()) return base + cfg_.path;
+    // base 以 /v1 结尾时避免拼出 /v1/v1
+    if (base.size() >= 3 && base.compare(base.size() - 3, 3, "/v1") == 0) {
+      return base + "/tools/tts";
+    }
+    return base + "/v1/tools/tts";
+  }
+
+  TtsConfig cfg_;
+  CircuitBreaker* breaker_;
+};
+
 // 火山引擎语音合成（v1 /api/v1/tts）。
 //
 // 为什么用 v1 而不是 v3：v3（/api/v3/tts/unidirectional）本质是流式的，
@@ -3135,6 +3209,10 @@ Result<std::unique_ptr<fish::core::ITextToSpeech>> make_tts(const TtsConfig& cfg
   if (cfg.provider == "volcengine") {
     return Result<std::unique_ptr<fish::core::ITextToSpeech>>::ok(
         std::make_unique<VolcengineTts>(cfg, &breaker_for(cfg.provider, "tts")));
+  }
+  if (cfg.provider == "deepseek") {
+    return Result<std::unique_ptr<fish::core::ITextToSpeech>>::ok(
+        std::make_unique<DeepseekTts>(cfg, &breaker_for(cfg.provider, "tts")));
   }
   return Result<std::unique_ptr<fish::core::ITextToSpeech>>::ok(
       std::make_unique<HttpTts>(cfg, &breaker_for(cfg.provider, "tts")));
