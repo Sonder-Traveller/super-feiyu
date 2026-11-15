@@ -1267,13 +1267,20 @@ class HttpStt final : public fish::core::ISpeechToText {
     if (!cfg_.api_key.empty()) headers["Authorization"] = "Bearer " + cfg_.api_key;
 
     std::vector<std::pair<std::string, std::string>> fields;
-    if (!cfg_.model.empty()) fields.emplace_back("model", cfg_.model);
-    // language=auto 时多数厂商要么不认、要么当成非法值，直接不发
-    if (!cfg_.language.empty() && cfg_.language != "auto") {
-      fields.emplace_back("language", cfg_.language);
+    // DeepSeek 官方 ASR 只收 file 一个字段（响应 {"text":...,"duration_ms":...}），
+    // 多余的 model / language / response_format 有被 400 的风险，直接不发。
+    // 其余厂商按 OpenAI /audio/transcriptions 风格带全。
+    const bool deepseek_asr = cfg_.path.rfind("/v1/tools/asr", 0) == 0 ||
+                              cfg_.base_url.find("api.deepseek.com") != std::string::npos;
+    if (!deepseek_asr) {
+      if (!cfg_.model.empty()) fields.emplace_back("model", cfg_.model);
+      // language=auto 时多数厂商要么不认、要么当成非法值，直接不发
+      if (!cfg_.language.empty() && cfg_.language != "auto") {
+        fields.emplace_back("language", cfg_.language);
+      }
+      // response_format：能返回 JSON 的都要 JSON，纯文本的厂商会忽略
+      fields.emplace_back("response_format", "json");
     }
-    // response_format：能返回 JSON 的都要 JSON，纯文本的厂商会忽略
-    fields.emplace_back("response_format", "json");
 
     std::vector<HttpRequest::FormFile> files;
     std::string mime;
