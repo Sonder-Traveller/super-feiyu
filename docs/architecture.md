@@ -83,13 +83,13 @@
 | `fish.doc` | **文档解析层**（上传 + 解析 PDF/Office/图片/表格） |
 | `fish.probe` | 上游能力探测与缓存 |
 | `fish.media` | 媒体去重缓存（内容哈希） |
-| `fish.image` | 立绘库（manifest 权威 + 目录扫描） |
-| `fish.meme` | 热梗库（本地优先 + 命中计数） |
+| `fish.image` | 立绘库（manifest 权威 + 目录扫描，列清单给模型挑） |
+| `fish.meme` | 热梗库（本地优先，列清单给模型挑；学到的写回） |
 | `fish.persona` | 人格分层拼装（稳定前缀 / 动态后缀） |
 | `fish.session` | 会话注册表 + 每会话互斥 |
 | `fish.control` | 配置 / 凭据 / 扫码绑定的控制面服务实现 |
 | `fish.api` | 控制面 HTTP API（带鉴权） |
-| `fish.tool` | 工具注册表（记忆 / 图片 / 搜索 / 抓取 / 梗） |
+| `fish.tool` | 工具注册表（记忆 / 图片 / 语音 / 搜索 / 抓取 / 梗） |
 | `fish.guard` | 输入注入防护 + 输出脱敏 + 限流 |
 | `fish.ws` | libcurl WebSocket 客户端 + 自动重连 |
 | `fish.qq_ws` | QQ 网关协议栈（op 码 / 心跳 / RESUME） |

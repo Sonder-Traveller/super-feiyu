@@ -76,13 +76,13 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 | `fish.doc` | **文档解析层**（PDF/Office/图片/表格） |
 | `fish.probe` | 上游能力探测与缓存 |
 | `fish.media` | 媒体去重缓存（内容哈希） |
-| `fish.image` | 立绘库（manifest 权威 + 目录扫描） |
-| `fish.meme` | 热梗库（本地优先 + 命中计数） |
+| `fish.image` | 立绘库（manifest 权威 + 目录扫描，**列清单给模型挑**） |
+| `fish.meme` | 热梗库（本地优先，**列清单给模型挑**；学到的写回） |
 | `fish.session` | 会话注册表 + 每会话互斥 |
 | `fish.persona` | 人格分层拼装（稳定前缀 / 动态后缀） |
 | `fish.control` | 配置 / 凭据 / 扫码绑定的控制面服务实现 |
 | `fish.api` | 控制面 HTTP API（人格管理，带鉴权） |
-| `fish.tool` | 工具注册表（记忆/图片/搜索/抓取/梗） |
+| `fish.tool` | 工具注册表（记忆 `search_memory` / 图片 `send_image` / 语音 `send_voice` / 热梗 `lookup_meme` / 联网 `web_search` `web_fetch`） |
 | `fish.guard` | 输入注入防护 + 输出脱敏 + 限流 |
 | `fish.ws` | libcurl WebSocket 客户端 + 自动重连 |
 | `fish.qq_ws` | QQ 网关协议栈（op 码/心跳/RESUME） |
@@ -119,6 +119,10 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 （默认仍是 131072 × 0.40，配置写更高也只按 50% 算）。在预算内全部原文
 进上下文；超了就 `compact()` —— 最早的部分压成滚动摘要，原文落盘到
 `episodes/` 并建索引，模型用 `search()` 自己检索。**不删任何一条。**
+
+**检索是两路**：向量余弦 + SQL `LIKE` 关键词，向量结果在前、关键词补足。
+这是**记忆召回**（模型主动调 `search_memory`），与热梗/图片「列清单让模型挑」
+不是一回事——热梗和图片**不做任何匹配**。
 
 详见 [docs/modules/memory.md](docs/modules/memory.md)。
 

@@ -96,8 +96,10 @@
 
 ### 8. 网络热梗学习
 - `fish.meme`：独立存储区 `data/memes/memes.tsv`，与记忆分开
-- 本地优先检索（关键词匹配，高频优先）
-- `lookup_meme` 工具：本地未命中且配了搜索后端时才联网，结果写回本地
+- **列清单，不做匹配**：不带 `index` 时把全部条目原样交给模型自己挑；
+  程序不做子串匹配、不猜「用户问的是哪个梗」
+- `lookup_meme` 工具：清单里没有的词，由模型用 `learn` 点名后
+  才联网查一次，结果写回本地；下次直接出现在清单里
 
 ### 9. web 工具接口化
 - 四种 provider：`deepseek` / `tavily` / `generic` / `none`
@@ -144,8 +146,8 @@
 ### P13: search provider 选择
 - **已接口化**：`deepseek` / `tavily` / `generic` / `none`
 - **generic** 可接任意 HTTP 端点（自建服务、聚合 API、本地桥接层）
-- **现状**：`provider = "none"`，所以 `tools_ready count=3`
-  （记忆 + 图片 + 热梗），没有 web 工具
+- **现状**：`capability.search.api_key` 未配时 web 工具不注册，
+  `tools_ready` 只有本地那几个（记忆 / 图片 / 语音 / 热梗）
 - **待办**：用户决定接哪个后端
 
 ### P14: 探测只覆盖 assistant 图片

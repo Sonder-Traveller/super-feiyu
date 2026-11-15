@@ -30,7 +30,7 @@
 | `fish.core` | 领域类型、`Result`、七类接口契约 | ✅ |
 | `fish.log` | 结构化单行 JSON 日志 | ✅ |
 | `fish.config` | TOML 子集 + `${VAR}` 展开 | ✅ |
-| `fish.memory` | 三层记忆、巩固、遗忘、RRF 检索 | ✅ |
+| `fish.memory` | 三层记忆、巩固、遗忘、向量 + LIKE 两路检索 | ✅ |
 | `fish.capability` | HTTP 客户端、熔断、多 provider 工厂 | ✅ |
 | `fish.ws` | libcurl WebSocket + 指数退避自动重连 | ✅ |
 | `fish.qq_ws` | QQ 网关协议栈 | ✅ |

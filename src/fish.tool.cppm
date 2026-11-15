@@ -135,7 +135,7 @@ class ImageSearchTool final : public ITool {
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
     return "查看并发送你自己的形象库图片。\n"
-           "第一次调用不要带 index：会返回**全部图片的清单**（序号 + 每张的内容说明）。\n"
+           "第一次调用不要带 index：会返回全部图片的清单。\n"
            "然后你读清单，挑出最贴合当前对话的一张，再带 index 调一次发出去。\n"
            "注意：没有「搜索」这回事，每次不带 index 都返回完整清单，"
            "所以不要反复用不同的词试探——清单里就是全部可用的图。";
@@ -162,9 +162,9 @@ class SendVoiceTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_voice"; }
   [[nodiscard]] std::string description() const override {
-    return "把一句话用你的声音发给对方。适合语气需要、对方在用语音聊天、"
-           "或唱一句歌词的场合。参数就是你要念出来的话，"
-           "会用你自己的说话风格念。不要长篇大论，一两句为宜。";
+    return "把一句话用你的声音发给对方。适合语气需要、或对方在用语音聊天的场合。"
+           "参数就是你要念出来的话，会用你自己的说话风格念。"
+           "不要长篇大论，一两句为宜。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -187,9 +187,8 @@ class WebSearchTool final : public ITool {
   [[nodiscard]] std::string description() const override {
     return "搜索互联网获取信息。适用于：近期事件、你不确定的事实、需要外部资料。\n"
            "提高结果质量的技巧：\n"
-           "- 优先搜原始出处（官方文档、当事人账号），而不是转述文章\n"
-           "- 加 site: 限定可信站点，如 site:github.com、site:gov.cn\n"
-           "- 加 after:2026 限定时间，避免搜到过时内容\n"
+           "- 优先搜原始出处，而不是转述文章\n"
+           "- 用搜索语法把范围限死在可信站点或时间窗，而不是泛泛地搜\n"
            "- 用「原文」「出处」「官方」这类词找一手来源\n"
            "注意：搜索结果里混着大量营销号和 AI 生成内容，"
            "多条结果说法一致也可能是因为互相转载。拿到结果后要自己判断可信度。";
@@ -223,9 +222,16 @@ class WebFetchTool final : public ITool {
   Fetcher fetch_;
 };
 
-// 网络热梗检索：本地库优先，未命中时联网学并记住。
-// 与 web_search 分开：热梗是高频、短小的查询，走本地库零成本；
-// 联网只在本地没有时才发生，且结果会写回本地 + 记进当前会话记忆。
+// 网络热梗：把本地库的**清单**交给模型自己挑，与 send_image 同一套做法。
+//
+// 为什么不做检索：
+//   以前这里是 search(query) 命中即返回。程序用子串去猜「模型在问哪个梗」，
+//   猜错的代价很大——命中一堆不相干条目、真正想要的被截掉、还反复联网。
+//   现在程序一个字都不猜：不带参数就给全部清单，模型自己找到那条，
+//   再带 index 取详情。判断交给模型，程序只负责如实摆出有哪些条目。
+//
+// 与 web_search 分开：热梗有本地库，平常零成本零联网；
+// 只有模型点名说了清单里没有的词（learn），才联网学一次并写回。
 class MemeLookupTool final : public ITool {
  public:
   struct Hit {
@@ -233,16 +239,23 @@ class MemeLookupTool final : public ITool {
     std::string meaning;  // 释义
     std::string usage;    // 用法示例
     std::string source;   // 来源：本地库 / provider 名（写回时存进 origin）
+    std::string aliases;  // 别名 / 变体（已用 、 拼好；可为空）
   };
-  // 本地检索（同步、零成本）
-  using LocalSearcher = std::function<std::vector<Hit>(const std::string& query)>;
-  // 外部补充。为空 = 纯本地模式（不联网）。
+  // 列出本地热梗库**全部**条目。不传查询词——没有「按词找」这回事。
+  //
+  // 不设条数上限：截断会让模型以为「库里就这么多」，反而找不到用户说的那条。
+  // 库长到几百条该处理的是数据规模，不是在这里悄悄砍。
+  using Lister = std::function<std::vector<Hit>()>;
+  // 按清单序号取详情（0 基，与 Lister 的顺序一致）。
+  // 返回 false = 序号越界。实现侧负责把「这条真的被用到」记进 hits。
+  using Detailer = std::function<bool(long long index, Hit* out)>;
+  // 联网学一个新梗。参数是模型点名的那个词（不是整句话）。
   //
   // error 出参：调用失败时写入原因（网络错、401、空结果等）。
   // 空字符串 = 调用成功（哪怕一条结果都没有）。
-  // 这样「provider 没启用」和「搜了但没搜到」在给模型的文案里能分开说。
+  // 这样「provider 没启用」和「查了但没查到」在给模型的文案里能分开说。
   using RemoteSearcher =
-      std::function<std::vector<Hit>(const std::string& query, std::string* error)>;
+      std::function<std::vector<Hit>(const std::string& term, std::string* error)>;
   // 写回本地库（可空）。返回实际新增条数。
   using Importer = std::function<int(const std::vector<Hit>& hits)>;
   // 把学到的梗记进当前会话的长期记忆（可空）。
@@ -251,42 +264,50 @@ class MemeLookupTool final : public ITool {
                                           const std::string& term,
                                           const std::string& meaning)>;
 
-  MemeLookupTool(LocalSearcher local, RemoteSearcher remote, Importer importer,
-                 MemoryWriter memory = {})
-      : local_(std::move(local)),
+  MemeLookupTool(Lister lister, Detailer detailer, RemoteSearcher remote,
+                 Importer importer, MemoryWriter memory = {})
+      : list_(std::move(lister)),
+        detail_(std::move(detailer)),
         remote_(std::move(remote)),
         importer_(std::move(importer)),
         memory_(std::move(memory)) {}
 
   [[nodiscard]] std::string name() const override { return "lookup_meme"; }
   [[nodiscard]] std::string description() const override {
-    return "查网络热梗 / 网络用语 / 缩写 / 谐音梗 / 黑话是什么意思、怎么用。\n"
+    return "查网络热梗 / 网络用语 / 缩写 / 谐音 / 黑话是什么意思、怎么用。\n"
            "\n"
-           "【什么时候用】遇到下面三种情况，**先查清楚再回答**：\n"
-           "1. 陌生词汇：对方说了个你不认识的词、缩写、谐音梗、网络黑话。\n"
-           "2. 无规则文字组合：看着不像正常词的一串字——拼音缩写、叠词、\n"
-           "   字母数字混排（比如 yyds、xswl、emo、栓Q 这种）。\n"
-           "3. 难以理解的事物：对方说的话、发的梗图文字你看不懂是什么意思。\n"
+           "【什么时候用】遇到下面三种情况，先弄清楚再回答：\n"
+           "1. 陌生词汇：对方说了个你不认识的词。\n"
+           "2. 无规则文字组合：一串看着不像正常词语的文字。\n"
+           "3. 看不懂的表达：对方说的话、或图片上的文字，你不确定是什么意思。\n"
            "\n"
-           "【怎么用】query 只填那个词本身（yyds、栓Q、尊嘟假嘟），\n"
-           "不要把整句话填进去。\n"
+           "【它怎么工作】\n"
+           "第一次调用不要带任何参数：会返回全部热梗条目的清单。\n"
+           "你读清单，找到对应的那一条，再带 index 调一次，"
+           "拿到它的完整释义和用法。\n"
+           "注意：**没有「搜索」这回事**，每次不带参数都返回完整清单，"
+           "所以不要反复用不同的词试探——清单里就是全部可用的条目。\n"
+           "清单可能很长，你只需要找其中一条。\n"
            "\n"
-           "【它怎么工作】先查你自己的热梗库，命中就直接返回释义和用法，\n"
-           "不联网；库里没有时会联网查一次，学到之后写回热梗库并记住——\n"
-           "同一个梗下次直接命中，不会再联网。查到的释义要**用来回答**，\n"
-           "不要原样背给用户。\n"
+           "【清单里没有的】带 learn 参数，把那个词原样填进去，"
+           "我会联网查一次，学到就写进库里并告诉你释义。"
+           "learn 只填那个词本身，不要填整句话。\n"
            "\n"
-           "【边界】只查网络用语 / 梗 / 黑话。查一般事实（比如「DeepSeek 是什么」\n"
-           "「今天天气」）用 web_search，别用这个工具。\n"
+           "【边界】只管网络用语 / 梗 / 黑话。查一般事实用 web_search，"
+           "不要用这个工具。\n"
            "\n"
-           "【没查到怎么办】如果它说没查到，就如实说不认识，或直接问对方，\n"
-           "**不要自己编一个解释**。";
+           "【都没查到怎么办】清单里没有、learn 也没学到，就如实说不认识，"
+           "或者直接问对方。**不要自己编一个解释**。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
 
  private:
-  LocalSearcher local_;
+  // learn 分支：联网学一个新梗 → 质量闸门 → 写回库 → 记进会话记忆。
+  Outcome learn_term(const Call& call, const std::string& term);
+
+  Lister list_;
+  Detailer detail_;
   RemoteSearcher remote_;
   Importer importer_;
   MemoryWriter memory_;
@@ -686,64 +707,110 @@ Outcome WebFetchTool::run(const Call& call) {
 
 // ── MemeLookupTool ──────────────────────────────────────
 std::string MemeLookupTool::parameters_schema() const {
+  // 三个可选参数，语义互斥，都不填 = 要清单。
+  // 没有任何「搜索词」参数：本地不做匹配，模型要哪个就带 index 来取。
   return R"({
     "type": "object",
     "properties": {
-      "query": {"type": "string", "description": "要查的梗 / 网络用语本身，如 yyds、栓Q、尊嘟假嘟"}
-    },
-    "required": ["query"]
+      "index": {"type": "integer",
+                "description": "清单里的序号（从 0 开始）。不填则只返回全部条目的清单让你挑；填了就返回那一条的完整释义和用法"},
+      "learn": {"type": "string",
+                "description": "清单里没有的新梗，把那个词本身填在这里（不要填整句话），会联网查一次并写进库里"}
+    }
   })";
 }
 
 Outcome MemeLookupTool::run(const Call& call) {
   Outcome out;
   const auto args = detail::parse_args(call.arguments_json);
-  const std::string query = detail::get_str(args, "query");
-  if (query.empty()) {
-    out.error = "missing_query";
-    out.content = "需要提供 query 参数。";
-    return out;
-  }
 
-  // 1. 本地优先：热梗库是高频查询，走本地零成本零延迟。
-  //    命中即返回，**绝不联网**（省调用，也省配额）。
-  std::vector<Hit> hits;
-  if (local_) hits = local_(query);
+  // 参数优先级：learn > index > 要清单。
+  // learn 放最前：模型既然点名要学一个新词，说明它已经翻过清单确认没有，
+  // 这时再返回一遍清单纯属浪费一轮。
+  const std::string learn = detail::get_str(args, "learn");
+  if (!learn.empty()) return learn_term(call, learn);
 
-  if (!hits.empty()) {
-    std::string s = "（来源：本地热梗库，已知）\n";
-    for (const auto& h : hits) {
-      s += h.term + "：" + h.meaning;
-      if (!h.usage.empty()) s += "\n  用法：" + h.usage;
-      s += "\n";
+  const long long idx_in = detail::get_int(args, "index");
+  if (idx_in >= 0) {
+    // 带 index：取那一条的详情。
+    //
+    // 这里不做任何匹配、也不做「越界就退回第 0 条」这种兜底——
+    // 序号错了就是错了，如实告诉模型重来，别让它以为拿到的是自己挑的那条。
+    Hit pick;
+    const bool found = detail_ && detail_(idx_in, &pick);
+    if (!found) {
+      out.ok = true;
+      const auto total = list_ ? list_().size() : 0;
+      out.content = "序号 " + std::to_string(idx_in) + " 超出清单范围（共 " +
+                    std::to_string(total) + " 条，序号从 0 开始）。\n"
+                    "不带参数再调一次，看清单重新选。";
+      out.error = "meme_index_out_of_range";
+      return out;
     }
+    std::string s = "（来源：本地热梗库）\n";
+    s += pick.term;
+    if (!pick.aliases.empty()) s += "（也叫 " + pick.aliases + "）";
+    s += "：" + pick.meaning + "\n";
+    if (!pick.usage.empty()) s += "用法：" + pick.usage + "\n";
     s += "\n用上面的释义来回答对方，别把这段原文背给他。";
     out.ok = true;
     out.content = detail::truncate(std::move(s));
     return out;
   }
 
-  // 2. 本地没有 → 联网学。
+  // 不带任何参数：把**全部条目清单**交给模型，让它自己挑。
   //
+  // 不做关键词匹配、不做随机兜底、不截断条数——
+  // 挑哪一条是模型的判断，程序只负责把「有哪些条目、每条一句话是什么」摆出来。
+  const std::vector<Hit> all = list_ ? list_() : std::vector<Hit>{};
+  if (all.empty()) {
+    out.ok = true;
+    out.content =
+        "本地热梗库是空的，没有条目可挑。\n"
+        "如果遇到看不懂的词，带 learn 参数把那个词填进来，我去联网查一次。";
+    return out;
+  }
+
+  std::string s = "热梗库共 " + std::to_string(all.size()) + " 条，清单：\n";
+  for (std::size_t i = 0; i < all.size(); ++i) {
+    s += "[" + std::to_string(i) + "] " + all[i].term;
+    if (!all[i].aliases.empty()) s += "（也叫 " + all[i].aliases + "）";
+    if (!all[i].meaning.empty()) s += "：" + all[i].meaning;
+    s += "\n";
+  }
+  s += "\n找到对应的那一条，带 index 参数再调用一次，拿它的完整释义和用法。";
+  s += "\n清单里没有的，用 learn 参数把那个词填进来。";
+  out.ok = true;
+  out.content = detail::truncate(std::move(s));
+  return out;
+}
+
+// learn 分支：清单里没有的梗 → 联网学一次 → 质量闸门 → 写回库 → 记进会话记忆。
+//
+// 为什么单独拆出来：这段逻辑（三种降级 + 相关性校验 + 写回 + 记忆）
+// 有十来条分支，和「列清单 / 取详情」混在一个函数里会看不清主流程。
+Outcome MemeLookupTool::learn_term(const Call& call, const std::string& term) {
+  Outcome out;
+
   // 降级要分清三种情况，给模型的说法不能一样：
-  //   a. 没有联网后端（provider 没配 / 没 key）→ 明说「未启用联网检索」
-  //   b. 联网调用失败（网络错 / 401 / 超时）→ 明说「联网检索失败」
+  //   a. 没有联网后端（provider 没配 / 没 key）→ 明说「未启用联网」
+  //   b. 联网调用失败（网络错 / 401 / 超时）→ 明说「联网失败」
   //   c. 联网成功但没搜到 → 明说「没查到」
   if (!remote_) {
     out.ok = true;
     out.content =
-        "本地热梗库里没有「" + query + "」，而且当前未启用联网检索，没法学到它。\n"
-        "你可以直接问对方这是什么意思，或者把对方的原话念出来问。\n"
-        "（如果你已经知道这个梗是什么意思，可以直接说，不要装不知道。）";
+        "「" + term + "」：当前未启用联网检索，没法学到它。\n"
+        "你可以直接问对方这是什么意思。\n"
+        "（如果你已经知道这个词是什么意思，可以直接说，不要装不知道。）";
     ::fish::log::log_line(::fish::log::LogLevel::kInfo, "tool", "meme_remote_disabled")
-        .field("query", query);
+        .field("term", term);
     return out;
   }
 
   std::string remote_error;
   std::vector<Hit> remote_hits;
   try {
-    remote_hits = remote_(query, &remote_error);
+    remote_hits = remote_(term, &remote_error);
   } catch (const std::exception& e) {
     remote_error = std::string("exception:") + e.what();
   } catch (...) {
@@ -753,11 +820,10 @@ Outcome MemeLookupTool::run(const Call& call) {
   if (!remote_error.empty()) {
     out.ok = true;
     out.content =
-        "本地热梗库里没有「" + query + "」，联网检索也失败了（" + remote_error + "），"
-        "所以这次没学到它。\n"
+        "「" + term + "」联网检索失败了（" + remote_error + "），所以这次没学到它。\n"
         "不要瞎编这个词的意思——可以问对方，或者如实说不知道。";
     ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_remote_failed")
-        .field("query", query)
+        .field("term", term)
         .field("detail", remote_error);
     return out;
   }
@@ -765,43 +831,39 @@ Outcome MemeLookupTool::run(const Call& call) {
   if (remote_hits.empty()) {
     out.ok = true;
     out.content =
-        "本地热梗库里没有「" + query + "」，联网也没搜到关于它的解释。\n"
+        "「" + term + "」联网也没查到关于它的解释。\n"
         "不要瞎编这个词的意思——可以问对方，或者如实说不知道。";
     ::fish::log::log_line(::fish::log::LogLevel::kInfo, "tool", "meme_remote_empty")
-        .field("query", query);
+        .field("term", term);
     return out;
   }
 
-  // 3. 质量闸门：抓回来的内容是不是真的在讲这个梗？
+  // 质量闸门：抓回来的内容是不是真的在讲这个梗？
   //
-  // 联网搜「666」「班味」这类词很容易搜到同名的东西。
-  // 判据是「梗名是否出现在抓回来的文本里」——
-  // 这是校验**抓取结果与查询是否相关**，不是用关键词判断模型意图。
+  // 【这不是「关键词匹配用户意图」】
+  //   这里判的是**联网抓回来的第三方正文**跟我们要学的那个词有没有关系，
+  //   是数据入库前的质量闸门：搜到一个同名的别的东西，
+  //   写进库会污染本地数据，越查越烂。
+  //   模型想学哪个词由模型自己决定（learn 参数点名），程序不猜。
   //
   // 注意：只用**抓回来的内容**（释义 + 用法）来判断，
-  // 不能把 hit.term 算进去——term 是我们自己从查询串派生的，
-  // 把它算进去等于「查询串出现在结果里」，闸门就永远开着。
-  //
-  // 不相关的内容**不写回**（否则本地库会被垃圾污染，越查越烂），
-  // 只把原文给模型看，并明说「没查到可靠解释」。
-  std::string learned_term;
+  // 不能把 hit.term 算进去——term 是我们从 learn 参数抄来的，
+  // 把它算进去等于「输入出现在输出里」，闸门就永远开着。
   std::vector<Hit> good;
   std::vector<Hit> rejected;
   for (const auto& h : remote_hits) {
     const std::string blob = h.meaning + " " + h.usage;
     std::string matched;
-    if (fish::meme::is_relevant_with_context(query, blob, &matched)) {
-      Hit copy = h;
-      if (copy.term.empty()) copy.term = matched;
-      good.push_back(std::move(copy));
+    if (fish::meme::is_relevant_with_context(term, blob, &matched)) {
+      good.push_back(h);
     } else {
       rejected.push_back(h);
     }
   }
 
   if (good.empty()) {
-    std::string s = "本地没有「" + query + "」，联网搜到的内容看起来不是在讲这个梗，"
-                    "所以**没有记住**，也不能当成解释。\n";
+    std::string s = "「" + term + "」联网搜到的内容看起来不是在讲这个词，"
+                    "所以没有记住，也不能当成解释。\n";
     for (const auto& h : rejected) {
       s += "搜到的东西（仅供参考，可能不相干）：\n";
       if (!h.term.empty()) s += "  - " + h.term + "\n";
@@ -811,58 +873,60 @@ Outcome MemeLookupTool::run(const Call& call) {
     out.ok = true;
     out.content = detail::truncate(std::move(s));
     ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_irrelevant")
-        .field("query", query)
+        .field("term", term)
         .field("rejected", static_cast<long long>(rejected.size()));
     return out;
   }
 
-  // 4. 写回本地库（失败不影响主链路：吞掉异常 + warn 日志）
+  // 写回本地库（失败不影响主链路：吞掉异常 + warn 日志）
   int added = 0;
   if (importer_) {
     try {
       added = importer_(good);
     } catch (const std::exception& e) {
       ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_import_failed")
-          .field("query", query)
+          .field("term", term)
           .field("detail", e.what());
     } catch (...) {
       ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_import_failed")
-          .field("query", query)
+          .field("term", term)
           .field("detail", "unknown_exception");
     }
   }
 
-  // 5. 记进当前会话的长期记忆（traits + facts）。
-  //    让模型知道「这个人/这个群在用这个梗」，而不是全世界都知道。
+  // 记进当前会话的长期记忆（traits + facts）。
+  // 让模型知道「这个人/这个群在用这个词」，而不是全世界都在用。
   if (memory_ && !call.conversation_id.empty()) {
     for (const auto& h : good) {
       try {
         memory_(call.conversation_id, h.term, h.meaning);
       } catch (const std::exception& e) {
         ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_memory_failed")
-            .field("query", query)
+            .field("term", term)
             .field("detail", e.what());
       } catch (...) {
         ::fish::log::log_line(::fish::log::LogLevel::kWarn, "tool", "meme_memory_failed")
-            .field("query", query)
+            .field("term", term)
             .field("detail", "unknown_exception");
       }
     }
   }
 
   ::fish::log::log_line(::fish::log::LogLevel::kInfo, "tool", "meme_learned")
-      .field("query", query)
+      .field("term", term)
       .field("added", static_cast<long long>(added));
 
-  // 6. 结果给模型：明确说「刚查到并已记住」
-  std::string s = "（来源：联网检索，刚查到并已记住，下次直接本地命中）\n";
+  // 结果给模型：明确说「刚查到并已记住」
+  std::string s = "（来源：联网检索，刚查到并已记住，下次清单里就有它了）\n";
   for (const auto& h : good) {
-    s += h.term + "：" + h.meaning;
+    s += h.term;
+    if (!h.aliases.empty()) s += "（也叫 " + h.aliases + "）";
+    s += "：" + h.meaning;
     if (!h.usage.empty()) s += "\n  用法：" + h.usage;
     s += "\n";
   }
   // 热梗领域营销号最多：同一个梗的解释经常被抄来抄去还抄错，
-  // 必须提醒模型别把搜索到的说法当成定论。
+  // 必须提醒模型别把搜到的说法当成定论。
   s += detail::kSourceWarning;
   out.ok = true;
   out.content = detail::truncate(std::move(s));

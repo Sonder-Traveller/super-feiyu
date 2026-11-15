@@ -533,11 +533,10 @@ int main(int argc, char** argv) {
         }));
   }
 
-  // 网络热梗：本地库优先，未命中时可选联网并写回
+  // 网络热梗：把本地库的清单交给模型自己挑，未收录的由模型点名后联网学
   {
     fish::meme::MemeStore::Config meme_cfg;
     meme_cfg.dir = cfg.get_or("meme.dir", "data/memes");
-    meme_cfg.max_results = static_cast<int>(cfg.get_int_or("meme.max_results", 5));
     meme_store = std::make_unique<fish::meme::MemeStore>(meme_cfg);
     auto e = meme_store->init();
     if (!e.ok()) {
@@ -617,25 +616,21 @@ int main(int argc, char** argv) {
     }
   }
 
-  // 热梗查询：本地优先，联网作为可选补充
+  // 热梗：清单交给模型自己挑（与本地图片同一套做法），联网只用于「学新梗」
   if (meme_store) {
     auto* ms = meme_store.get();
     auto* raw_search = search_holder.get();
 
     fish::tool::MemeLookupTool::RemoteSearcher remote;
     if (raw_search != nullptr) {
-      // 有搜索后端时才启用联网补充。
+      // 有搜索后端时才启用联网学习。
       //
-      // 查询串的构造：**无条件**用「梗名」作为查询主体，
-      // 不做关键词黑名单——不判断模型在问什么，只从字面上取梗名
-      // （见 fish::meme::term_candidate）。
+      // 入参是**模型点名的梗名**（learn 参数），不是整句话——
+      // 清单模式下程序不再从查询串里猜梗名（原 term_candidate 已删）。
       remote = [raw_search, provider_name = search_cfg.provider](
-                   const std::string& query, std::string* error) {
+                   const std::string& term, std::string* error) {
         std::vector<fish::tool::MemeLookupTool::Hit> out;
         if (error != nullptr) error->clear();
-
-        // 梗名：拉丁字母的梗取最长的一段（yyds），中文的取第一段
-        const std::string term = fish::meme::term_candidate(query);
         if (term.empty()) {
           if (error != nullptr) *error = "empty_term";
           return out;
@@ -648,7 +643,7 @@ int main(int argc, char** argv) {
 
         auto r = raw_search->search(q, 3);
         if (!r.ok()) {
-          // 失败原因传给工具，工具才能区分「联网失败」和「没搜到」
+          // 失败原因传给工具，工具才能区分「联网失败」和「没查到」
           if (error != nullptr) *error = r.error.detail;
           return out;
         }
@@ -677,16 +672,43 @@ int main(int argc, char** argv) {
           .field("api_key_empty", search_cfg.api_key.empty())
           .field("hint", std::string(
                            "热梗联网学习不可用：capability.search 未配置 provider 或 api_key，"
-                           "模型查到本地没有的梗时只能如实说没查到"));
+                           "模型要用 learn 学新梗时只能如实说没学到"));
     }
 
     tools.add(std::make_shared<fish::tool::MemeLookupTool>(
-        [ms](const std::string& query) {
+        // 清单：全部条目，不检索、不截断。
+        [ms]() {
           std::vector<fish::tool::MemeLookupTool::Hit> out;
-          for (const auto& e : ms->search(query)) {
-            out.push_back({e.term, e.meaning, e.usage, "local"});
+          for (const auto& e : ms->all()) {
+            fish::tool::MemeLookupTool::Hit h;
+            h.term = e.term;
+            h.meaning = e.meaning;
+            h.usage = e.usage;
+            h.source = "local";
+            // 别名拼好给工具展示（清单里带上「也叫 …」，
+            // 用户用的可能是别名或另一种写法，模型看到就知道是同一条）
+            for (std::size_t i = 0; i < e.aliases.size(); ++i) {
+              if (i > 0) h.aliases += "、";
+              h.aliases += e.aliases[i];
+            }
+            out.push_back(std::move(h));
           }
           return out;
+        },
+        // 取详情：按清单序号拿一条（命中计数由 store 负责）
+        [ms](long long index, fish::tool::MemeLookupTool::Hit* out) {
+          if (out == nullptr || index < 0) return false;
+          fish::meme::Entry e;
+          if (!ms->detail(static_cast<std::size_t>(index), &e)) return false;
+          out->term = e.term;
+          out->meaning = e.meaning;
+          out->usage = e.usage;
+          out->source = "local";
+          for (std::size_t i = 0; i < e.aliases.size(); ++i) {
+            if (i > 0) out->aliases += "、";
+            out->aliases += e.aliases[i];
+          }
+          return true;
         },
         remote,
         [ms](const std::vector<fish::tool::MemeLookupTool::Hit>& hits) {
