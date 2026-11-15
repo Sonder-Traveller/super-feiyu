@@ -1239,7 +1239,30 @@ class HttpStt final : public fish::core::ISpeechToText {
     if (ext == ".silk" || cfg_.need_wav16k) {
       const std::string wav = stem + ".wav";
       if (!to_wav16k(tmp, wav)) {
-        std::remove(tmp.c_str());
+        // 保留现场：文件头 hex 打进日志（判断真实格式），样本留在 /tmp 供人工分析。
+        // 之前只报「装 ffmpeg 或 pilk」——工具明明都在，真正的死因看不到，
+        // 排查时只能靠猜。有了这 32 字节，一眼就知道是 silk 变体还是私有格式。
+        std::ifstream probe(tmp, std::ios::binary);
+        std::string head(32, '\0');
+        probe.read(head.data(), static_cast<std::streamsize>(head.size()));
+        head.resize(static_cast<std::size_t>(probe.gcount()));
+        char hexbuf[4];
+        std::string hex;
+        std::string ascii;
+        for (const unsigned char ch : head) {
+          std::snprintf(hexbuf, sizeof(hexbuf), "%02x", ch);
+          hex += hexbuf;
+          ascii += (ch >= 0x20 && ch < 0x7F) ? static_cast<char>(ch) : '.';
+        }
+        const std::string keep = tmp + ".fail";
+        std::error_code rename_ec;
+        std::filesystem::rename(tmp, keep, rename_ec);
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "stt", "transcode_failed")
+            .field("ext", ext)
+            .field("bytes", static_cast<long long>(audio.value->size()))
+            .field("head_hex", hex)
+            .field("head_ascii", ascii)
+            .field("kept", keep);
         return Result<std::string>::fail(
             ErrorCode::kUnsupported, "audio_transcode_failed（装 ffmpeg 或 pilk）");
       }
@@ -1312,12 +1335,21 @@ class HttpStt final : public fish::core::ISpeechToText {
       std::ifstream f(out, std::ios::binary | std::ios::ate);
       return f && f.tellg() > 44;  // 比 WAV 头大才算有内容
     }
-    // ffmpeg 不可用时，SILK 用纯 Python 方案
-    if (in.size() >= 4) {
+    // ffmpeg 不可用（或对 SILK 不支持）时，纯 Python 方案兜底。
+    //
+    // SILK 有两种文件头：
+    //   "#!SILK_V3"          —— 标准头
+    //   0x02 "#!SILK_V3"     —— QQ 的变体，多一个 0x02 前缀字节
+    // 两种都要交给 silk2wav.py。之前只判 "#!SI" 开头，0x02 前缀的变体
+    // 被跳过 → 直接报转码失败。
+    if (in.size() >= 5) {
       std::ifstream probe(in, std::ios::binary);
-      std::string head(4, '\0');
-      probe.read(head.data(), 4);
-      if (head.rfind("#!SI", 0) == 0) {
+      std::string head(5, '\0');
+      probe.read(head.data(), 5);
+      const bool is_silk = head.rfind("#!SI", 0) == 0 ||
+                           (static_cast<unsigned char>(head[0]) == 0x02 &&
+                            head.compare(1, 4, "#!SI") == 0);
+      if (is_silk) {
         const std::string py = "python3 tools/silk2wav.py '" + in + "' '" + out +
                                "' --rate 16000 >/dev/null 2>&1";
         if (std::system(py.c_str()) == 0) {
