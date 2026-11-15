@@ -862,13 +862,24 @@ constexpr const char* kConsolidatePrompt =
     R"("supersedes":"..."}],)"
     R"("traits":[{"pattern":"...","evidence":1}]})"
     "\n没有值得记的内容就三个数组都给空。\n"
-    "\n关于 facts 里的 supersedes 字段（可选）：\n"
-    "  只有当这条新事实**推翻了**一条已知的旧事实时才填，内容是旧事实的原文，"
+    "\n关于 facts 里的 supersedes 字段（默认要检查）：\n"
+    "  输入里附有「已有事实」清单时，逐条核对新提取的事实和它有没有矛盾。\n"
+    "  只有当新事实**推翻了**某条已有事实时才填，内容是旧事实的原文，"
     "一字不差地照抄。例如旧事实是「养了一只叫豆豆的猫」，"
     "现在说「豆豆上个月死了」，新事实就写 supersedes: \"养了一只叫豆豆的猫\"。\n"
     "  两条事实同时成立（「喜欢猫」和「住在上海」）时**不要**填 —— "
     "填错的后果是一条真事实被永久排除在回忆之外。\n"
-    "  拿不准就别填，宁可两条并存。";
+    "  拿不准就别填，宁可两条并存。没有已有事实清单、或清单里没有矛盾的，"
+    "就不填这个字段。\n"
+    "\n关于 facts 里的 confidence（置信度）：\n"
+    "  用户亲口说的、明确发生的事用 0.9；推测、听说的用 0.6；道听途说不记。";
+
+// 巩固时给 LLM 的「已有事实」清单上限。
+//
+// 为什么有上限：facts.md 会一直增长，全量塞进巩固 prompt 会让每次压缩
+// 都变得又贵又慢。100 条对「找出矛盾」足够了——更早的事实即使有矛盾，
+// 重要性也已经衰减到几乎不被召回。
+constexpr std::size_t kSupersedeListMax = 100;
 
 }  // namespace
 
@@ -1670,10 +1681,45 @@ Result<ConsolidateReport> Consolidator::consolidate(const std::string& conv_id,
 
   fish::core::IChatModel::Request req;
   req.system_prompt = kConsolidatePrompt;
-  fish::core::ContentBlock block;
-  block.kind = fish::core::BlockKind::kText;
-  block.text = render_transcript(transcript);
-  req.user_blocks.push_back(std::move(block));
+
+  // 默认带上「已有事实」清单：模型必须能看到旧事实才可能判断矛盾。
+  //
+  // 为什么默认开：supersedes 靠模型判断，而模型只看得到对话原文——
+  // 不喂旧事实清单，它永远填不出 supersedes，「矛盾检查」就是空话。
+  //
+  // 只取最近 kSupersedeListMax 条：facts 按写入序追加，越靠后越新，
+  // 新事实最可能推翻的就是这些。已经 superseded_by 非空的旧事实不再列出
+  // （被推翻过的不用再推翻一次）。
+  {
+    std::string existing_block;
+    if (notes_ != nullptr) {
+      auto ef = notes_->load_facts(conv_id);
+      if (ef.ok() && !ef.value->empty()) {
+        std::vector<Fact> alive;
+        for (const auto& f : *ef.value) {
+          if (f.superseded_by.empty()) alive.push_back(f);
+        }
+        std::size_t start =
+            alive.size() > kSupersedeListMax ? alive.size() - kSupersedeListMax : 0;
+        existing_block = "\n\n【已有事实】（若新事实推翻了其中一条，"
+                         "在新事实里填 supersedes 字段，内容照抄原文）\n";
+        for (std::size_t i = start; i < alive.size(); ++i) {
+          existing_block += "- " + alive[i].content + "\n";
+        }
+      }
+    }
+    if (existing_block.empty()) {
+      fish::core::ContentBlock block;
+      block.kind = fish::core::BlockKind::kText;
+      block.text = render_transcript(transcript);
+      req.user_blocks.push_back(std::move(block));
+    } else {
+      fish::core::ContentBlock block;
+      block.kind = fish::core::BlockKind::kText;
+      block.text = render_transcript(transcript) + existing_block;
+      req.user_blocks.push_back(std::move(block));
+    }
+  }
   req.max_tokens = 800;
   req.temperature = 0.3;
 
