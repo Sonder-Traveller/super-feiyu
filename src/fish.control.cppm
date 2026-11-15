@@ -1048,6 +1048,14 @@ constexpr FieldDef kFields[] = {
     {"capability.chat", "model", FieldKind::kString},
     {"capability.chat", "reasoning_effort", FieldKind::kLocked},
     {"capability.chat", "api_key", FieldKind::kSecret},
+    // DeepSeek 服务端联网工具开关。
+    //
+    // kBool 而不是 kLocked：这是用户可切的开关（GUI 有对应控件）。
+    // 注意「开关开着」≠「服务端联网工具生效」——还要端点是 DeepSeek
+    // 官方（见 capability::server_web_tools_active_for）。控制面额外下发
+    // deepseek_web_tools_active，让 GUI 能如实告诉用户当前是不是服务端
+    // 搜索，免得用户以为开关生效了。
+    {"capability.chat", "deepseek_web_tools", FieldKind::kBool},
     // WorkBuddy 桥接（跨平台部署用）
     //   cred_file       凭据落盘路径；空 = data_dir/workbuddy.json
     //   credential_token 桥接层拉凭据用的独立令牌；空 = 自动生成到
@@ -1182,7 +1190,15 @@ fish::core::Result<std::string> ControlService::config_json() {
         break;
       }
       case FieldKind::kBool: {
-        const auto raw = to_lower(cf.get_or(f.section, f.key, "false"));
+        // deepseek_web_tools 的出厂默认是 true（服务端联网搜索是默认路径），
+        // 其余布尔项沿用 false。默认值与运行时同源，见
+        // fish::capability::default_deepseek_web_tools()。
+        const char* def = "false";
+        if (f.section == std::string_view("capability.chat") &&
+            f.key == std::string_view("deepseek_web_tools")) {
+          def = fish::capability::default_deepseek_web_tools() ? "true" : "false";
+        }
+        const auto raw = to_lower(cf.get_or(f.section, f.key, def));
         (*node)[f.key] = (raw == "true" || raw == "1" || raw == "yes" || raw == "on");
         break;
       }
@@ -1218,11 +1234,40 @@ fish::core::Result<std::string> ControlService::config_json() {
     json& chat = root["capability"]["chat"];
     json items = json::array();
     for (const auto& p : kChatPresets) {
+      // base_url 也下发：前端要判断「这个提供方是不是 DeepSeek 官方端点」
+      // （服务端联网工具只有官方有效），判据必须和后端一致——后端判的是
+      // base_url，前端就也得看 base_url，不能只看 provider 名字。
       items.push_back({{"provider", p.provider},
+                       {"base_url", p.base_url},
                        {"api_key_hint", p.api_key_hint}});
     }
     chat["presets"] = items;
     chat["model_locked"] = "deepseek-flash";
+
+    // 服务端联网工具「实际是否生效」。
+    //
+    // 开关本身（deepseek_web_tools）只说明用户想不想用服务端联网工具；
+    // 真正生效还要端点是 DeepSeek 官方。GUI 用这个字段如实显示
+    // 「当前是服务端搜索还是本地搜索」，不让用户以为开关生效了。
+    {
+      // 默认值与运行时 load_chat_config 保持一致（provider 默认 deepseek、
+      // base_url 默认 https://api.deepseek.com）。两边默认值不同的话，
+      // 「配置里没写这一项」时界面会显示一种结论、运行时走另一种。
+      const std::string provider =
+          cf.get_or("capability.chat", "provider", "deepseek");
+      std::string base_url = resolved(rc, "capability.chat", "base_url");
+      if (base_url.empty()) base_url = "https://api.deepseek.com";
+      const std::string raw_sw =
+          to_lower(cf.get_or("capability.chat", "deepseek_web_tools",
+                             fish::capability::default_deepseek_web_tools() ? "true"
+                                                                          : "false"));
+      const bool enabled =
+          (raw_sw == "true" || raw_sw == "1" || raw_sw == "yes" || raw_sw == "on");
+      chat["deepseek_web_tools_active"] =
+          fish::capability::server_web_tools_active_for(provider, base_url, enabled);
+      chat["deepseek_web_tools_supported"] =
+          fish::capability::is_deepseek_endpoint(provider, base_url);
+    }
   }
 
   // 各能力的提供方清单：GUI 下拉直接用这个，前端不硬编码。

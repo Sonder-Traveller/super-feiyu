@@ -1150,6 +1150,27 @@ def main(page: ft.Page) -> None:
     chat_effort_note = ft.Text("思考强度：high（锁定，不可调）", size=12,
                                color=TEXT_HINT)
 
+    # ── 服务端联网搜索（DeepSeek 官方）───────────────────
+    #
+    # 开关本身对应 capability.chat.deepseek_web_tools（后端默认 true）。
+    # 注意：**开关开着 ≠ 生效**。服务端联网工具只有 DeepSeek 官方端点
+    # 支持；选了 workbuddy 桥接层时端点不是官方，本项无效，搜索走本地
+    # web_search/web_fetch。所以这里在非官方提供方时把开关置灰，并说明
+    # 原因——不然用户会以为开关生效了。
+    chat_web_tools_switch = ft.Switch(
+        label="服务端联网搜索（DeepSeek 官方）",
+        label_position=ft.LabelPosition.LEFT,
+        value=True,
+        scale=0.85,
+    )
+    chat_web_tools_note = ft.Text(
+        "开启后搜索在 DeepSeek 服务端执行，支持边思考边搜、引用原文；按次计费。"
+        "仅 DeepSeek 官方提供方有效。",
+        size=11.5, color=TEXT_SUB,
+    )
+    # 非官方提供方时的额外提示（说明「当前实际走的是本地搜索」）
+    chat_web_tools_state = ft.Text("", size=11.5, color=TEXT_HINT)
+
     # ── 其他能力：也简化成下拉 ──
     # 选项由 GET /v1/config 的 capability.providers 驱动——
     # 后端加一家厂商，这里自动多一项，前端不硬编码。
@@ -1228,6 +1249,34 @@ def main(page: ft.Page) -> None:
     CHAT_PROVIDER_ALIAS = {"openai": "workbuddy", "workbuddy": "workbuddy",
                            "deepseek": "deepseek", "siliconflow": "siliconflow"}
 
+    # 服务端联网工具只有 DeepSeek 官方端点支持。
+    #
+    # 判据和后端一致（fish::capability::is_deepseek_endpoint）：看的是
+    # **base_url**（含 api.deepseek.com / deepseek），不是 provider 名字。
+    # 后端 GET /v1/config 的 capability.chat.presets 里带 base_url，
+    # 这里直接用；拿不到预设时退回「provider == deepseek」。
+    def _chat_provider_is_official(p: str) -> bool:
+        base = ""
+        for preset in chat_presets:
+            if preset.get("provider") == p:
+                base = (preset.get("base_url") or "").lower()
+                break
+        if not base:
+            return p == "deepseek"
+        return "api.deepseek.com" in base or "deepseek" in base
+
+    def _sync_web_tools_state(p: str) -> None:
+        """按当前提供方更新服务端联网搜索开关的可用性与提示。"""
+        official = _chat_provider_is_official(p)
+        chat_web_tools_switch.disabled = not official
+        if official:
+            chat_web_tools_state.value = ""
+        else:
+            chat_web_tools_state.value = (
+                "仅 DeepSeek 官方提供方支持：当前提供方下本项不生效，"
+                "搜索走本地 web_search/web_fetch。"
+            )
+
     def _chat_provider_changed() -> None:
         """切换提供方：只显示该提供方需要的输入。"""
         p = chat_provider_dd.value or ""
@@ -1241,6 +1290,9 @@ def main(page: ft.Page) -> None:
                 hint = preset.get("api_key_hint", "")
                 break
         chat_key_hint.value = hint
+
+        # 服务端联网搜索开关：非官方提供方时置灰并说明原因
+        _sync_web_tools_state(p)
 
         # 换提供方 → 清空 key 输入框。
         #
@@ -1304,6 +1356,20 @@ def main(page: ft.Page) -> None:
         state["chat_provider"] = cur
         chat_lock_note.value = f"底层模型：{model_locked}（锁定，不可更换）"
         chat_effort_note.value = "思考强度：high（锁定，不可调）"
+
+        # 服务端联网搜索开关的初值。
+        # 后端 GET /v1/config 已在 capability.chat.deepseek_web_tools 回显
+        # 原始开关；deepseek_web_tools_active 是「实际是否生效」的判据结果
+        # （还要端点是 DeepSeek 官方）。
+        chat_web_tools_switch.value = bool(chat.get("deepseek_web_tools", True))
+        _sync_web_tools_state(cur)
+        # 后端说的「实际是否生效」优先于前端自己的推断：它是运行时用的
+        # 那一份判据（capability::server_web_tools_active）。
+        if chat.get("deepseek_web_tools_supported") is False:
+            chat_web_tools_state.value = (
+                "仅 DeepSeek 官方提供方支持：当前提供方下本项不生效，"
+                "搜索走本地 web_search/web_fetch。"
+            )
 
         # workbuddy 特殊：显示桥接状态 + 登录入口
         wb = chat.get("base_url", "")
@@ -1389,6 +1455,13 @@ def main(page: ft.Page) -> None:
             chat_payload["provider"] = p
         if (chat_key.value or "").strip():
             chat_payload["api_key"] = chat_key.value.strip()
+        # 服务端联网搜索开关：每次都发（和 provider 一样是「当前状态」，
+        # 不是「用户这次改了什么」）。后端按 kBool 写回 config.toml。
+        #
+        # 非官方提供方时开关是置灰的，值仍然照发——它记录的是用户的
+        # 偏好，等用户切到 DeepSeek 官方时立刻生效（默认值本来就是 true，
+        # 用户在官方端点下关掉之后换到桥接再换回来，这个「关」应当保留）。
+        chat_payload["deepseek_web_tools"] = bool(chat_web_tools_switch.value)
         if chat_payload:
             payload["capability"]["chat"] = chat_payload
 
@@ -1465,9 +1538,13 @@ def main(page: ft.Page) -> None:
             glass(ft.Column([
                 section_title("对话提供方", ""),
                 chat_provider_dd,
-                chat_workbuddy_row,
                 chat_key,
                 chat_key_hint,
+                # 服务端联网搜索：开关 + 说明 + 「当前是否生效」的提示
+                chat_web_tools_switch,
+                chat_web_tools_note,
+                chat_web_tools_state,
+                chat_workbuddy_row,
                 chat_lock_note,
                 chat_effort_note,
             ], spacing=10)),

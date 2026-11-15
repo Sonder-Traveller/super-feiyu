@@ -216,7 +216,60 @@ struct SearchHit {
 
 各家字段差异（url vs link、title vs name）已在实现里适配，不用为每家准备不同的端点格式。
 
-**默认 none**：被动对话场景搜索用得少，先关。需要时再开。
+**默认 deepseek**：出厂即配好协议，只差一把 key。填上就能用（见下）。
+
+### 3.6 两种搜索：服务端工具 vs 本地工具
+
+搜索有两条**互斥**的实现路径，由「对话提供方是不是 DeepSeek 官方端点」决定走哪条。
+
+| | 服务端联网工具 | 本地工具 |
+|---|---|---|
+| 开关 | `capability.chat.deepseek_web_tools`（默认 true） | `capability.search.provider` + `api_key` |
+| 生效条件 | 开关开 **且** 端点是 DeepSeek 官方 | `provider != "none"` **且** api_key 解析出非空值 |
+| 实际执行 | DeepSeek 服务端（`deepseek_web_search` / `deepseek_read_url`） | 本机进程（`web_search` / `web_fetch` 工具） |
+| 行为 | **边思考边搜**：多步推理中自主搜索 / 开网页 / 页内查找，约 20 次调用 | 模型自己决定何时调工具，一次一查 |
+| 引用 | 服务端直接引用原文 | 工具返回 title/url/snippet，模型自己组织 |
+| 计费 | 按次计费（走模型 token 账） | 搜索接口按次计费（DeepSeek 官方 5 元/1000 次） |
+| 本地工具注册 | **不注册**（`web_search` / `web_fetch` 会被注销） | 注册 |
+
+**判据是 `base_url`，不是 `provider` 名字**：控制面在用户选「DeepSeek 官方」时
+会把 `capability.chat.provider` 写成接入方式 `"openai"`，所以 provider 字段几乎
+永远是 `openai`。真正判据是 `fish::capability::is_deepseek_endpoint()`：
+`provider == "deepseek"`，或 `base_url` 含 `api.deepseek.com` / `deepseek`。
+
+**互斥的实现方式**：`fish::capability::server_web_tools_active(cfg)` 是**唯一判据来源**，
+capability（是否注入服务端工具）和 `main.cpp`（是否注册本地工具）都用它。
+
+> 历史上两边各判各的：capability 只看开关，`main.cpp` 也只看开关，
+> 但「开关开 + 端点非官方」（WorkBuddy 桥接部署）时两边结论还不一致，
+> 结果本地 `web_search`/`web_fetch` 被注销、服务端工具又没注入——
+> **两个搜索工具同时消失，搜索能力凭空蒸掉且没有任何报错**。
+> 现在判据统一成「开关开 **且** 端点是官方」，非官方端点时本地工具照常注册。
+
+### 3.7 怎么选
+
+| 场景 | 用哪种 | 怎么配 |
+|---|---|---|
+| 对话走 DeepSeek 官方端点 | **服务端工具**（默认） | 什么都不用配，开关默认 true |
+| 对话走 WorkBuddy 桥接 / 其它 OpenAI 兼容端点 | **本地工具** | `capability.search.provider = "deepseek"` + 填 `DEEPSEEK_API_KEY` |
+| 想要更便宜的搜索（免费额度 / 自建实例） | **本地工具** | `provider` 换 `tavily` / `searxng` / `bocha` … + 对应的 api_key |
+| 对话走官方，但想省服务端搜索的按次费用 | **本地工具** | `capability.chat.deepseek_web_tools = false` + 配 `capability.search` |
+
+**开关闭关都不静默**，三个地方都会如实说：
+
+1. **启动日志**：开关开着但端点非官方时打
+   `info / capability / deepseek_web_tools_inactive`，带 `provider`、`base_url`
+   和一句 `hint: 端点非 DeepSeek 官方，服务端联网工具不生效，使用本地搜索`。
+2. **控制面**：`GET /v1/config` 下发三个字段，GUI 据此如实显示当前走哪条路
+   （见 [CONTROL_API.md](../CONTROL_API.md)）。
+3. **本地搜索没开时**：`capability.search.api_key` 解析为空 → 启动打
+   `warn / config / env_var_missing / var=DEEPSEEK_API_KEY`；
+   控制面 `capability.search.key_ready = false`，GUI 的搜索 API Key 输入框会出现，
+   填进去保存即生效。
+
+**开关本身不改变搜索是否可用**：端点非官方时它无效，但本地搜索照常工作；
+端点是官方时它才把搜索从「本地工具」切到「服务端工具」。
+
 
 ---
 
@@ -255,8 +308,8 @@ format   = "mp3"
 group_voice = false                      # 群里不发语音
 
 [capability.search]
-provider = "none"                        # 默认关闭
-api_key  = "${TAVILY_API_KEY}"
+provider = "deepseek"                 # 默认已配好协议，只差一把 key
+api_key  = "${DEEPSEEK_API_KEY}"      # 没填 = 搜索不启用（但会明确提示）
 max_results = 5
 ```
 
@@ -403,7 +456,7 @@ class CircuitBreaker {
 | embedding | 无向量，退化为关键词召回 | 记忆没那么准 |
 | stt | 占位文本 `[语音转写失败]` | 知道没听清 |
 | tts | 只发文本 | 没有语音 |
-| search | 跳过搜索直接回答 | 回答可能不够新 |
+| search | 跳过搜索直接回答 | 回答可能不够新（启动日志会说搜索没开） |
 | document | 占位文本「[收到文件：xxx，解析失败]」 | 知道收到了文件，读不到正文 |
 
 ### 7.1 embedding 失败的连锁影响
@@ -423,14 +476,19 @@ embedding 挂了 → 无法召回 L3 → **但仍可用 L2 短时记忆**。
 | 向量 | `siliconflow` | **是** | 0 |
 | 语音识别 | `siliconflow` | **是** | 0 |
 | 语音合成 | `edge` | 否 | 0 |
-| 搜索 | `none` 或 `tavily` | 否 | 0（1000 次/月内） |
+| 搜索 | `deepseek`（默认）/ `tavily` / `searxng` | 否 | DeepSeek 5 元/1000 次；tavily 1000 次/月内 0 |
 
 **最小可用组合**：
-- 一个 DeepSeek key（付费）
+- 一个 DeepSeek key（付费）—— 对话、搜索、文档解析共用这一把
 - 一个硅基流动 key（免费，需实名）
 - Edge-TTS 无需 key
 
 **两把 key，全部能力可用。**
+
+> 搜索默认已配好 `provider = "deepseek"`，DeepSeek key 填进 `.env.local` 的
+> `DEEPSEEK_API_KEY` 即生效（同一把 key 也供对话和文档解析复用）。
+> 不想为搜索付费就换 `tavily`（每月 1000 次免费）或自建 `searxng`。
+> 详见 [3.6 两种搜索](#36-两种搜索服务端工具-vs-本地工具)。
 
 ---
 
@@ -500,6 +558,13 @@ timeout_ms = 90000
 `provider = "workbuddy"` 与 `provider = "openai"` 的区别：
 `workbuddy` 会带上 DeepSeek 服务端联网工具相关的处理，
 并接受桥接层的抽象模型名（`fast-model` / `balanced-model` / `deep-model` / `auto`）。
+
+> **桥接部署下的搜索走本地**：`base_url` 指向 `127.0.0.1:18091`，
+> 不是 DeepSeek 官方端点，所以 `capability.chat.deepseek_web_tools` 开关无效
+> （启动日志会打 `deepseek_web_tools_inactive` 说明这一点），
+> 搜索照常走本地 `web_search` / `web_fetch`——
+> 只要 `capability.search.provider != "none"` 且 key 解析出非空值。
+> 见 [3.6 两种搜索](#36-两种搜索服务端工具-vs-本地工具)。
 
 > **桥接层启动必须带 `--cred-file`**，否则 GUI「扫码登录 WorkBuddy」
 > 写入的凭据（`data/workbuddy.json`）不会被桥读取，登录等于白发。

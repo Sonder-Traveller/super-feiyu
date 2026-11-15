@@ -764,7 +764,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
   fish::memory::MemoryContext mem_ctx;
   if (deps_.memory != nullptr) {
-    auto g = deps_.memory->gather(conv_key, query);
+    // gather 只按会话取「预算内的最近原文 + 滚动摘要」，不做相关性检索，
+    // 所以不需要 query。相关性召回是 search_memory 工具的职责
+    // （模型自己决定何时调），不是每轮自动发生的。
+    auto g = deps_.memory->gather(conv_key);
     if (g.ok()) mem_ctx = std::move(*g.value);
   }
 
@@ -945,6 +948,10 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
       fish::tool::Call tc;
       tc.name = call.name;
       tc.arguments_json = call.arguments;
+      // 带上会话键：有些工具要把结果写进**当前会话**的记忆
+      // （lookup_meme 学到新梗 → 记进这个群的 traits/facts）。
+      // 工具自己不知道在跟谁说话，所以由这里告知。
+      tc.conversation_id = conv_key;
 
       auto outcome = deps_.tools->run(tc);
       ::fish::log::log_line(fish::log::LogLevel::kInfo, "pipeline", "tool_ran")

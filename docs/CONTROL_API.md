@@ -85,7 +85,10 @@ Content-Type: application/json
     "chat": {
       "provider": "workbuddy", "base_url": "http://127.0.0.1:18091/v1",
       "model": "deep-model", "reasoning_effort": "high",
-      "api_key_set": true
+      "api_key_set": true,
+      "deepseek_web_tools": true,
+      "deepseek_web_tools_active": false,
+      "deepseek_web_tools_supported": false
     },
     "embedding": {"provider": "siliconflow", "base_url": "...", "model": "BAAI/bge-m3",
                   "api_key_set": true},
@@ -96,7 +99,8 @@ Content-Type: application/json
                   "format": "mp3", "app_id": "", "cluster": "", "group_voice": false},
     "document":  {"provider": "none", "base_url": "https://api.deepseek.com",
                   "api_key_set": true},
-    "search":    {"provider": "none", "base_url": "...", "api_key_set": false,
+    "search":    {"provider": "deepseek", "base_url": "https://api.deepseek.com",
+                  "api_key_set": false, "key_ready": false,
                   "api_engine": "", "max_results": 5},
     "image":     {"provider": "none", "base_url": "", "model": ""}
   },
@@ -121,6 +125,48 @@ Content-Type: application/json
 `capability.chat.reasoning_effort` 是**锁定字段**：值固定为 `high`，
 GET 一律回显锁定值（不取 `config.toml`，那里可能根本没这个键），
 PUT 试图修改会返回 `effort_locked:high`。
+
+### 服务端联网工具的三个字段
+
+`capability.chat` 下有一组三个字段，回答「搜索现在到底走哪条路」。
+
+| 字段 | 含义 |
+|---|---|
+| `deepseek_web_tools` | **用户偏好**：开关本身（默认 `true`）。可 PUT 修改 |
+| `deepseek_web_tools_supported` | **端点支不支持**：当前对话端点是不是 DeepSeek 官方 |
+| `deepseek_web_tools_active` | **实际是否生效**：开关开 **且** 端点支持 |
+
+判据是 `base_url` 而不是 `provider` 名字——控制面选「DeepSeek 官方」时会把
+`capability.chat.provider` 写成接入方式 `"openai"`，靠 provider 判断会让开关变成死开关。
+
+| 端点 | supported | active | 实际搜索路径 |
+|---|---|---|---|
+| `https://api.deepseek.com` | true | 跟随开关 | 服务端工具 `deepseek_web_search` / `deepseek_read_url` |
+| `http://127.0.0.1:18091/v1`（WorkBuddy 桥接） | false | false | 本地 `web_search` / `web_fetch` |
+
+> **开关无效 ≠ 搜索不可用**。端点非官方时开关不起作用（启动日志打
+> `deepseek_web_tools_inactive` 说明），但本地搜索照常工作。
+
+### 本地搜索的启用条件与 `key_ready`
+
+本地 `web_search` / `web_fetch` 需要**两个条件同时满足**才注册：
+
+1. `capability.search.provider != "none"`
+2. `capability.search.api_key` 解析出非空值（`${DEEPSEEK_API_KEY}` 从
+   `.env.local` 展开；同提供方在别处填过的 key 也会被复用）
+
+`capability.search.key_ready` 如实反映第 2 条：
+
+| `key_ready` | 含义 | 用户看到的 |
+|---|---|---|
+| `true` | 已有可用 key | GUI 不显示搜索的 API Key 输入框 |
+| `false` | 没 key | GUI 显示输入框，填进去保存即生效 |
+
+`key_ready` 的判定与运行时**同源**（同一套 `shared_api_key` 逻辑），
+所以控制面说「key 就绪」就一定真能搜，不会出现「界面说就绪、实际搜不了」。
+
+PUT `capability.search.api_key` 时控制面会把明文写进 `.env.local` 的
+`DEEPSEEK_API_KEY`，`config.toml` 里保持 `${DEEPSEEK_API_KEY}` 不变。
 
 ### PUT /v1/config
 

@@ -140,7 +140,7 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 | 向量 | `siliconflow/BAAI/bge-m3` | **免费** |
 | 语音识别 | `siliconflow/SenseVoiceSmall` | **免费** |
 | 语音合成 | `edge` | **免费，无需 key** |
-| 搜索 | `none` | — |
+| 搜索 | `deepseek`（官方端点走服务端工具） | 5 元/1000 次 |
 | 文档 | `none` | 按页计费（启用后） |
 | 生图 | `none` | — |
 
@@ -158,6 +158,31 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 > DeepSeek 没有 embeddings 接口，向量必须另配。见 [ADR-008](docs/decisions/008-two-vendor-keys.md)。
 > 清单以 `src/fish.capability.cppm` 的 `*_provider_list()` 为准。
+
+---
+
+## 搜索：两条路，先看清走哪条
+
+搜索有两条**互斥**的实现路径，由「对话端点是不是 DeepSeek 官方」决定。
+
+| | 服务端联网工具 | 本地工具 |
+|---|---|---|
+| 开关 | `capability.chat.deepseek_web_tools`（默认 true） | `capability.search.provider` + `api_key` |
+| 生效条件 | 开关开 **且** 端点是 DeepSeek 官方 | `provider != "none"` **且** key 解析出非空值 |
+| 实际执行 | DeepSeek 服务端（边思考边搜、引用原文） | 本机进程（`web_search` / `web_fetch`） |
+| 计费 | 按次计费 | 5 元/1000 次（DeepSeek 官方） |
+
+- **对话走 DeepSeek 官方端点** → 走服务端工具，什么都不用配（默认就是这条）。
+- **对话走 WorkBuddy 桥接 / 其它 OpenAI 兼容端点** → 走本地工具：
+  出厂已配好 `capability.search.provider = "deepseek"`，只差一把 key。
+  填 `.env.local` 的 `DEEPSEEK_API_KEY`，或在 GUI「模型」页填搜索的 API Key。
+
+**不静默**：开关在非官方端点时无效（启动日志打 `deepseek_web_tools_inactive`），
+但本地搜索照常工作；本地搜索没 key 时启动打 `env_var_missing`，
+控制面 `capability.search.key_ready = false`，GUI 的 API Key 输入框会出现。
+
+详见 [docs/modules/capability.md](docs/modules/capability.md#36-两种搜索服务端工具-vs-本地工具)
+和 [docs/API.md](docs/API.md#搜索两种方式先看清走哪条)。
 
 ---
 
@@ -204,6 +229,12 @@ journalctl --user -u super-feiyu -f
 配置模板见 [config.example.toml](config.example.toml)：它是**出厂模板**，
 实际运行的配置在 `config.toml`（已 gitignore，不入库）。
 密钥一律用 `${VAR}` 引用，不写明文。
+
+**搜索要用的 key**（`.env` / `.env.local` 里加一行即可）：
+`DEEPSEEK_API_KEY` —— 对话、搜索、文档解析共用这一把。
+没填搜索就不会启用，但**不会静默**：启动日志打 `env_var_missing`，
+控制面 `capability.search.key_ready = false`，GUI 也会提示填。
+见 [搜索：两条路](#搜索两条路先看清走哪条)。
 
 详见 [deploy/README.md](deploy/README.md)。
 

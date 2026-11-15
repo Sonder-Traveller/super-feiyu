@@ -168,14 +168,14 @@ void test_index_store() {
   fish::memory::IndexStore idx(db);
   CHECK(idx.open().ok(), "index opens");
 
-  idx.upsert_item("fact", "f1", "她喜欢猫", {1.0F, 0.0F, 0.0F});
-  idx.upsert_item("fact", "f2", "她讨厌加班", {0.0F, 1.0F, 0.0F});
+  idx.upsert_item("c1", "fact", "f1", "她喜欢猫", {1.0F, 0.0F, 0.0F});
+  idx.upsert_item("c1", "fact", "f2", "她讨厌加班", {0.0F, 1.0F, 0.0F});
 
-  auto r = idx.search({0.95F, 0.05F, 0.0F}, 1);
+  auto r = idx.search({0.95F, 0.05F, 0.0F}, 1, "c1");
   CHECK(r.ok() && r.value->size() == 1, "search returns top_k");
   CHECK(r.ok() && (*r.value)[0].id == "f1", "finds closest by cosine");
 
-  auto kw = idx.search_text("加班", 5);
+  auto kw = idx.search_text("c1", "加班", 5);
   CHECK(kw.ok() && kw.value->size() == 1, "keyword search works");
 
   idx.close();
@@ -277,7 +277,7 @@ void test_gather() {
   a.at = fish::core::Clock::now();
   ms.record("conv1", u, a);
 
-  auto ctx = ms.gather("conv1", "猫");
+  auto ctx = ms.gather("conv1");
   CHECK(ctx.ok(), "gather ok");
   CHECK(ctx.ok() && !ctx.value->working.empty(), "包含预算内的原文");
   // 长时记忆不再预注入（模型用工具自检索），gather 只带原文 + 摘要
@@ -455,7 +455,7 @@ void test_tool_registry() {
   CHECK(reg.openai_tools_json().empty(), "empty tools json");
 
   reg.add(std::make_shared<fish::tool::MemorySearchTool>(
-      [](const std::string& q, int) {
+      [](const std::string& /*conv_id*/, const std::string& q, int) {
         if (q == "cat") return std::vector<std::string>{"用户养了一只猫"};
         return std::vector<std::string>{};
       }));
@@ -499,8 +499,8 @@ void test_tool_truncate() {
   std::printf("\n=== tool: result truncation ===\n");
   fish::tool::Registry reg;
   reg.add(std::make_shared<fish::tool::MemorySearchTool>(
-      [](const std::string&, int) {
-        // 返回超长内容，验证截断
+      [](const std::string& /*conv_id*/, const std::string&, int) {
+        // 返回超长内容，验证不截断
         return std::vector<std::string>{std::string(20000, 'a')};
       }));
 

@@ -112,6 +112,71 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
 # → {"ok":true}
 ```
 
+## 搜索：两种方式，先看清走哪条
+
+搜索有两条互斥的实现路径，由「对话端点是不是 DeepSeek 官方」决定。
+
+### 1. DeepSeek 服务端联网工具（官方端点）
+
+开关：`capability.chat.deepseek_web_tools`，**默认 true**。
+
+- **只在 DeepSeek 官方端点生效**。判据是 `base_url`（含 `api.deepseek.com` / `deepseek`），
+  不是 `provider` 名字——控制面选「DeepSeek 官方」时会把 `provider` 写成接入方式 `"openai"`。
+- 开启后**本地 `web_search` / `web_fetch` 不注册**，搜索由 DeepSeek 服务端执行
+  （`deepseek_web_search` / `deepseek_read_url`）。
+- **边思考边搜**：配合 `reasoning_effort=high`，服务端在多步推理中自主搜索、
+  开网页、页内查找（约 20 次调用）。
+- **按次计费**（走模型 token 账）。
+
+### 2. 本地搜索（其它端点）
+
+开关：`capability.search.provider` + 对应的 `api_key`。
+
+启用条件**两条都要满足**：
+
+| 条件 | 不满足的后果 |
+|---|---|
+| `capability.search.provider != "none"` | 不注册搜索工具 |
+| 该能力的 `api_key` 解析出非空值 | 不注册搜索工具 |
+
+出厂配置已经配好 `provider = "deepseek"`，只差一把 key：
+
+```bash
+# .env.local 里加一行（同一把 key 也供对话、文档解析复用）
+DEEPSEEK_API_KEY=sk-xxx
+```
+
+也可以在 GUI「模型」页填：搜索提供方选「DeepSeek 官方」→ 填 API Key → 保存
+（控制面把明文写进 `.env.local`，`config.toml` 里保持 `${DEEPSEEK_API_KEY}`）。
+
+不想为搜索付费就换 provider：`tavily`（每月 1000 次免费）、`searxng`（自建免费）、
+`bocha`、`brave`、`exa` 等，清单见 `GET /v1/config` 的 `capability.providers.search`。
+
+### 3. 怎么选
+
+| 场景 | 用哪种 | 怎么配 |
+|---|---|---|
+| 对话走 DeepSeek 官方端点 | 服务端工具（默认） | 什么都不用配 |
+| 对话走 WorkBuddy 桥接 / 其它 OpenAI 兼容端点 | 本地工具 | `capability.search.provider = "deepseek"` + 填 key |
+| 想要免费 / 自建搜索 | 本地工具 | 换 `tavily` / `searxng` + 对应 key |
+| 走官方端点但想省按次费用 | 本地工具 | `deepseek_web_tools = false` + 配 `capability.search` |
+
+### 4. 不静默
+
+开关闭关都不静默，三处都会如实说：
+
+| 位置 | 表现 |
+|---|---|
+| 启动日志 | 开关开但端点非官方 → `info / capability / deepseek_web_tools_inactive`（附 hint） |
+| 启动日志 | 本地搜索没 key → `warn / config / env_var_missing / var=DEEPSEEK_API_KEY` |
+| `GET /v1/config` | `capability.chat.deepseek_web_tools_active` / `_supported` / `capability.search.key_ready` |
+| GUI | 开关在非官方端点时置灰并说明「搜索走本地」；`key_ready=false` 时显示 API Key 输入框 |
+
+**开关无效 ≠ 搜索不可用**：端点非官方时 `deepseek_web_tools` 不起作用，
+但本地搜索照常工作。
+
+详见 [modules/capability.md](modules/capability.md#36-两种搜索服务端工具-vs-本地工具)。
+
 ## 人格生效时机
 
 **热加载**：`persona_for()` 每次请求都读盘，改完下一条消息就生效，不用重启。

@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
   std::printf("  索引条目数: %zu\n", count);
 
   // 召回：查询应与记忆内容相关
-  auto ctx = mem.gather(conv, "我在哪上班");
+  auto ctx = mem.gather(conv);
   CHECK(ctx.ok(), "gather 成功");
 
   // 删除索引，验证能从旁路文件重建

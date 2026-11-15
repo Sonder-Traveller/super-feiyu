@@ -192,7 +192,7 @@ void test_token_budget_compaction() {
 
   CHECK(ms.needs_compaction("conv"), "总量超预算 → 需要压缩");
 
-  auto ctx_before = ms.gather("conv", "");
+  auto ctx_before = ms.gather("conv");
   CHECK(ctx_before.ok(), "gather ok");
   const std::size_t before_tokens = ctx_before.ok() ? ctx_before.value->estimated_tokens : 0;
   CHECK(before_tokens <= 120, "上下文被裁到预算内（<=120 token）");
@@ -203,12 +203,12 @@ void test_token_budget_compaction() {
   auto rep = ms.compact("conv", cons);
   CHECK(rep.ok(), "compact 成功");
 
-  auto ctx_after = ms.gather("conv", "");
+  auto ctx_after = ms.gather("conv");
   CHECK(ctx_after.ok(), "压缩后 gather ok");
   CHECK(ctx_after.ok() && !ctx_after.value->summary.empty(), "生成了摘要");
 
   // 原文没丢：应能从索引/旁路文件检索到
-  auto hits = ms.search("第 15 条", 5);
+  auto hits = ms.search("conv", "第 15 条", 5);
   CHECK(hits.ok() && !hits.value->empty(), "压缩掉的内容仍可检索到");
 
   fs::remove_all(base);
@@ -239,7 +239,7 @@ void test_gather_full_when_under_budget() {
   }
 
   CHECK(!ms.needs_compaction("c2"), "远低于预算 → 不需要压缩");
-  auto ctx = ms.gather("c2", "");
+  auto ctx = ms.gather("c2");
   CHECK(ctx.ok(), "gather ok");
   CHECK(ctx.ok() && ctx.value->working.size() == 100, "50 轮 = 100 条全部返回（一份不少）");
 
@@ -267,6 +267,12 @@ void test_raw_buffer_cap() {
   // 恰好等于上限时不误伤
   auto exact = fish::memory::TokenBudget::make(window, 0.50, 0.25);
   CHECK(exact.raw_budget == half, "配置正好 0.50 → 原样保留");
+
+  // 下限保护：配得过低（每轮都压缩、疯狂调 LLM）→ 抬到下限
+  const std::size_t min_budget =
+      static_cast<std::size_t>(window * fish::memory::TokenBudget::kRawBufferMinRatio);
+  auto too_small = fish::memory::TokenBudget::make(window, 0.01, 0.25);
+  CHECK(too_small.raw_budget == min_budget, "配置 0.01 → 抬到下限 5%");
 
   // 三段预算加起来不超过窗口
   CHECK(modest.raw_budget + modest.summary_budget + modest.reserve ==

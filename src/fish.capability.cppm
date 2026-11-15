@@ -160,9 +160,11 @@ struct ChatConfig {
   //
   // 开启后由 DeepSeek 服务端执行搜索与抓取，客户端不执行任何工具；
   // 配合 reasoning_effort=high 时 deepseek_web_search 是「深度思考搜索」。
-  // 默认 false：不改变现有行为，且服务端工具按次计费。
-  // 只对 provider=deepseek 生效（其他 provider 声明这两个 type 会 400）。
-  bool deepseek_web_tools{false};
+  // 默认开（default_deepseek_web_tools()）：服务端工具按次计费，但它是
+  // 产品默认路径（边思考边搜 + 引用原文）。
+  // 只对 DeepSeek 官方端点生效（其他 provider 声明这两个 type 会 400）；
+  // 端点不是官方时，本地 web_search/web_fetch 照常注册，搜索能力不受影响。
+  bool deepseek_web_tools{true};
 
   // 上游是否支持「assistant 角色消息里带图片」。
   //
@@ -280,6 +282,38 @@ std::string resolve_provider_key_for(const fish::config::Config& c,
 // 各写各的 "high" 迟早会跑偏（曾经就出现控制面回显空串、运行时发 high）。
 const char* locked_reasoning_effort();
 
+// 端点是不是 DeepSeek 官方（服务端联网工具的唯一端点判据）。
+//
+// 判断依据必须是 base_url 而不是 provider：控制面在用户选
+// 「DeepSeek 官方」时会把 provider 写成接入方式 "openai"（见
+// fish.control.cppm 的 kChatDialect + ProviderPreset），所以
+// provider 字段几乎永远是 openai，靠它判断会把开关彻底变成死开关。
+[[nodiscard]] bool is_deepseek_endpoint(const std::string& provider,
+                                         const std::string& base_url);
+
+// deepseek_web_tools 的出厂默认值（true）。
+//
+// 单独定义一份而不是各处硬编码 true：控制面 GET 回显、运行时
+// load_chat_config 的默认值必须同源，否则界面显示「关」而运行时
+// 已经按「开」在跑（历史上 reasoning_effort 就出过这种错）。
+[[nodiscard]] bool default_deepseek_web_tools();
+
+// 服务端联网工具是否真正生效：既要看开关，也要看端点是不是 DeepSeek 官方。
+// 两者缺一不可——开关开着但端点不是官方时，本地 web_search/web_fetch 必须照常注册。
+//
+// 这个函数是**唯一的判据来源**，capability（是否注入服务端工具）与
+// main.cpp（是否注册本地搜索/抓取工具）都用它。两边各判各的会出
+// 「搜索能力凭空消失」：一边不注入服务端工具、另一边又注销了本地工具，
+// 而且没有任何报错。
+//
+// 注意：这里只收基本类型，**不要**在 export 接口里出现 fish::config::Config
+// 这类外部模块的具体类型——clang 21 序列化 pcm 时会因为跨模块的具体类型
+// 崩溃（崩在 ASTWriter::VisitUnresolvedLookupExpr，位置随机）。
+// 需要读 config 的调用方请用下面的三参数版本，自己取好值传进来。
+[[nodiscard]] bool server_web_tools_active_for(const std::string& provider,
+                                               const std::string& base_url,
+                                               bool enabled);
+
 fish::core::Result<std::unique_ptr<fish::core::IChatModel>> make_chat(const ChatConfig& cfg);
 fish::core::Result<std::unique_ptr<fish::core::IEmbeddingModel>> make_embedding(
     const EmbeddingConfig& cfg);
@@ -324,6 +358,45 @@ const char* chat_provider_list() {
 // 控制面 GET 回显、PUT 拒绝、运行时默认值三处共用同一个来源。
 const char* locked_reasoning_effort() {
   return "high";
+}
+
+// 端点是不是 DeepSeek 官方。
+//
+// 这两个服务端工具只有 DeepSeek 官方支持，声明给别家会 400。
+//
+// 判断依据必须是 base_url 而不是 provider：控制面在用户选
+// 「DeepSeek 官方」时会把 provider 写成接入方式 "openai"（见
+// fish.control.cppm 的 kChatDialect + ProviderPreset），所以
+// provider 字段几乎永远是 openai，靠它判断会把开关彻底变成死开关。
+bool is_deepseek_endpoint(const std::string& provider, const std::string& base_url) {
+  if (provider == "deepseek") return true;
+  std::string base = base_url;
+  for (auto& ch : base) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return base.find("api.deepseek.com") != std::string::npos ||
+         base.find("deepseek") != std::string::npos;
+}
+
+// 出厂默认值：开。
+//
+// 服务端联网工具是产品默认路径（边思考边搜 + 引用原文），默认关的话
+// 绝大多数用户根本不会发现它存在。
+bool default_deepseek_web_tools() { return true; }
+
+// 三参数版本：判据的唯一实现。调用方自己从配置取值传进来。
+//
+// = 开关打开 且 端点是 DeepSeek 官方。
+//
+// 两个条件缺一不可。开关开着但端点不是官方（例如当前 WorkBuddy 桥接
+// 部署）时，本地 web_search/web_fetch 必须照常注册——否则两个搜索工具
+// 同时消失，搜索能力凭空消失，而且没有任何报错。
+//
+// 这里没有再判协议方言：make_chat 只接受 deepseek/workbuddy/openai
+// 三家，全是 OpenAI 兼容协议（dialect_of 一律返回 kOpenAI），
+// 方言条件恒成立，所以没必要在这里重复一遍。
+bool server_web_tools_active_for(const std::string& provider, const std::string& base_url,
+                                 bool enabled) {
+  if (!enabled) return false;
+  return is_deepseek_endpoint(provider, base_url);
 }
 // 向量：这几家都托管 DeepSeek，且各有向量接口。
 // DeepSeek 官方没有向量端点，所以不在列表里。
@@ -734,7 +807,8 @@ class HttpChat final : public fish::core::IChatModel {
     //     presence_penalty / stop / seed / n / parallel_tool_calls 会被
     //     服务端忽略，所以这里干脆不发，避免"看起来生效了"。
     const bool web_tools =
-        cfg_.deepseek_web_tools && dial_ == Dialect::kOpenAI && is_deepseek_endpoint();
+        cfg_.deepseek_web_tools && dial_ == Dialect::kOpenAI &&
+        is_deepseek_endpoint(cfg_.provider, cfg_.base_url);
     if (web_tools) {
       json tools = json::array();
       tools.push_back({{"type", "deepseek_web_search"}});
@@ -872,20 +946,6 @@ class HttpChat final : public fish::core::IChatModel {
   }
 
  private:
-  // 这两个服务端工具只有 DeepSeek 官方支持，声明给别家会 400。
-  //
-  // 判断依据必须是 base_url 而不是 cfg_.provider：控制面在用户选
-  // 「DeepSeek 官方」时会把 provider 写成接入方式 "openai"（见
-  // fish.control.cppm 的 kChatDialect + ProviderPreset），所以
-  // provider 字段几乎永远是 openai，靠它判断会把开关彻底变成死开关。
-  [[nodiscard]] bool is_deepseek_endpoint() const {
-    if (cfg_.provider == "deepseek") return true;
-    std::string base = cfg_.base_url;
-    for (auto& ch : base) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    return base.find("api.deepseek.com") != std::string::npos ||
-           base.find("deepseek") != std::string::npos;
-  }
-
   // ── 服务端联网工具：解析与观测 ──
   //
   // Chat Completions 协议里的形态（见 guides/web_tools.md）：
@@ -3339,8 +3399,23 @@ ChatConfig load_chat_config(const fish::config::Config& c) {
   cfg.reasoning_effort =
       c.get_or("capability.chat.reasoning_effort", locked_reasoning_effort());
   cfg.timeout_ms = static_cast<int>(c.get_int_or("capability.chat.timeout_ms", 30000));
-  // DeepSeek 服务端联网工具：默认关，不改变现有行为
-  cfg.deepseek_web_tools = c.get_bool_or("capability.chat.deepseek_web_tools", false);
+  // DeepSeek 服务端联网工具：默认开（default_deepseek_web_tools）。
+  // 真正生效还要端点是 DeepSeek 官方——判据见 server_web_tools_active()。
+  cfg.deepseek_web_tools = c.get_bool_or("capability.chat.deepseek_web_tools",
+                                         default_deepseek_web_tools());
+  // 开关开着但端点不是 DeepSeek 官方时，明确说一声。
+  //
+  // 不说的话，用户以为「服务端联网搜索已开启」，实际搜索走的是本地
+  // 工具（端点非官方时服务端工具根本不生效）——两套路径的计费、引用、
+  // 行为都不同，用户无从判断自己用的是哪一套。
+  if (cfg.deepseek_web_tools && !is_deepseek_endpoint(cfg.provider, cfg.base_url)) {
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "capability",
+                          "deepseek_web_tools_inactive")
+        .field("provider", cfg.provider)
+        .field("base_url", cfg.base_url)
+        .field("hint",
+               "端点非 DeepSeek 官方，服务端联网工具不生效，使用本地搜索");
+  }
   // supports_assistant_image 不在这里读配置：
   // 由 fish.probe 探测后由 main 注入，避免配置过时。
   return cfg;

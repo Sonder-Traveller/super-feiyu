@@ -490,12 +490,15 @@ int main(int argc, char** argv) {
   std::unique_ptr<fish::core::IWebFetch> fetch_holder;
   std::unique_ptr<fish::meme::MemeStore> meme_store;
 
-  // 记忆检索：用向量 + 关键词混合召回
+  // 记忆检索：用向量 + 关键词混合召回（按会话隔离）
+  //
+  // 会话键来自 Call::conversation_id（编排层在调工具前填好）。
+  // 空值时检索层返回空结果而不是跨会话乱捞——宁可查不到，也不泄漏。
   if (memory_ready) {
     tools.add(std::make_shared<fish::tool::MemorySearchTool>(
-        [&memory_sys](const std::string& query, int top_k) {
+        [&memory_sys](const std::string& conv_id, const std::string& query, int top_k) {
           std::vector<std::string> out;
-          auto hits = memory_sys.search(query, top_k);
+          auto hits = memory_sys.search(conv_id, query, top_k);
           if (hits.ok()) {
             for (const auto& h : *hits.value) out.push_back(h.text);
           }
@@ -545,35 +548,57 @@ int main(int argc, char** argv) {
   }
 
   // 网络搜索：只有配置了 provider 才注册。
-  // DeepSeek 服务端联网工具（capability.chat.deepseek_web_tools）开启时
-  // 不注册本地 web_search/web_fetch——两者不能混用，且服务端搜索免本地配额
-  //（判断依据直接读 config，与装配给 orchestrator 的是同一来源）。
-  const bool deepseek_web_tools_on =
-      cfg.get_bool_or("capability.chat.deepseek_web_tools", false);
-  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty() &&
-      !deepseek_web_tools_on) {
+  //
+  // 判据用 fish::capability::server_web_tools_active_for(...)——它同时看
+  // 「开关是否打开」和「端点是不是 DeepSeek 官方」，与 capability 侧
+  // 注入服务端工具用的是同一个判据。
+  //
+  // 以前这里只看开关，而 capability 侧还要额外判端点：开关开着但端点
+  // 不是官方（当前 WorkBuddy 桥接部署就是）时，两边都「以为」服务端
+  // 搜索开着——本地 web_search/web_fetch 被注销，服务端工具又不注入，
+  // 两个搜索工具同时消失，搜索能力凭空蒸掉且没有任何报错。
+  const bool web_tools_active = fish::capability::server_web_tools_active_for(
+      cfg.get_or("capability.chat.provider", "deepseek"),
+      cfg.get_or("capability.chat.base_url", "https://api.deepseek.com"),
+      cfg.get_bool_or("capability.chat.deepseek_web_tools",
+                      fish::capability::default_deepseek_web_tools()));
+
+  // 搜索后端：只要 provider 配了且 key 解析出非空值就建一个。
+  //
+  // 注意这里**不看** web_tools_active：
+  //   - web_tools_active 只决定「要不要把 web_search 工具暴露给模型」
+  //     （服务端联网工具开启时，本地 web_search 不注册，避免混用）
+  //   - 热梗学习用的是这个后端做**后台自动检索**，
+  //     不经过模型的工具声明，跟服务端工具不冲突。
+  //
+  // 以前热梗的联网路径直接复用「注册了 web_search 才有的」后端，
+  // 于是服务端联网工具一开，热梗就再也学不了了。
+  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
     auto searcher = fish::capability::make_search(search_cfg);
     if (searcher.ok() && *searcher.value) {
       search_holder = std::move(*searcher.value);
-      auto* raw = search_holder.get();
-      tools.add(std::make_shared<fish::tool::WebSearchTool>(
-          [raw](const std::string& query, int max_results) {
-            std::vector<fish::tool::WebSearchTool::Hit> out;
-            auto r = raw->search(query, max_results);
-            if (r.ok()) {
-              for (const auto& h : *r.value) {
-                out.push_back({h.title, h.url, h.snippet});
-              }
-            }
-            return out;
-          }));
     }
   }
 
+  if (search_holder != nullptr && !web_tools_active) {
+    auto* raw = search_holder.get();
+    tools.add(std::make_shared<fish::tool::WebSearchTool>(
+        [raw](const std::string& query, int max_results) {
+          std::vector<fish::tool::WebSearchTool::Hit> out;
+          auto r = raw->search(query, max_results);
+          if (r.ok()) {
+            for (const auto& h : *r.value) {
+              out.push_back({h.title, h.url, h.snippet});
+            }
+          }
+          return out;
+        }));
+  }
+
   // 网页抓取：与搜索配套，search 找链接、fetch 读内容
-  // （deepseek_web_tools 开启时同样不注册，理由同上）
+  // （web_tools_active 为真时同样不注册，理由同上）
   if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty() &&
-      !deepseek_web_tools_on) {
+      !web_tools_active) {
     auto fetcher = fish::capability::make_fetch(search_cfg);
     if (fetcher.ok() && *fetcher.value) {
       fetch_holder = std::move(*fetcher.value);
@@ -599,29 +624,67 @@ int main(int argc, char** argv) {
 
     fish::tool::MemeLookupTool::RemoteSearcher remote;
     if (raw_search != nullptr) {
-      // 有搜索后端时才启用联网补充
-      remote = [raw_search](const std::string& query) {
+      // 有搜索后端时才启用联网补充。
+      //
+      // 查询串的构造：**无条件**用「梗名」作为查询主体，
+      // 不做关键词黑名单——不判断模型在问什么，只从字面上取梗名
+      // （见 fish::meme::term_candidate）。
+      remote = [raw_search, provider_name = search_cfg.provider](
+                   const std::string& query, std::string* error) {
         std::vector<fish::tool::MemeLookupTool::Hit> out;
-        auto r = raw_search->search(query + " 梗 含义", 3);
-        if (r.ok()) {
-          for (const auto& h : *r.value) {
-            fish::tool::MemeLookupTool::Hit hit;
-            hit.term = query;
-            // 用搜索结果拼一个粗略解释
-            hit.meaning = h.title + (h.snippet.empty() ? "" : "。" + h.snippet);
-            hit.usage = h.url;
-            out.push_back(std::move(hit));
+        if (error != nullptr) error->clear();
+
+        // 梗名：拉丁字母的梗取最长的一段（yyds），中文的取第一段
+        const std::string term = fish::meme::term_candidate(query);
+        if (term.empty()) {
+          if (error != nullptr) *error = "empty_term";
+          return out;
+        }
+
+        // 查询串：梗名 + 释义类关键词。
+        // DeepSeek 官方 Search 的 query 上限 128 字符。
+        std::string q = term + " 什么意思 梗 含义";
+        if (q.size() > 120) q.resize(120);
+
+        auto r = raw_search->search(q, 3);
+        if (!r.ok()) {
+          // 失败原因传给工具，工具才能区分「联网失败」和「没搜到」
+          if (error != nullptr) *error = r.error.detail;
+          return out;
+        }
+        for (const auto& h : *r.value) {
+          fish::tool::MemeLookupTool::Hit hit;
+          hit.term = term;
+          // 释义：优先取摘要（snippet / summary），拿不到就取正文前几百字。
+          // **不自己编释义**——原文里是什么就是什么。
+          hit.meaning = h.snippet;
+          if (hit.meaning.empty() && !h.title.empty()) {
+            hit.meaning = h.title.substr(0, 300);
           }
+          if (hit.meaning.size() > 600) hit.meaning.resize(600);
+          // 用法示例：只从原文里摘已经存在的引号片段，不自己编
+          hit.usage = fish::meme::extract_usage_example(h.snippet + " " + h.title, term);
+          // 来源：记进 meme 库的 origin 列
+          hit.source = provider_name;
+          out.push_back(std::move(hit));
         }
         return out;
       };
+    } else {
+      // 联网不可用：原因写清楚，运维一眼能看出是「没配 provider」还是「没 key」
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "meme_remote_unavailable")
+          .field("provider", search_cfg.provider)
+          .field("api_key_empty", search_cfg.api_key.empty())
+          .field("hint", std::string(
+                           "热梗联网学习不可用：capability.search 未配置 provider 或 api_key，"
+                           "模型查到本地没有的梗时只能如实说没查到"));
     }
 
     tools.add(std::make_shared<fish::tool::MemeLookupTool>(
         [ms](const std::string& query) {
           std::vector<fish::tool::MemeLookupTool::Hit> out;
           for (const auto& e : ms->search(query)) {
-            out.push_back({e.term, e.meaning, e.usage});
+            out.push_back({e.term, e.meaning, e.usage, "local"});
           }
           return out;
         },
@@ -633,10 +696,17 @@ int main(int argc, char** argv) {
             e.term = h.term;
             e.meaning = h.meaning;
             e.usage = h.usage;
-            e.origin = "web";
+            // 来源：哪个 provider 查到的
+            e.origin = h.source.empty() ? "web" : h.source;
             entries.push_back(std::move(e));
           }
           return ms->import_many(entries);
+        },
+        // 记住到当前会话：学到的梗落成 trait + fact，
+        // 让模型知道「这个人/这个群在用这个梗」，而不是全世界都知道。
+        [&memory_sys](const std::string& conv_id, const std::string& term,
+                      const std::string& meaning) {
+          memory_sys.remember_meme(conv_id, term, meaning);
         }));
   }
 
@@ -716,9 +786,14 @@ int main(int argc, char** argv) {
   deps.passive_window_ms =
       static_cast<int>(cfg.get_int_or("orchestrator.passive_window_ms", 300000));
   // DeepSeek 服务端联网工具：开了它本地 web_search/web_fetch 就不注册
-  // （见下方工具装配与 orchestrator 的工具声明过滤）
-  deps.deepseek_web_tools =
-      cfg.get_bool_or("capability.chat.deepseek_web_tools", false);
+  // （见下方工具装配与 orchestrator 的工具声明过滤）。
+  //
+  // 这里必须填 web_tools_active（= 开关开 且 端点是 DeepSeek 官方），
+  // 不能填原始配置开关：orchestrator 按这个值过滤 tools_json 里的
+  // web_search/web_fetch，只有和服务端注入条件一致，两边才不会错位。
+  // 填原始开关的话，桥接部署下（开关开、端点非官方）编排层会把本地
+  // 搜索从声明里剔掉，而服务端工具又没注入——搜索工具彻底消失。
+  deps.deepseek_web_tools = web_tools_active;
 
   fish::orchestrator::Pipeline pipeline(deps);
 

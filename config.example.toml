@@ -51,9 +51,10 @@ model = "deepseek-flash"
 # 思考强度锁死 high（产品要求），控制面也拒绝修改。
 reasoning_effort = "high"
 # DeepSeek 服务端联网工具（deepseek_web_search / deepseek_read_url）。
-# 仅 provider=deepseek 生效；开启后本地 web_search/web_fetch 不注册，
-# 服务端执行搜索（按次计费）。
-deepseek_web_tools = false
+# 默认开启。仅当对话提供方是 DeepSeek 官方端点时真正生效；此时本地
+# web_search/web_fetch 不再注册，搜索由服务端执行（按次计费）。
+# 接 WorkBuddy 桥接层时本项无效，本地搜索照常工作。
+deepseek_web_tools = true
 timeout_ms = 30000
 
 # ── WorkBuddy 桥接 ──
@@ -165,8 +166,29 @@ max_bytes = 104857600
 #
 # 聚合成一层：provider 选哪家协议，换一家只改这里。
 # 各家字段差异（url vs link、title vs name）已在实现里适配。
+#
+# ── 启用条件（两条都要满足，缺一条搜索就没开）────────────
+#   1. provider != "none"    —— 决定用哪家的协议
+#   2. api_key 解析出非空值  —— 没 key 就不注册 web_search/web_fetch
+#
+# api_key 写 "${DEEPSEEK_API_KEY}" 时，这把 key 从 .env.local 读。
+# **没填 = 搜索不启用**。但「没填」不会静默，三处都会说：
+#   - 启动日志：warn / config / env_var_missing / var=DEEPSEEK_API_KEY
+#   - 控制面：GET /v1/config 的 capability.search.key_ready = false
+#   - GUI：「模型」页的搜索 API Key 输入框会出现，填进去保存即生效
+#
+# 填 key 的两种方式（等价）：
+#   1. 直接编辑 .env.local，加一行 DEEPSEEK_API_KEY=sk-xxx
+#   2. GUI「模型」页 → 搜索提供方选 DeepSeek 官方 → 填 API Key → 保存
+#      （控制面把 key 写进 .env.local，config.toml 里保持 ${DEEPSEEK_API_KEY}）
+#
+# ⚠ 与服务端联网工具的互斥关系：
+#   对话提供方是 DeepSeek 官方端点且 capability.chat.deepseek_web_tools
+#   开启时，本地 web_search/web_fetch **不注册**——搜索由服务端执行
+#   （deepseek_web_search / deepseek_read_url，边思考边搜，按次计费）。
+#   端点不是官方（如 WorkBuddy 桥接）时，开关无效，搜索照常走本地。
 [capability.search]
-provider = "none"
+provider = "deepseek"
 # 空 = 按 provider 用官方默认地址
 base_url = "https://api.deepseek.com"
 # 请求路径，空 = 按 provider 用默认值
@@ -229,8 +251,11 @@ ttl_days = 30          # 缓存有效期，过期自动重探
 on_start = true        # 启动时同步探测（false = 只用缓存，后台再探）
 
 # ══════════ 工具调用 ══════════
-# 模型可主动调用的工具：search_memory / search_images / web_search
-# web_search 只在 capability.search.provider != "none" 时注册
+# 模型可主动调用的工具：search_memory / search_images / web_search / web_fetch
+# web_search / web_fetch 需要**两个条件同时满足**才注册：
+#   capability.search.provider != "none" 且该能力的 api_key 解析出非空值
+# 另外：对 DeepSeek 官方端点开了 capability.chat.deepseek_web_tools 时，
+# 本地 web_search / web_fetch 不注册（改由服务端执行搜索）。
 [tool]
 max_rounds = 0         # 单轮最多几次工具调用；0 = 不限制，由模型自己决定何时停
 
