@@ -121,6 +121,14 @@ class Server {
     convos_ = book;
   }
 
+  // 记忆索引重建回调。POST /v1/memory/rebuild 时在后台线程里调用。
+  //
+  // 返回值：重建后的条目数，负数表示失败（失败原因由实现侧打日志）。
+  // 用 int64 而不是 size_t 是为了能表达失败——大小本身够用。
+  void set_memory_rebuild_callback(std::function<long long()> cb) {
+    memory_rebuild_cb_ = std::move(cb);
+  }
+
  private:
   void accept_loop();
   void handle_connection(int fd);
@@ -155,6 +163,7 @@ class Server {
   std::mutex routes_mu_;
   std::function<std::string()> status_cb_;
   std::function<void()> restart_cb_;
+  std::function<long long()> memory_rebuild_cb_;
   // 凭据令牌缓存（mutable：check_auth 是 const 的）。
   mutable std::mutex cred_token_mu_;
   mutable std::string cred_token_cache_;
@@ -916,6 +925,41 @@ Response Server::builtin_route(const Request& req) {
         return r;
       }
       r.body = c.body;
+      return r;
+    }
+
+    // ── 记忆索引重建 ──
+    //
+    // 索引是**派生数据**（真源是 data/memory/notes/ 下的 Markdown），
+    // 坏了、改了 embedding 模型、或怀疑漏了条目时，用它从真源重新灌一遍。
+    //
+    // 为什么要在控制面暴露：启动时的自愈只在「条目数对不上」时触发，
+    // 覆盖不到「向量算错了但条数一样」这种情况；而这个操作要调
+    // embedding（可能几十秒），不能塞在请求线程里同步跑太久——
+    // 所以放到后台线程，立刻回 accepted，进度看日志 index_rebuilt。
+    if (req.method == "POST" && path == "/v1/memory/rebuild") {
+      Response r;
+      if (!memory_rebuild_cb_) {
+        r.status = 503;
+        r.body = R"({"error":"rebuild_unavailable"})";
+        return r;
+      }
+      auto cb = memory_rebuild_cb_;
+      std::thread([cb]() {
+        try {
+          const auto n = cb();
+          if (n < 0) {
+            ::fish::log::log_line(::fish::log::LogLevel::kWarn, "api",
+                                  "memory_rebuild_failed");
+          }
+        } catch (const std::exception& e) {
+          ::fish::log::log_line(::fish::log::LogLevel::kWarn, "api",
+                                "memory_rebuild_threw")
+              .field("detail", e.what());
+        }
+      }).detach();
+      r.status = 202;
+      r.body = R"({"accepted":true,"detail":"rebuild started in background"})";
       return r;
     }
 

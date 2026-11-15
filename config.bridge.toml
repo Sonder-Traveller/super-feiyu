@@ -24,7 +24,6 @@ dimension = 1024
 [capability.tts]
 provider = "edge"
 voice = "zh-CN-XiaoyiNeural"
-group_voice = false
 
 [memory]
 working_rounds = 20

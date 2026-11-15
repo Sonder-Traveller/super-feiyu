@@ -137,8 +137,6 @@ cluster = ""
 # 例：{"audio":{"speed_ratio":1.1,"volume_ratio":1.2}}
 extra_json = ""
 timeout_ms = 20000
-# 群里是否也发语音（false = 只在私聊发）
-group_voice = false
 
 # ── 文档输入 ──
 # provider 清单：deepseek | none

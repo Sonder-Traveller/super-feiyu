@@ -1,30 +1,27 @@
 // src/fish.meme.cppm
-// 网络热梗库：把清单交给模型自己挑，外部学到的写回本地。
+// 网络热梗库：按词查、学新词、纠错。
 //
 // 设计：
 //   - 独立存储区（data/memes/），与记忆分开：
 //     热梗是「公共知识」，不随会话隔离；记忆是「私人上下文」
 //   - 权威源是纯文本文件（人可读、可手改、可增删）
-//   - **不做检索**：all() 列出全部条目，模型自己看清单挑；
-//     detail(index) 按序号取一条。程序不参与「这条是不是用户问的那个」的判断
-//     ——那是模型的事，程序只负责如实摆出有哪些条目。
-//   - 清单里没有的梗，由模型点名（learn 参数）后联网学一次并写回
+//   - **查找靠百分比相似度，不做子串匹配**：
+//     lookup_meme 只收一个词，程序用「字符二元组 Dice 相似度」算百分比，
+//     达到阈值才算命中。命中直接给库里的释义；不命中就自动联网学一次并写回。
+//     为什么不是子串：子串是 0/1 判断，「拴Q」查不到「栓Q」的条目，
+//     而「这个」「意思」这种片段又会命中半张表。百分比既能容忍写法差异，
+//     又能把置信度量出来——没到阈值就是没命中，交给联网去查。
 //
-// 为什么需要：
+// 为什么需要本地库：
 //   模型训练数据有截止日期，新梗它不知道。若每次都联网查，既慢又贵。
 //   所以本地建库：学到一次就记住，之后零成本。
-//
-// 为什么不做子串匹配（历史教训）：
-//   以前 search(query) 用双向子串去匹配 term/释义/用法，试图「猜」模型在问哪个梗。
-//   结果是「这个」「意思」这类片段命中大半张表，模型拿到一堆不相干的条目，
-//   反而更看不懂；真正想看的条目还常被 max_results 截掉。
-//   现在改成列清单：程序不做任何判断，模型读到清单自己选，准确率反而更高。
 module;
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -53,28 +50,47 @@ struct Entry {
   std::string added_at;    // yyyy-mm-dd
   // 别名 / 变体：同一个梗的其它写法。
   //
-  // 现在不再用于「检索匹配」（已经没有检索了），只用于两件事：
-  //   1. 写回查重：别名撞别名也算同一个梗，不重复入库
-  //   2. 清单里给模型看：「梗名（也叫 别名1、别名2）」
-  //      ——用户可能用的是别名或者另一种写法，模型看到就知道是同一条。
+  // 两个用途：
+  //   1. 查重 / 匹配：别名撞别名也算同一个梗
+  //   2. 命中时一并展示：「梗名（也叫 别名1、别名2）」
   std::vector<std::string> aliases;
-  // 被取详情次数（index 取一条时 +1）。
-  //
-  // 语义已变：以前是「search 命中次数」（翻清单也算命中，没意义），
-  // 现在是「这条真被模型拿去用了几次」。TSV 结构不变，存量数据照样读。
+  // 被取详情次数（命中时 +1）。
   int hits{0};
+  // 是否被人工 / 模型纠正过（fix_meme 写入后置 true）。
+  //
+  // 为什么需要：自动联网学来的释义质量参差，纠正过的才是可信的。
+  //   再次联网学到同一条时，不许把纠正过的释义覆盖回去。
+  bool edited{false};
+
+  // 这条条目有没有被这个名字命中（名字与 term 或任一 alias 匹配）。
+  [[nodiscard]] bool matches(const std::string& name, int* percent_out = nullptr) const;
 };
 
 // 规范化：全角→半角、ASCII 小写、去掉所有空白。
-//
-// 现在的用途只剩「判断两个写法是不是同一个词」：
-//   - 写回查重（same_term）
-//   - 别名 / 变体等价（拴Q ↔ 栓Q）
-// 它**不参与**「猜用户问的是哪个梗」——那件事已经没有了。
-//
-// 非 ASCII（中文等）原样保留：中文没有大小写 / 全角问题，
-// 写法变体（拴Q / 栓Q）由变体表处理。
 std::string normalize_text(const std::string& s);
+
+// 名字相似度（0~100 的百分比）。
+//
+// 算法：字符二元组 Dice 系数。
+//   1. 两侧都规范化（全角→半角、小写、去空白、去标点）
+//   2. 切成字符（不是字节，中文一个字算一个）
+//   3. 相邻两字符组成二元组，取多重集合
+//   4. Dice = 2 * |交集| / (|A| + |B|)
+//
+// 为什么用二元组而不是编辑距离：编辑距离对「yyds」和「yyds是什么意思」
+// 会算出很高的相似度（只多了 5 个字，距离 5），而二元组把多出来的字
+// 也算进分母，得分会明显掉下来，正好符合我们要的「不像同一个词」。
+//
+// 完全相同 → 100。任一侧为空 → 0。
+int percent_match(const std::string& a, const std::string& b);
+
+// 判定阈值：相似度 >= 这个百分比才算「库里就是这个梗」。
+//
+// 定在 50 的理由：实测「yyds」对「yyds是什么意思」是 55%，
+// 对「abc」是 0%；而「什么意思」对「yyds是什么意思」也是 55%——
+// 所以命中后还要**按分数排序**取最高的那条，阈值只负责「够不够格」。
+// 没到阈值 → 当成库里没有，交给联网去学，而不是拿一条不相干的糊弄过去。
+inline constexpr int kMatchThreshold = 50;
 
 // 相关性闸门：抓回来的正文是否**确实在讲这个梗**。
 //
@@ -82,9 +98,7 @@ std::string normalize_text(const std::string& s);
 //   这里判的是「**联网抓回来的第三方内容**跟我们要学的那个梗有没有关系」，
 //   是数据入库前的质量闸门：搜「班味」搜到班组长的值班表，这种内容
 //   写进库会污染本地数据，越查越烂。
-//   它**不是**「判断用户这句话在问什么」，也不参与模型侧的选梗——
-//   模型问哪个梗由模型自己从清单里挑，程序不猜。
-//   用户反对的是后者（程序替模型猜意图），不是前者（脏数据入库）。
+//   它**不是**「判断用户这句话在问什么」，也不参与模型侧的选梗。
 //
 // term_out 出参：正文里实际出现的那个梗名（写回时用它当条目的 term）。
 // 相关时返回 true。
@@ -94,27 +108,19 @@ bool is_relevant(const std::string& query, const std::string& text,
 // 从释义里自动抽取别名 / 变体。
 //
 // 为什么需要：存量热梗的别名是**混在释义的自然语言里**的，
-// 抽出来当别名，清单里能一并展示，模型也就知道「用户说的那个写法」是哪条。
+// 抽出来当别名，匹配时就能命中。
 // 这是**数据增强**，不是匹配。
 //
 // 识别的是**结构化的引导词**（也叫 / 又叫 / 也称 / 又称 / 俗称 / 别称），
 // 不是关键词黑名单：它不判断「这条释义在讲什么」，
 // 只看有没有「别名引导词 + 一串并列项」这个句式。
-//
-// 返回抽到的别名（可能为空）。
 std::vector<std::string> extract_aliases(const std::string& meaning);
 
 // 相关性闸门（加强版）：梗名出现在文本里 **且** 这段文本像是在解释它。
 //
-// 判据说明：
-//   - 「梗名是否出现在抓回来的文本里」是核心判据
-//   - 额外要求文本里有解释性语境，否则「梗名出现了但讲的是别的东西」
-//     也会被当成查到了
-//
 // 同上：这是**抓取结果入库前的质量闸门**，不是判断用户意图。
-// 详细理由见实现处注释。
 bool is_relevant_with_context(const std::string& query, const std::string& text,
-                               std::string* term_out = nullptr);
+                              std::string* term_out = nullptr);
 
 // 从正文里摘一句带引号的用法示例。找不到返回空串。
 //
@@ -125,6 +131,13 @@ class MemeStore {
  public:
   struct Config {
     std::string dir{"data/memes"};
+  };
+
+  // 一次查找的结果。
+  struct Match {
+    Entry entry;
+    int percent{0};   // 相似度百分比
+    bool exact{false};  // 是否完全同名（term 或别名一模一样）
   };
 
   explicit MemeStore(Config cfg);
@@ -143,26 +156,37 @@ class MemeStore {
 
   // 批量导入（从外部搜索结果）。
   // 查重：同名或同别名都不重复写。返回实际新增条数。
+  //
+  // 已经被 fix_meme 纠正过的条目**不会被覆盖**：释义以人工纠正为准，
+  // 自动学来的内容只补空缺（usage / origin），不动 meaning。
   int import_many(const std::vector<Entry>& entries);
 
   [[nodiscard]] std::size_t size() const;
 
-  // 全部条目（快照）。**清单工具就用这个**——不检索、不截断。
-  //
-  // 排序：added_at 倒序（新的在前），同一天按 term 字典序兜底。
-  //   - 新的在前：新梗更可能被问
-  //   - 同一天按 term：序号必须稳定，模型拿清单后要带 index 回来取详情，
-  //     两次调用之间顺序一变就会取错条目
-  //
-  // 这里**不设条数上限**：模型上下文够大，截断会让模型以为「库里就这么多」，
-  // 反而找不到用户说的那条。库真的长到几百条该处理的是数据规模，不是悄悄截断。
+  // 全部条目（快照）。排序：added_at 倒序，同一天按 term 字典序兜底。
   std::vector<Entry> all() const;
 
-  // 按「清单里的序号」取一条（0 基，序号即 all() 的下标）。
-  // 命中时给这条 hits +1 并落盘（这才是「真的被用到」）。
+  // 按名字找一条。
   //
-  // 返回 false = 序号越界或库为空，调用方据此告诉模型「序号不对」。
-  bool detail(std::size_t index, Entry* out);
+  // 判据：对每条条目的所有名字（term + aliases）算 percent_match，
+  // 取最高分；最高分 < kMatchThreshold 视为没找到。
+  // 完全同名（100%）直接胜出，不再算别的。
+  //
+  // 不插兜底：找不到就是 false，调用方去联网学，不拿不相干的条目糊弄。
+  bool find(const std::string& name, Match* out) const;
+
+  // 纠正一条已入库的释义。
+  //
+  // found=false（含「库里没有」）时返回 kNotFound，调用方据此决定
+  // 是回「库里没有」还是回「纠正失败」。
+  //
+  // 语义：**只改 meaning**，保留原 term / usage / origin / added_at / aliases / hits，
+  // 并把 edited 置 true（此后自动学习不会覆盖它）。
+  //
+  // 为什么纠正只改释义而不新增条目：要纠正的东西是「释义写错了」，
+  // 梗名本身没错。新增一条会造成同一个梗两条互相矛盾的记录。
+  fish::core::Error correct(const std::string& term, const std::string& meaning,
+                            Match* out);
 
  private:
   fish::core::Error load();
@@ -172,6 +196,8 @@ class MemeStore {
   // 写临时文件用的唯一名：多个会话同时学同一个梗时，
   // 共用一个 .tmp 会互相覆盖，rename 出来的文件就是坏的。
   [[nodiscard]] std::string tmp_path() const;
+  // 查找实现。调用方必须持有 mu_。
+  bool find_locked(const std::string& name, Match* out) const;
 
   Config cfg_;
   mutable std::mutex mu_;
@@ -270,6 +296,7 @@ bool is_separator_cp(std::uint32_t cp) {
   // CJK 标点、书名号、引号、省略号、破折号
   if (cp >= 0x3000 && cp <= 0x303F) return true;   // 。、《》「」【】…
   if (cp >= 0x2010 && cp <= 0x2027) return true;   // —— ‘’“”…
+  if (cp == 0x00B7) return true;                   // · 间隔号（中文里当分隔用）
   if (cp >= 0xFF01 && cp <= 0xFF20) return true;   // 全角标点
   if (cp >= 0xFF3B && cp <= 0xFF40) return true;   // 全角标点
   if (cp >= 0xFF5B && cp <= 0xFF65) return true;   // 全角标点
@@ -280,6 +307,9 @@ bool is_separator_cp(std::uint32_t cp) {
 //
 // 只收「实际会被混用」的字，不做通用模糊匹配——
 // 模糊匹配会把不相关的词也拉进来，模型会以为自己知道了。
+//
+// 注意：百分比匹配本身已经能容忍一部分写法差异（拴Q ↔ 栓Q 的二元组
+// 只有第一个字不同，Dice 仍然有 50%），但把它做成显式等价更可靠。
 constexpr const std::pair<const char*, const char*> kVariants[] = {
     {"拴", "栓"},   // 拴Q / 栓Q
 };
@@ -321,55 +351,57 @@ std::vector<std::string> forms_of(const std::string& s) {
   return out;
 }
 
-// hay 里是否含 needle。
+// 拆成「字符符号」：规范化 + 变体替换 + 丢掉分隔符。
 //
-// 现存调用点只有 text_has_form()（相关性闸门的一部分：判断第三方抓回来的正文
-// 里有没有出现这个梗），已经不再有任何「拿用户查询串去匹配库条目」的用法。
-bool contains(const std::string& hay, const std::string& needle) {
-  if (needle.empty() || hay.size() < needle.size()) return false;
-  return hay.find(needle) != std::string::npos;
-}
-
-// text 是否包含 form（含变体等价的写法）。
-//
-// form 可能是**没规范化**的原文（"栓Q"），text 也可能是原文。
-// 两侧都要规范化后再比，否则大小写 / 全角差异会漏。
-bool text_has_form(const std::string& text, const std::string& form) {
-  if (form.empty()) return false;
-  const std::string nt = normalize_text(text);
-  const std::string nf = normalize_text(form);
-  if (nf.empty()) return false;
-  if (contains(nt, nf)) return true;
-  // 变体等价：拴Q ↔ 栓Q
-  const std::string nt_var = apply_variants(nt);
-  const std::string nf_var = apply_variants(nf);
-  if (nf_var != nf && contains(nt_var, nf_var)) return true;
-  return contains(nt_var, nf);
-}
-
-// 查询串按空白 / 标点切成片段（保留原文形态）。
-//
-// 现在只服务于 is_relevant()：模型/调用方给的梗名偶尔带问法
-// （「X 是什么意思」），切段后按段判相关性。
-std::vector<std::string> split_segments(const std::string& query) {
+// 返回的是每个字符的 UTF-8 字节序列，不是字节。中文一个字算一个符号。
+std::vector<std::string> symbols_of(const std::string& s) {
   std::vector<std::string> out;
-  std::string cur;
+  const std::string base = apply_variants(normalize_text(s));
   std::size_t i = 0;
-  while (i < query.size()) {
+  while (i < base.size()) {
     std::size_t len = 1;
-    const std::uint32_t cp = decode_utf8(query, i, len);
-    if (is_separator_cp(cp)) {
-      if (!cur.empty()) {
-        out.push_back(cur);
-        cur.clear();
-      }
-    } else {
-      cur.append(query, i, len);
-    }
+    const std::uint32_t cp = decode_utf8(base, i, len);
+    if (!is_separator_cp(cp)) out.push_back(base.substr(i, len));
     i += len;
   }
-  if (!cur.empty()) out.push_back(cur);
   return out;
+}
+
+// 字符二元组（有序对）。单字符词退化成该字符本身，保证还能参与比较。
+std::vector<std::string> bigrams_of(const std::string& s) {
+  const auto sym = symbols_of(s);
+  std::vector<std::string> out;
+  if (sym.empty()) return out;
+  if (sym.size() == 1) {
+    out.push_back(sym[0]);
+    return out;
+  }
+  out.reserve(sym.size() - 1);
+  for (std::size_t i = 0; i + 1 < sym.size(); ++i) {
+    out.push_back(sym[i] + sym[i + 1]);
+  }
+  return out;
+}
+
+// 两个多元组集合的交集大小（多重集合：重复项按较少的一侧计数）。
+std::size_t multiset_intersection(std::vector<std::string> a, std::vector<std::string> b) {
+  std::sort(a.begin(), a.end());
+  std::sort(b.begin(), b.end());
+  std::size_t i = 0;
+  std::size_t j = 0;
+  std::size_t n = 0;
+  while (i < a.size() && j < b.size()) {
+    if (a[i] == b[j]) {
+      ++n;
+      ++i;
+      ++j;
+    } else if (a[i] < b[j]) {
+      ++i;
+    } else {
+      ++j;
+    }
+  }
+  return n;
 }
 
 // 字符数（不是字节数）。中文一个字 3 字节，按字节判长度会判错。
@@ -395,6 +427,14 @@ bool same_term(const std::string& a, const std::string& b) {
     }
   }
   return false;
+}
+
+// 一个条目的全部名字：term + 别名。
+std::vector<std::string> names_of(const Entry& e) {
+  std::vector<std::string> v;
+  v.push_back(e.term);
+  for (const auto& a : e.aliases) v.push_back(a);
+  return v;
 }
 
 }  // namespace detail
@@ -444,36 +484,67 @@ std::string normalize_text(const std::string& s) {
   return out;
 }
 
+int percent_match(const std::string& a, const std::string& b) {
+  const auto ga = detail::bigrams_of(a);
+  const auto gb = detail::bigrams_of(b);
+  if (ga.empty() || gb.empty()) return 0;
+  const std::size_t inter = detail::multiset_intersection(ga, gb);
+  if (inter == 0) return 0;
+  const double dice =
+      2.0 * static_cast<double>(inter) / static_cast<double>(ga.size() + gb.size());
+  int pct = static_cast<int>(std::llround(dice * 100.0));
+  if (pct > 100) pct = 100;
+  if (pct < 0) pct = 0;
+  // 二元组完全相同 → 100。Dice 在两侧集合完全相等时必然给出 100，
+  // 这里只是把浮点误差兜住。
+  if (ga.size() == gb.size() && inter == ga.size() &&
+      detail::symbols_of(a) == detail::symbols_of(b)) {
+    pct = 100;
+  }
+  return pct;
+}
+
+bool Entry::matches(const std::string& name, int* percent_out) const {
+  int best = 0;
+  for (const auto& n : detail::names_of(*this)) {
+    const int p = percent_match(n, name);
+    if (p > best) best = p;
+  }
+  if (percent_out != nullptr) *percent_out = best;
+  return best >= kMatchThreshold;
+}
+
 bool is_relevant(const std::string& query, const std::string& text,
                  std::string* term_out) {
   if (term_out != nullptr) term_out->clear();
   const std::string trimmed = detail::trim(query);
   if (trimmed.empty() || text.empty()) return false;
 
-  // 1. 梗名（整串）出现在正文里 → 相关。
+  // 梗名是否出现在正文里。
   //
-  // 不再从查询串里「猜」梗名（原 term_candidate 的启发式已删）：
-  // 联网学习现在只由 learn 参数触发，传进来的就是模型明确点名的新梗，
-  // 不再有「这个 X 是什么意思」这种整句被人硬塞进来的情况。
-  if (detail::text_has_form(text, trimmed)) {
-    if (term_out != nullptr) *term_out = trimmed;
-    return true;
-  }
+  // 用 percent_match 判「正文里这段是不是在说这个词」是不对的——
+  // 这里判的是**抓回来的正文里有没有出现这个梗**，本质是包含判断，
+  // 但必须按「字符」而不是按「字节」比，否则中文会切错。
+  //
+  // 做法：把正文和梗名都切成符号序列，然后在正文里找梗名的子序列。
+  const auto needle = detail::symbols_of(trimmed);
+  if (needle.empty()) return false;
+  const auto hay = detail::symbols_of(text);
+  if (hay.size() < needle.size()) return false;
 
-  // 2. 片段级：查询串里某个片段出现在正文里（长度≥2，避免单字误命中）。
-  //    留作兜底：调用方（测试 / 手工）仍可能传带空格的写法。
-  const auto segs = detail::split_segments(trimmed);
-  std::string best;
-  for (const auto& seg : segs) {
-    if (seg.size() < 2) continue;
-    if (!detail::text_has_form(text, seg)) continue;
-    if (seg.size() > best.size()) best = seg;
+  for (std::size_t start = 0; start + needle.size() <= hay.size(); ++start) {
+    bool all = true;
+    for (std::size_t k = 0; k < needle.size(); ++k) {
+      if (hay[start + k] != needle[k]) {
+        all = false;
+        break;
+      }
+    }
+    if (all) {
+      if (term_out != nullptr) *term_out = trimmed;
+      return true;
+    }
   }
-  if (!best.empty()) {
-    if (term_out != nullptr) *term_out = best;
-    return true;
-  }
-
   return false;
 }
 
@@ -483,11 +554,8 @@ bool is_relevant(const std::string& query, const std::string& text,
 // 会被当成「讲清了 666 这个梗」——梗名确实出现了，但它讲的是别的东西。
 //
 // 加强判据（不判断模型意图，只看文本自身的结构）：
-//   梗名附近（前后一定距离内）出现了「解释性语境词」
-//   （意思 / 含义 / 意思�� / 指 / 用来 / 表示 / 释义 / 网络用语 / 梗 / 俗称 …），
-//   或者这段文本本身就提到了「梗 / 网络用语 / 缩写 / 黑话」这类词。
-//
-// 两条都判不出来 → 认为「没查到可靠解释」，不写回本地库。
+//   正文里出现了「解释性语境词」（意思 / 含义 / 用来 / 表示 / 网络用语 …），
+//   或者这段文本本身带了引号 / 书名号（多半是带例句的解释）。
 //
 // 为什么不做得太严：宁可放过一些噪声，也不能把真梗挡在外面——
 // 挡住的后果是模型永远学不到这个梗，代价比库里多一条噪声大得多。
@@ -498,17 +566,13 @@ bool is_relevant_with_context(const std::string& query, const std::string& text,
   const std::string ntext = normalize_text(text);
   if (ntext.empty()) return false;
 
-  // 语境词表：解释性词汇。
-  //
-  // 只在这里用（校验抓取结果是否在讲这个梗），不用于判断模型在问什么。
-  // 刻意**不含**单独的「梗」字：正文里的「跟网络梗无关」会把它带出来，
-  // 那样「计算器上的 666 是数字游戏里的说法」也会被当成查到了。
+  // 语境词表：解释性词汇。只用于校验抓取结果是否在讲这个梗。
   static const char* kContextWords[] = {
       "意思", "含义", "意指", "指的是", "是指", "即为", "意为",
-      "用来", "用于", "表示", "释义", "解释", "指的是",
+      "用来", "用于", "表示", "释义", "解释",
       "网络用语", "网络流行语", "流行语", "热梗", "黑话", "俚语",
-      "俗称", "缩写", "谐音", "口头禅", "用法", "什么意思", "啥意思",
-      "形容", "调侃", "自嘲", "出处", "来历", "来源", "就是",
+      "俗称", "缩写", "谐音", "口头禅", "用法",
+      "形容", "调侃", "自嘲", "出处", "来历", "来源",
   };
   for (const char* w : kContextWords) {
     if (ntext.find(w) != std::string::npos) return true;
@@ -547,7 +611,6 @@ std::vector<std::string> extract_aliases(const std::string& meaning) {
       //
       // 注意：「、」是并列项分隔符，不是句末——「也叫蓝色大肥鱼、吃白饭的大肥鱼」
       // 要当成两个别名，所以不能在这里截断。
-      // 真正的句末标点：。；！？ 以及换行。
       std::size_t end = meaning.size();
       for (std::size_t i = pos; i < meaning.size();) {
         std::size_t len = 1;
@@ -612,7 +675,7 @@ std::vector<std::string> extract_aliases(const std::string& meaning) {
 
 std::string extract_usage_example(const std::string& text, const std::string& term) {
   if (text.empty() || term.empty()) return {};
-  const std::string nterm = normalize_text(term);
+  const auto nterm = detail::symbols_of(term);
   if (nterm.empty()) return {};
 
   // 常见的成对引号：中文直角引号 / 书名号 / 弯引号 / 直引号
@@ -630,7 +693,7 @@ std::string extract_usage_example(const std::string& text, const std::string& te
       const auto b = text.find(close, a + open.size());
       if (b == std::string::npos) break;
       const std::string inner = text.substr(a, b + close.size() - a);
-      if (detail::text_has_form(inner, nterm)) return inner;
+      if (is_relevant(term, inner, nullptr)) return inner;
       pos = b + close.size();
     }
   }
@@ -673,8 +736,9 @@ fish::core::Error MemeStore::load() {
       if (line.empty() || line[0] == '#') continue;
       // 跳过表头：表头可能不在第一行（前面常有注释），所以每行都判。
       if (line.rfind("term\t", 0) == 0) continue;
-      // 格式：term \t meaning \t usage \t origin \t added_at \t hits \t aliases
-      // aliases 是新增的第 7 列（可选）：老文件只有 6 列，照样能读。
+      // 格式：term \t meaning \t usage \t origin \t added_at \t hits
+      //       \t aliases \t edited
+      // 后两列是可选的：老文件只有 6 列，照样能读。
       const auto f = detail::split(line, '\t');
       if (f.size() < 2) continue;
       Entry e;
@@ -696,12 +760,12 @@ fish::core::Error MemeStore::load() {
           if (!t.empty()) e.aliases.push_back(t);
         }
       }
+      if (f.size() > 7) {
+        e.edited = detail::trim(f[7]) == "1" || detail::trim(f[7]) == "true";
+      }
       if (e.term.empty()) continue;
 
       // 别名兜底：从释义里自动抽（「也叫X、Y」这种句式）。
-      //
-      // 存量 24 条热梗的别名都混在释义的自然语言里，
-      // 抽出来当别名，模型查「蓝色大肥鱼」也能命中「大肥鱼」那条。
       // TSV 里已经写了 aliases 的条目以文件为准，不重复抽。
       if (e.aliases.empty()) {
         for (const auto& a : extract_aliases(e.meaning)) {
@@ -732,10 +796,11 @@ fish::core::Error MemeStore::save_locked() const {
     }
     out << "# 网络热梗库\n";
     out << "# 格式: term<TAB>meaning<TAB>usage<TAB>origin<TAB>added_at<TAB>hits"
-           "<TAB>aliases\n";
+           "<TAB>aliases<TAB>edited\n";
     out << "# aliases 是别名/变体，用 | 分隔（可留空）。\n";
+    out << "# edited=1 表示释义被纠正过，自动学习不会再覆盖它。\n";
     out << "# 直接手改这个文件即可增删，重启或 reload() 后生效。\n";
-    out << "term\tmeaning\tusage\torigin\tadded_at\thits\taliases\n";
+    out << "term\tmeaning\tusage\torigin\tadded_at\thits\taliases\tedited\n";
     for (const auto& e : items_) {
       out << e.term << '\t' << e.meaning << '\t' << e.usage << '\t' << e.origin << '\t'
           << e.added_at << '\t' << e.hits << '\t';
@@ -743,7 +808,7 @@ fish::core::Error MemeStore::save_locked() const {
         if (i > 0) out << '|';
         out << e.aliases[i];
       }
-      out << '\n';
+      out << '\t' << (e.edited ? "1" : "0") << '\n';
     }
     out.flush();
     if (!out) {
@@ -782,7 +847,6 @@ std::size_t MemeStore::size() const {
 std::vector<Entry> MemeStore::all() const {
   std::lock_guard<std::mutex> lock(mu_);
   std::vector<Entry> out = items_;
-  // 清单顺序 = 序号顺序，详见头文件里的排序说明。
   std::sort(out.begin(), out.end(), [](const Entry& a, const Entry& b) {
     if (a.added_at != b.added_at) return a.added_at > b.added_at;
     return a.term < b.term;
@@ -790,29 +854,80 @@ std::vector<Entry> MemeStore::all() const {
   return out;
 }
 
-bool MemeStore::detail(std::size_t index, Entry* out) {
-  std::lock_guard<std::mutex> lock(mu_);
-  // 按下标取：下标来自 all() 同一个排序，所以两边必须用同一套比较。
-  std::vector<std::size_t> order(items_.size());
-  for (std::size_t i = 0; i < items_.size(); ++i) order[i] = i;
-  std::sort(order.begin(), order.end(), [this](std::size_t a, std::size_t b) {
-    const Entry& x = items_[a];
-    const Entry& y = items_[b];
-    if (x.added_at != y.added_at) return x.added_at > y.added_at;
-    return x.term < y.term;
-  });
-  if (index >= order.size()) return false;
-
-  auto& pick = items_[order[index]];
-  // 取详情才算「被用到」：hits +1 并落盘（翻清单不计数）。
-  ++pick.hits;
-  if (out != nullptr) *out = pick;
-  const auto err = save_locked();
-  if (!err.ok()) {
-    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "meme", "save_failed")
-        .field("detail", err.detail);
+bool MemeStore::find_locked(const std::string& name, Match* out) const {
+  if (name.empty()) return false;
+  int best = 0;
+  for (const auto& e : items_) {
+    int pct = 0;
+    if (!e.matches(name, &pct)) continue;
+    if (pct > best) {
+      best = pct;
+      if (out != nullptr) {
+        out->entry = e;
+        out->percent = pct;
+        out->exact = pct >= 100;
+      }
+      // 100 分不用说，已经是最高分，直接收工
+      if (pct >= 100) return true;
+    }
   }
-  return true;
+  return best >= kMatchThreshold;
+}
+
+bool MemeStore::find(const std::string& name, Match* out) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return find_locked(name, out);
+}
+
+fish::core::Error MemeStore::correct(const std::string& term, const std::string& meaning,
+                                     Match* out) {
+  if (term.empty()) {
+    return fish::core::Error::make(fish::core::ErrorCode::kBadRequest, "meme_empty_term");
+  }
+  if (meaning.empty()) {
+    return fish::core::Error::make(fish::core::ErrorCode::kBadRequest, "meme_empty_meaning");
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+
+  Match m;
+  if (!find_locked(term, &m)) {
+    return fish::core::Error::make(fish::core::ErrorCode::kNotFound, "meme_not_found");
+  }
+
+  // 按匹配到的名字反查到底是哪一条：find_locked 返回的是副本，
+  // 这里要在容器里找到同一个 term 的那条才能改。
+  auto it = std::find_if(items_.begin(), items_.end(), [&](const Entry& e) {
+    return e.term == m.entry.term;
+  });
+  if (it == items_.end()) {
+    return fish::core::Error::make(fish::core::ErrorCode::kNotFound, "meme_not_found");
+  }
+
+  it->meaning = meaning;
+  it->edited = true;
+  // 纠正后的释义里可能带「也叫 X」句式，顺手把别名补齐，
+  // 这样纠正完的名字也参与匹配。
+  for (const auto& a : extract_aliases(meaning)) {
+    if (detail::same_term(a, it->term)) continue;
+    bool dup = false;
+    for (const auto& existing : it->aliases) {
+      if (detail::same_term(existing, a)) dup = true;
+    }
+    if (!dup) it->aliases.push_back(a);
+  }
+
+  const auto err = save_locked();
+  if (!err.ok()) return err;
+
+  if (out != nullptr) {
+    out->entry = *it;
+    out->percent = m.percent;
+    out->exact = m.exact;
+  }
+  ::fish::log::log_line(::fish::log::LogLevel::kInfo, "meme", "corrected")
+      .field("term", it->term)
+      .field("percent", static_cast<long long>(m.percent));
+  return fish::core::Error::none();
 }
 
 bool MemeStore::has(const std::string& term) const {
@@ -872,12 +987,13 @@ fish::core::Error MemeStore::upsert(const Entry& e) {
 
 int MemeStore::import_many(const std::vector<Entry>& entries) {
   int added = 0;
+  int filled = 0;
   {
     std::lock_guard<std::mutex> lock(mu_);
     for (const auto& e : entries) {
       if (e.term.empty()) continue;
 
-      // 查重：库里已有同名 / 同别名 → 跳过。
+      // 查重：库里已有同名 / 同别名 → 视为同一条。
       //
       // 比对的是**所有名字**（term + 别名）对**所有名字**：
       //   existing.term  vs e.term
@@ -885,34 +1001,55 @@ int MemeStore::import_many(const std::vector<Entry>& entries) {
       //   existing.alias vs e.term
       //   existing.alias vs e.aliases[*]
       // 少比一种就会漏：「别名撞别名」是最容易漏的一对。
-      bool dup = false;
-      auto names_of = [](const Entry& x) {
-        std::vector<std::string> v{x.term};
-        for (const auto& a : x.aliases) v.push_back(a);
-        return v;
-      };
-      const auto enames = names_of(e);
-      for (const auto& existing : items_) {
-        const auto xnames = names_of(existing);
-        for (const auto& x : xnames) {
+      Entry* hit = nullptr;
+      auto names_match = [](const Entry& x, const std::vector<std::string>& enames) {
+        for (const auto& xn : detail::names_of(x)) {
           for (const auto& y : enames) {
-            if (detail::same_term(x, y)) {
-              dup = true;
-              break;
-            }
+            if (detail::same_term(xn, y)) return true;
           }
-          if (dup) break;
         }
-        if (dup) break;
+        return false;
+      };
+      const auto enames = detail::names_of(e);
+      for (auto& existing : items_) {
+        if (names_match(existing, enames)) {
+          hit = &existing;
+          break;
+        }
       }
-      if (dup) continue;
+
+      if (hit != nullptr) {
+        // 已经存在：**绝不覆盖纠正过的释义**。
+        //
+        // 自动学来的东西质量参差，人工 / 模型纠正过的才是可信的；
+        // 覆盖回去等于把纠正扔了，下次又错。
+        // 只补空缺（usage / origin），并且只在原值为空时补。
+        bool touched = false;
+        if (!hit->edited && !e.meaning.empty()) {
+          // 老条目释义为空或明显更短时，用新学到的补上
+          if (hit->meaning.empty()) {
+            hit->meaning = e.meaning;
+            touched = true;
+          }
+        }
+        if (hit->usage.empty() && !e.usage.empty()) {
+          hit->usage = e.usage;
+          touched = true;
+        }
+        if (hit->origin.empty() && !e.origin.empty()) {
+          hit->origin = e.origin;
+          touched = true;
+        }
+        if (touched) ++filled;
+        continue;
+      }
 
       Entry copy = e;
       if (copy.added_at.empty()) copy.added_at = detail::today_str();
       items_.push_back(std::move(copy));
       ++added;
     }
-    if (added > 0) {
+    if (added > 0 || filled > 0) {
       const auto err = save_locked();
       if (!err.ok()) {
         ::fish::log::log_line(::fish::log::LogLevel::kWarn, "meme", "save_failed")
@@ -920,9 +1057,10 @@ int MemeStore::import_many(const std::vector<Entry>& entries) {
       }
     }
   }
-  if (added > 0) {
+  if (added > 0 || filled > 0) {
     ::fish::log::log_line(::fish::log::LogLevel::kInfo, "meme", "imported")
-        .field("added", static_cast<long long>(added));
+        .field("added", static_cast<long long>(added))
+        .field("filled", static_cast<long long>(filled));
   }
   return added;
 }

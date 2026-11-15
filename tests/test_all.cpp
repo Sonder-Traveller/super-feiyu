@@ -206,7 +206,9 @@ void test_consolidation() {
 
   auto facts = notes.load_facts(kTestConv);
   CHECK(facts.ok() && facts.value->size() == 1, "fact in sidecar file");
-  CHECK(idx.item_count() == 2, "index has episode + fact");
+  // 3 条 = 1 episode + 1 fact + 1 trait：traits 现在也进索引，
+  // 否则 search_memory 永远搜不到「这个人有什么习惯」。
+  CHECK(idx.item_count() == 3, "index has episode + fact + trait");
 
   // 证据累加
   const std::string out2 = R"({"episodes":[],"facts":[],"traits":[{"pattern":"不喜欢被追问","evidence":2}]})";

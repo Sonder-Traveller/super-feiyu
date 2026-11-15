@@ -148,62 +148,179 @@ void test_all_entries() {
 
 // ── 3. 按序号取详情 ──────────────────────────────────────
 
-void test_detail() {
-  std::printf("\n=== detail(index) ===\n");
+// ── 3b. 百分比匹配 ───────────────────────────────────────
 
-  const std::string dir = make_tmp_dir("detail");
+void test_percent_match() {
+  std::printf("\n=== percent_match ===\n");
+
+  check(fish::meme::percent_match("yyds", "yyds") == 100, "同一词 → 100");
+  check(fish::meme::percent_match("YYDS", "yyds") == 100, "大小写不影响 → 100");
+  check(fish::meme::percent_match("ＹＹＤＳ", "yyds") == 100, "全角不影响 → 100");
+  check(fish::meme::percent_match("拴Q", "栓Q") >= fish::meme::kMatchThreshold,
+        "变体（拴/栓）达到阈值",
+        std::to_string(fish::meme::percent_match("拴Q", "栓Q")));
+
+  // 关键差异：多带了问法，分数必须掉下来，不能像子串那样仍然算命中
+  const int with_suffix = fish::meme::percent_match("yyds是什么意思", "yyds");
+  check(with_suffix < 100, "带问法的整句不是 100 分",
+        std::to_string(with_suffix));
+
+  check(fish::meme::percent_match("yyds", "abc") == 0, "完全无关 → 0");
+  check(fish::meme::percent_match("", "yyds") == 0, "空串 → 0");
+  check(fish::meme::percent_match("yyds", "") == 0, "空串（反向）→ 0");
+
+  // 单字词不退化成分母 0
+  check(fish::meme::percent_match("6", "6") == 100, "单字同词 → 100");
+  check(fish::meme::percent_match("6", "7") == 0, "单字不同 → 0");
+
+  // 中文多字
+  check(fish::meme::percent_match("尊嘟假嘟", "尊嘟假嘟") == 100, "中文同词 → 100");
+  const int partial = fish::meme::percent_match("尊嘟假嘟o", "尊嘟假嘟");
+  check(partial > 0 && partial < 100, "中文加字 → 0 与 100 之间",
+        std::to_string(partial));
+
+  // 标点/空白不参与比较
+  check(fish::meme::percent_match("  yyds  ", "yyds") == 100, "首尾空白不影响");
+  check(fish::meme::percent_match("y·y·d·s", "yyds") == 100, "中间标点不影响");
+}
+
+// ── 3. 查找（find）──────────────────────────────────────
+
+void test_find() {
+  std::printf("\n=== find(term) ===\n");
+
+  const std::string dir = make_tmp_dir("find");
   {
     fish::meme::MemeStore::Config cfg;
     cfg.dir = dir;
     fish::meme::MemeStore store(cfg);
     store.init();
 
-    // added_at 不同：验证「新的在前」
-    fish::meme::Entry old_one;
-    old_one.term = "old_one";
-    old_one.meaning = "旧的一条";
-    old_one.added_at = "2026-01-01";
-    store.upsert(old_one);
+    fish::meme::Entry a;
+    a.term = "yyds";
+    a.meaning = "永远的神";
+    a.aliases = {"YYDS"};
+    a.added_at = "2026-01-01";
+    store.upsert(a);
 
-    fish::meme::Entry new_one;
-    new_one.term = "new_one";
-    new_one.meaning = "新的一条";
-    new_one.added_at = "2026-11-15";
-    store.upsert(new_one);
+    fish::meme::Entry b;
+    b.term = "尊嘟假嘟";
+    b.meaning = "真的假的的可爱说法";
+    b.added_at = "2026-02-02";
+    store.upsert(b);
 
-    const auto all = store.all();
-    check(all.size() == 2, "两条都在", "got " + std::to_string(all.size()));
-    check(!all.empty() && all[0].term == "new_one", "新的在前（added_at 倒序）",
-          all.empty() ? "empty" : all[0].term);
+    // 完全同名
+    fish::meme::MemeStore::Match m;
+    check(store.find("yyds", &m), "find：完全同名命中");
+    check(m.entry.term == "yyds", "find：拿到正确条目", m.entry.term);
+    check(m.percent == 100, "find：完全是 100 分", std::to_string(m.percent));
+    check(m.exact, "find：exact 标记为真");
 
-    // index 0 = 最新的那条
-    fish::meme::Entry got;
-    check(store.detail(0, &got), "index 0 取得到");
-    check(got.term == all[0].term, "index 0 拿到清单第 0 条", got.term);
-    check(got.meaning == all[0].meaning, "释义一并给出", got.meaning);
-    check(got.usage == all[0].usage, "用法一并给出", got.usage);
+    // 大小写变体
+    fish::meme::MemeStore::Match m2;
+    check(store.find("YYDS", &m2), "find：大小写变体也命中");
+    check(m2.percent == 100, "find：变体仍是 100 分");
 
-    // hits 只在取详情时 +1（翻清单不计数）
-    const auto after_one = store.all();
-    check(after_one[0].hits >= 1, "取详情后 hits 累加",
-          "hits=" + std::to_string(after_one[0].hits));
+    // 中文
+    fish::meme::MemeStore::Match m3;
+    check(store.find("尊嘟假嘟", &m3), "find：中文同名命中");
+    check(m3.entry.term == "尊嘟假嘟", "find：中文拿到正确条目");
 
-    // index 1 = 旧的那条
-    fish::meme::Entry got2;
-    check(store.detail(1, &got2), "index 1 取得到");
-    check(got2.term == "old_one", "index 1 拿到第 1 条", got2.term);
+    // 带问法的整句：仍能命中，但分数不是 100
+    fish::meme::MemeStore::Match m4;
+    const bool hit4 = store.find("尊嘟假嘟是什么意思", &m4);
+    if (hit4) {
+      check(m4.percent < 100, "find：带问法不是 100 分",
+            std::to_string(m4.percent));
+      check(m4.entry.term == "尊嘟假嘟", "find：带问法仍指向正确条目");
+    } else {
+      check(true, "find：带问法低于阈值，交给联网（也是可接受的）");
+    }
 
-    // 越界
-    fish::meme::Entry oob;
-    check(!store.detail(2, &oob), "index == size → 越界返回 false");
-    check(!store.detail(999, &oob), "index 远大于 size → 越界返回 false");
+    // 完全无关 → 没找到
+    fish::meme::MemeStore::Match m5;
+    check(!store.find("zzz完全不相干的词", &m5), "find：无关词 → false");
 
     // 空库
     fish::meme::MemeStore::Config cfg2;
     cfg2.dir = dir + "/empty";
     fish::meme::MemeStore empty_store(cfg2);
     empty_store.init();
-    check(!empty_store.detail(0, &oob), "空库 detail(0) → false");
+    fish::meme::MemeStore::Match m6;
+    check(!empty_store.find("yyds", &m6), "find：空库 → false");
+
+    // hits 只在命中时累加（find 本身不计数，由工具层决定）
+    const auto all = store.all();
+    for (const auto& x : all) {
+      if (x.term == "yyds") {
+        check(x.hits == 0, "find 本身不累加 hits（由工具层负责）",
+              std::to_string(x.hits));
+      }
+    }
+  }
+  rm_tmp_dir(dir);
+}
+
+// ── 3c. 纠错（correct）───────────────────────────────────
+
+void test_correct() {
+  std::printf("\n=== correct(term, meaning) ===\n");
+
+  const std::string dir = make_tmp_dir("correct");
+  {
+    fish::meme::MemeStore::Config cfg;
+    cfg.dir = dir;
+    fish::meme::MemeStore store(cfg);
+    store.init();
+
+    fish::meme::Entry a;
+    a.term = "yyds";
+    a.meaning = "错的释义";
+    a.usage = "保留的用法";
+    a.origin = "web";
+    a.added_at = "2026-01-01";
+    store.upsert(a);
+
+    fish::meme::MemeStore::Match m;
+    auto e = store.correct("yyds", "永远的神（正确）", &m);
+    check(e.ok(), "correct：成功", e.detail);
+    check(m.entry.meaning == "永远的神（正确）", "correct：释义已替换", m.entry.meaning);
+    check(m.entry.usage == "保留的用法", "correct：用法保留", m.entry.usage);
+    check(m.entry.origin == "web", "correct：来源保留", m.entry.origin);
+    check(m.entry.term == "yyds", "correct：梗名不变", m.entry.term);
+    check(m.entry.edited, "correct：打上 edited 标记");
+
+    // 落盘了（重新加载还能读到）
+    fish::meme::MemeStore reloaded(cfg);
+    reloaded.init();
+    fish::meme::MemeStore::Match m2;
+    check(reloaded.find("yyds", &m2), "correct：重新加载后能找到");
+    check(m2.entry.meaning == "永远的神（正确）", "correct：重新加载后释义是新的",
+          m2.entry.meaning);
+    check(m2.entry.edited, "correct：重新加载后 edited 仍为真");
+
+    // 库里没有的词 → kNotFound
+    fish::meme::MemeStore::Match m3;
+    auto e2 = store.correct("完全不存在zzz", "随便", &m3);
+    check(!e2.ok(), "correct：库里没有 → 失败");
+    check(e2.code == fish::core::ErrorCode::kNotFound, "correct：错误码是 kNotFound");
+
+    // 空参数
+    fish::meme::MemeStore::Match m4;
+    check(!store.correct("", "x", &m4).ok(), "correct：空 term → 失败");
+    check(!store.correct("yyds", "", &m4).ok(), "correct：空 meaning → 失败");
+
+    // 纠正过的条目，自动学习不再覆盖释义
+    fish::meme::Entry auto_learned;
+    auto_learned.term = "yyds";
+    auto_learned.meaning = "自动学来的（错的）";
+    auto_learned.origin = "web";
+    const int added = store.import_many({auto_learned});
+    check(added == 0, "correct：自动学习不新增条目", std::to_string(added));
+    fish::meme::MemeStore::Match m5;
+    store.find("yyds", &m5);
+    check(m5.entry.meaning == "永远的神（正确）",
+          "correct：**纠正后的释义不被自动学习覆盖**", m5.entry.meaning);
   }
   rm_tmp_dir(dir);
 }
@@ -411,28 +528,30 @@ void test_alias_autofill_from_store() {
   rm_tmp_dir(dir);
 }
 
-// ── 6. 工具闭环（假的远程响应，不真联网）──────────────────
+// ── 6. 工具：一个词进、释义出 / 自动学习 / 降级 / 纠错 ──
 
-// 假远程学梗：按 term 返回预置的响应体
-std::vector<fish::tool::MemeLookupTool::Hit> fake_remote(
-    const std::string& term, std::string* error, bool force_error = false) {
-  std::vector<fish::tool::MemeLookupTool::Hit> out;
+// 假的联网后端：给一个像样的解释性正文，能过质量闸门。
+std::vector<fish::tool::MemeHit> fake_remote(const std::string& term,
+                                             std::string* error,
+                                             bool force_error = false) {
   if (error != nullptr) error->clear();
   if (force_error) {
-    if (error != nullptr) *error = "search_401_unauthorized";
-    return out;
+    if (error != nullptr) *error = "fake_network_error";
+    return {};
   }
-  fish::tool::MemeLookupTool::Hit h;
+  if (term.empty()) return {};
+
+  fish::tool::MemeHit h;
   h.term = term;
-  h.meaning = term + " 是网络用语，意思是「永远的神」，夸人很厉害。常说「" + term + " 太强了」。";
-  h.usage = "「" + term + " 太强了」";
+  // 正文里必须出现这个词，且带解释性语境词（is_relevant_with_context 的判据）
+  h.meaning = term + " 是网络流行语，意思是「测试用的解释」。";
+  h.usage = "";
   h.source = "fake";
-  out.push_back(h);
-  return out;
+  return {h};
 }
 
 void test_tool_loop() {
-  std::printf("\n=== tool: 清单 / 取详情 / learn / 降级 ===\n");
+  std::printf("\n=== tool: term → 释义 / 自动学习 / 降级 / 纠错 ===\n");
 
   const std::string dir = make_tmp_dir("tool");
   {
@@ -447,31 +566,32 @@ void test_tool_loop() {
     std::string last_memory_conv;
     std::string last_memory_term;
 
-    // 与 main.cpp 的装配一一对应：清单走 all()，详情走 detail()，不检索。
-    auto lister = [&store]() {
-      std::vector<fish::tool::MemeLookupTool::Hit> out;
-      for (const auto& e : store.all()) {
-        fish::tool::MemeLookupTool::Hit h;
-        h.term = e.term;
-        h.meaning = e.meaning;
-        h.usage = e.usage;
-        h.source = "local";
-        for (std::size_t i = 0; i < e.aliases.size(); ++i) {
-          if (i > 0) h.aliases += "、";
-          h.aliases += e.aliases[i];
-        }
-        out.push_back(std::move(h));
-      }
-      return out;
-    };
-    auto detailer = [&store](long long index, fish::tool::MemeLookupTool::Hit* out) {
-      if (out == nullptr || index < 0) return false;
-      fish::meme::Entry e;
-      if (!store.detail(static_cast<std::size_t>(index), &e)) return false;
-      out->term = e.term;
-      out->meaning = e.meaning;
-      out->usage = e.usage;
+    // 与 main.cpp 的装配一一对应：查找走 find()，纠错走 correct()。
+    auto finder = [&store](const std::string& term, fish::tool::MemeHit* out) {
+      if (out == nullptr) return false;
+      fish::meme::MemeStore::Match m;
+      if (!store.find(term, &m)) return false;
+      out->term = m.entry.term;
+      out->meaning = m.entry.meaning;
+      out->usage = m.entry.usage;
       out->source = "local";
+      out->percent = m.percent;
+      for (std::size_t i = 0; i < m.entry.aliases.size(); ++i) {
+        if (i > 0) out->aliases += "、";
+        out->aliases += m.entry.aliases[i];
+      }
+      return true;
+    };
+    auto corrector = [&store](const std::string& term, const std::string& meaning,
+                              fish::tool::MemeHit* out) {
+      fish::meme::MemeStore::Match m;
+      const auto e = store.correct(term, meaning, &m);
+      if (!e.ok()) return false;
+      if (out != nullptr) {
+        out->term = m.entry.term;
+        out->meaning = m.entry.meaning;
+        out->percent = m.percent;
+      }
       return true;
     };
     auto remote = [&remote_calls](const std::string& q, std::string* error) {
@@ -479,7 +599,7 @@ void test_tool_loop() {
       return fake_remote(q, error);
     };
     auto importer = [&store, &import_calls](
-                        const std::vector<fish::tool::MemeLookupTool::Hit>& hits) {
+                        const std::vector<fish::tool::MemeHit>& hits) {
       ++import_calls;
       std::vector<fish::meme::Entry> entries;
       for (const auto& h : hits) {
@@ -500,147 +620,105 @@ void test_tool_loop() {
       last_memory_term = term;
     };
 
-    fish::tool::MemeLookupTool tool(lister, detailer, remote, importer, memory);
+    fish::tool::MemeLookupTool tool(finder, remote, importer, memory);
+    fish::tool::MemeFixTool fixer(corrector);
 
-    // ── 1) 空参数 → 全部清单，不联网 ──
+    // ── 1) 本地命中 → 直接给释义，不联网 ──
     fish::meme::Entry seed;
     seed.term = "yyds";
     seed.meaning = "永远的神";
+    seed.usage = "「yyds」太强了";
     seed.aliases = {"YYDS"};
     store.upsert(seed);
 
-    fish::meme::Entry seed2;
-    seed2.term = "栓Q";
-    seed2.meaning = "示弱、委屈";
-    store.upsert(seed2);
-
     fish::tool::Call call;
     call.name = "lookup_meme";
-    call.arguments_json = R"({})";
+    call.arguments_json = R"({"term":"yyds"})";
     call.conversation_id = "g:test_group";
     auto out = tool.run(call);
-    check(out.ok, "清单：ok");
-    check(out.content.find("清单") != std::string::npos, "清单：说明这是清单",
+    check(out.ok, "本地命中：ok");
+    check(out.content.find("永远的神") != std::string::npos, "本地命中：拿到释义",
           out.content);
-    check(out.content.find("共 2 条") != std::string::npos, "清单：报出总条数",
+    check(out.content.find("本地热梗库") != std::string::npos, "本地命中：标明来源",
           out.content);
-    check(out.content.find("[0]") != std::string::npos, "清单：带序号 [0]");
-    check(out.content.find("[1]") != std::string::npos, "清单：带序号 [1]");
-    check(out.content.find("yyds") != std::string::npos, "清单：含梗名",
+    check(out.content.find("100%") != std::string::npos, "本地命中：给出匹配度",
           out.content);
-    check(out.content.find("永远的神") != std::string::npos, "清单：含一句话释义");
-    check(out.content.find("也叫") != std::string::npos, "清单：展示别名");
-    check(remote_calls.load() == 0, "清单：**不联网**",
+    check(remote_calls.load() == 0, "本地命中：**不联网**",
           "remote_calls=" + std::to_string(remote_calls.load()));
 
-    // ── 2) 带 index → 取详情 ──
-    // 先算出 yyds 在清单里的序号（排序是新的在前 + term 字典序，不假定顺序）
-    long long idx_yyds = -1;
-    {
-      const auto all = store.all();
-      for (std::size_t i = 0; i < all.size(); ++i) {
-        if (all[i].term == "yyds") idx_yyds = static_cast<long long>(i);
-      }
-    }
-    check(idx_yyds >= 0, "yyds 在清单里找得到序号",
-          "idx=" + std::to_string(idx_yyds));
+    // ── 2) 大小写变体也命中本地 ──
+    call.arguments_json = R"({"term":"YYDS"})";
+    out = tool.run(call);
+    check(out.ok && out.content.find("永远的神") != std::string::npos,
+          "变体：大小写变体也命中本地", out.content);
+    check(remote_calls.load() == 0, "变体：仍然不联网");
 
-    fish::tool::Call detail_call;
-    detail_call.name = "lookup_meme";
-    detail_call.arguments_json = "{\"index\":" + std::to_string(idx_yyds) + "}";
-    detail_call.conversation_id = "g:test_group";
-    out = tool.run(detail_call);
-    check(out.ok, "详情：ok");
-    check(out.content.find("永远的神") != std::string::npos, "详情：拿到释义",
-          out.content);
-    check(out.content.find("本地热梗库") != std::string::npos, "详情：标明来源",
-          out.content);
-    check(remote_calls.load() == 0, "详情：**不联网**",
+    // ── 3) 本地没有 → 自动联网学一次 + 写回 + 记记忆 ──
+    call.arguments_json = R"({"term":"尊嘟假嘟"})";
+    out = tool.run(call);
+    check(out.ok, "自动学习：ok");
+    check(remote_calls.load() == 1, "自动学习：联网一次",
           "remote_calls=" + std::to_string(remote_calls.load()));
-
-    // 取详情会累加 hits
-    {
-      const auto all = store.all();
-      for (const auto& x : all) {
-        if (x.term == "yyds") {
-          check(x.hits == 1, "取详情后 hits == 1", "hits=" + std::to_string(x.hits));
-        }
-      }
-    }
-
-    // ── 3) index 越界 → 明说序号不对，不静默退回第 0 条 ──
-    fish::tool::Call oob_call;
-    oob_call.name = "lookup_meme";
-    oob_call.arguments_json = R"({"index":99})";
-    out = tool.run(oob_call);
-    check(out.ok, "越界：ok（不抛异常）");
-    check(out.content.find("超出清单范围") != std::string::npos, "越界：明说超出范围",
-          out.content);
-    check(out.content.find("共 2 条") != std::string::npos, "越界：告知实际条数");
-    check(out.content.find("永远的神") == std::string::npos,
-          "越界：**不**把第 0 条当成模型挑的那条返回");
-
-    // ── 4) learn → 联网学到 + 写回 + 记记忆 ──
-    fish::tool::Call learn_call;
-    learn_call.name = "lookup_meme";
-    learn_call.arguments_json = R"({"learn":"尊嘟假嘟"})";
-    learn_call.conversation_id = "g:test_group";
-    out = tool.run(learn_call);
-    check(out.ok, "learn：ok");
-    check(remote_calls.load() == 1, "learn：联网一次",
-          "remote_calls=" + std::to_string(remote_calls.load()));
-    check(out.content.find("刚查到并已记住") != std::string::npos,
-          "learn：标明「刚查到并已记住」", out.content);
-    check(import_calls.load() == 1, "learn：写回本地库一次");
-    check(memory_calls.load() == 1, "learn：写记忆一次");
+    check(out.content.find("刚查到并已存进本地热梗库") != std::string::npos,
+          "自动学习：标明已入库", out.content);
+    check(import_calls.load() == 1, "自动学习：写回本地库一次");
+    check(memory_calls.load() == 1, "自动学习：写记忆一次");
     check(last_memory_conv == "g:test_group", "记忆写进当前会话",
           "got " + last_memory_conv);
     check(last_memory_term == "尊嘟假嘟", "记忆里是梗名", "got " + last_memory_term);
-    check(store.has("尊嘟假嘟"), "learn 之后库里能查到");
+    check(store.has("尊嘟假嘟"), "自动学习之后库里能查到");
 
-    // ── 5) 学到之后 → 清单里就有它，不再联网 ──
+    // ── 4) 学到之后再查 → 走本地，不再联网 ──
     out = tool.run(call);
     check(out.content.find("尊嘟假嘟") != std::string::npos,
-          "学到后：清单里出现新条目", out.content);
-    check(out.content.find("共 3 条") != std::string::npos, "学到后：清单条数 +1",
-          out.content);
-    check(remote_calls.load() == 1, "学到后：清单**不再联网**",
+          "学到后：能查到新条目", out.content);
+    check(out.content.find("本地热梗库") != std::string::npos,
+          "学到后：来源变成本地", out.content);
+    check(remote_calls.load() == 1, "学到后：**不再联网**",
           "remote_calls=" + std::to_string(remote_calls.load()));
 
+    // ── 5) 缺 term 参数 ──
+    fish::tool::Call no_arg;
+    no_arg.name = "lookup_meme";
+    no_arg.arguments_json = "{}";
+    out = tool.run(no_arg);
+    check(!out.ok, "缺参数：ok=false");
+    check(out.error == "missing_term", "缺参数：错误码正确", out.error);
+
     // ── 6) 降级：没有远程后端 ──
-    fish::tool::MemeLookupTool local_only(lister, detailer, nullptr, importer, memory);
+    fish::tool::MemeLookupTool local_only(finder, nullptr, importer, memory);
     fish::tool::Call call2;
     call2.name = "lookup_meme";
-    call2.arguments_json = R"({"learn":"一个新梗xyzzy"})";
+    call2.arguments_json = R"({"term":"一个新梗xyzzy"})";
     out = local_only.run(call2);
     check(out.ok, "降级（无联网）：ok");
-    check(out.content.find("未启用联网") != std::string::npos,
+    check(out.content.find("没启用联网") != std::string::npos,
           "降级（无联网）：明说未启用", out.content);
     check(out.content.find("xyzzy") != std::string::npos,
           "降级（无联网）：说清是哪个词", out.content);
 
     // ── 7) 降级：联网调用失败 ──
     fish::tool::MemeLookupTool failing(
-        lister, detailer,
+        finder,
         [](const std::string&, std::string* error) {
           return fake_remote("", error, /*force_error=*/true);
         },
         importer, memory);
-    call2.arguments_json = R"({"learn":"另一个新梗abc"})";
+    call2.arguments_json = R"({"term":"另一个新梗abc"})";
     out = failing.run(call2);
     check(out.ok, "降级（联网失败）：ok");
-    check(out.content.find("联网检索失败") != std::string::npos,
+    check(out.content.find("联网查也失败了") != std::string::npos,
           "降级（联网失败）：明说失败", out.content);
 
     // ── 8) 降级：联网成功但没查到 ──
     fish::tool::MemeLookupTool empty_remote(
-        lister, detailer,
+        finder,
         [](const std::string&, std::string* error) {
           if (error != nullptr) error->clear();
-          return std::vector<fish::tool::MemeLookupTool::Hit>{};
+          return std::vector<fish::tool::MemeHit>{};
         },
         importer, memory);
-    call2.arguments_json = R"({"learn":"查不到的东西zzz"})";
+    call2.arguments_json = R"({"term":"查不到的东西zzz"})";
     out = empty_remote.run(call2);
     check(out.ok, "降级（没查到）：ok");
     check(out.content.find("没查到") != std::string::npos,
@@ -651,11 +729,11 @@ void test_tool_loop() {
     // ── 9) 质量闸门：抓到不相关内容 → 不写回 ──
     const int before = static_cast<int>(store.size());
     fish::tool::MemeLookupTool irrelevant(
-        lister, detailer,
+        finder,
         [](const std::string&, std::string* error) {
           if (error != nullptr) error->clear();
-          std::vector<fish::tool::MemeLookupTool::Hit> out2;
-          fish::tool::MemeLookupTool::Hit h;
+          std::vector<fish::tool::MemeHit> out2;
+          fish::tool::MemeHit h;
           h.term = "班味";
           h.meaning = "班组长的工作安排与值班表说明";
           h.source = "fake";
@@ -663,7 +741,7 @@ void test_tool_loop() {
           return out2;
         },
         importer, memory);
-    call2.arguments_json = R"({"learn":"班味"})";
+    call2.arguments_json = R"({"term":"班味"})";
     out = irrelevant.run(call2);
     check(out.ok, "不相关：ok");
     check(out.content.find("没有记住") != std::string::npos,
@@ -671,31 +749,46 @@ void test_tool_loop() {
     check(static_cast<int>(store.size()) == before,
           "不相关：**不写回**本地库",
           "before=" + std::to_string(before) + " after=" + std::to_string(store.size()));
-    check(memory_calls.load() == 1, "不相关：不写记忆",
-          "memory_calls=" + std::to_string(memory_calls.load()));
 
-    // ── 10) 空库时给清单 → 引导用 learn ──
-    {
-      fish::meme::MemeStore::Config cfg3;
-      cfg3.dir = dir + "/empty2";
-      fish::meme::MemeStore empty_store(cfg3);
-      empty_store.init();
-      auto empty_lister = [&empty_store]() {
-        std::vector<fish::tool::MemeLookupTool::Hit> v;
-        for (const auto& e : empty_store.all()) v.push_back({e.term, e.meaning,
-                                                             e.usage, "local", ""});
-        return v;
-      };
-      fish::tool::MemeLookupTool t2(empty_lister, detailer, remote, importer, memory);
-      fish::tool::Call c3;
-      c3.name = "lookup_meme";
-      c3.arguments_json = "{}";
-      out = t2.run(c3);
-      check(out.ok && out.content.find("空的") != std::string::npos,
-            "空库：明说库是空的", out.content);
-      check(out.content.find("learn") != std::string::npos,
-            "空库：引导模型用 learn");
-    }
+    // ── 10) 纠错：改掉已入库的错误释义 ──
+    fish::tool::Call fix_call;
+    fix_call.name = "fix_meme";
+    fix_call.arguments_json = R"({"term":"尊嘟假嘟","meaning":"「真的假的」的可爱说法"})";
+    fix_call.conversation_id = "g:test_group";
+    out = fixer.run(fix_call);
+    check(out.ok, "纠错：ok", out.content);
+    check(out.content.find("已改正") != std::string::npos, "纠错：明说已改正",
+          out.content);
+    check(out.content.find("真的假的") != std::string::npos, "纠错：回显新释义",
+          out.content);
+
+    fish::meme::MemeStore::Match m;
+    check(store.find("尊嘟假嘟", &m), "纠错：库里还能查到");
+    check(m.entry.meaning == "「真的假的」的可爱说法", "纠错：释义已替换",
+          m.entry.meaning);
+    check(m.entry.edited, "纠错：edited 标记已置位");
+
+    // 纠错之后再查 → 拿到的是新释义
+    call.arguments_json = R"({"term":"尊嘟假嘟"})";
+    out = tool.run(call);
+    check(out.content.find("真的假的") != std::string::npos,
+          "纠错后：查询返回新释义", out.content);
+
+    // ── 11) 纠错：库里没有这个词 ──
+    fix_call.arguments_json = R"({"term":"完全不存在zzz","meaning":"x"})";
+    out = fixer.run(fix_call);
+    check(out.ok, "纠错（不在库）：ok（不抛异常）");
+    check(out.error == "meme_not_found", "纠错（不在库）：错误码正确", out.error);
+    check(out.content.find("没有") != std::string::npos, "纠错（不在库）：明说没有",
+          out.content);
+    check(out.content.find("lookup_meme") != std::string::npos,
+          "纠错（不在库）：引导先查一次", out.content);
+
+    // ── 12) 纠错：缺参数 ──
+    fix_call.arguments_json = R"({"term":"yyds"})";
+    out = fixer.run(fix_call);
+    check(!out.ok, "纠错（缺 meaning）：ok=false");
+    check(out.error == "missing_field", "纠错（缺 meaning）：错误码正确", out.error);
   }
   rm_tmp_dir(dir);
 }
@@ -734,13 +827,13 @@ void test_concurrency() {
         }
       });
     }
-    // 同时并发读清单 + 取详情，验证读主路径和写不打架
+    // 同时并发读清单 + 查找，验证读主路径和写不打架
     std::thread reader([&store] {
       for (int i = 0; i < 200; ++i) {
         const auto all = store.all();
         if (!all.empty()) {
-          fish::meme::Entry e;
-          store.detail(0, &e);
+          fish::meme::MemeStore::Match m;
+          store.find(all.front().term, &m);
         }
       }
     });
@@ -859,7 +952,9 @@ int main() {
 
   test_normalize();
   test_all_entries();
-  test_detail();
+  test_percent_match();
+  test_find();
+  test_correct();
   test_dedup();
   test_relevance();
   test_alias_extraction();

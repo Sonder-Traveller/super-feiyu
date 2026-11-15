@@ -1081,7 +1081,6 @@ constexpr FieldDef kFields[] = {
     {"capability.tts", "app_id", FieldKind::kString},
     {"capability.tts", "cluster", FieldKind::kString},
     {"capability.tts", "api_key", FieldKind::kSecret},
-    {"capability.tts", "group_voice", FieldKind::kBool},
     {"capability.document", "provider", FieldKind::kString},
     {"capability.document", "base_url", FieldKind::kString},
     {"capability.document", "api_key", FieldKind::kSecret},

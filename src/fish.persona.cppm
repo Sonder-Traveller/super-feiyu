@@ -70,6 +70,8 @@ class PersonaStore {
  private:
   [[nodiscard]] std::string default_path() const;
   [[nodiscard]] std::string override_path(const std::string& conv_id) const;
+  // 读路径：新名优先，旧名（历史哈希）兜底，找到旧名顺手迁移。
+  [[nodiscard]] std::string override_path_read(const std::string& conv_id) const;
 
   Config cfg_;
 };
@@ -93,26 +95,43 @@ namespace {
 // conv_id 可能是 "g:123456" 这种带冒号的，也可能是 QQ openid 长串，
 // 直接当文件名跨平台不安全。用 FNV-1a 哈希，稳定且无依赖。
 //
-// ⚠ 偏移基是**项目自定义的 FNV-1a 变体**，不是标准值：
-//   这里   1469598103934665603   （19 位，少一位）
-//   标准   14695981039346656037  （20 位）
-// 故意保持现状，**不要"顺手修正"**：conv_id → 文件名的映射只在本项目内部用，
-// 读写走同一个函数、自洽即可，没有任何外部工具依赖这个哈希值。
-// 一旦改成标准值，已有的 data/persona/sessions/*.md 会**全部命中不到** ——
-// 用户之前存的人格会静默回退到全局默认人格，界面上看不出任何异常。
+// 历史：这里原来用的是**非标准**偏移基 1469598103934665603（19 位，少一位），
+// 改成标准值 14695981039346656037 之后，已经存在的
+// data/persona/sessions/*.md 会全部命中不到——用户存过的人格会静默
+// 回退到全局默认，界面上看不出异常。
 //
-// 真要改，必须同时实现「旧名 → 新名」迁移：读时先试新名，没有再回退旧名。
+// 所以现在的做法是「新名优先、旧名兜底」：
+//   - 写：永远写标准哈希的新名
+//   - 读：先找新名，没有就找旧名；找到旧名的顺手迁移成新名
+// 迁移是幂等的：改名失败（权限等）不影响读取，下次启动再试。
+//
 // 同样的偏移基也用在 src/fish.media.cppm（内容寻址去重）和
-// src/fish.memory.cppm（内容哈希），改动需一并评估。
-std::string safe_filename(const std::string& conv_id) {
-  std::uint64_t h = 1469598103934665603ULL;  // 非标准偏移基，见上方说明：不要改
-  for (const unsigned char c : conv_id) {
+// src/fish.memory.cppm（内容哈希）。那两处是**内容**哈希：
+// 改了就换命名空间，媒体缓存要全量重算、索引要全量重建，
+// 而且没有「读时兜底」这回事——所以只改 persona 这一处。
+std::uint64_t fnv1a(const std::string& s, std::uint64_t basis) {
+  std::uint64_t h = basis;
+  for (const unsigned char c : s) {
     h ^= c;
     h *= 1099511628211ULL;
   }
+  return h;
+}
+
+std::string hash_hex(std::uint64_t h) {
   char buf[24];
   std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
   return std::string(buf);
+}
+
+// 标准 FNV-1a（新文件名）
+std::string safe_filename(const std::string& conv_id) {
+  return hash_hex(fnv1a(conv_id, 14695981039346656037ULL));
+}
+
+// 旧的非标准偏移基（历史文件名）。只用于读时兜底与迁移。
+std::string legacy_filename(const std::string& conv_id) {
+  return hash_hex(fnv1a(conv_id, 1469598103934665603ULL));
 }
 
 }  // namespace
@@ -123,6 +142,35 @@ std::string PersonaStore::default_path() const { return cfg_.dir + "/default.md"
 
 std::string PersonaStore::override_path(const std::string& conv_id) const {
   return cfg_.dir + "/sessions/" + safe_filename(conv_id) + ".md";
+}
+
+// 读路径：新名优先，旧名兜底。
+//
+// 为什么要兜底：改了哈希基之后，历史人格文件还在旧名下。
+// 不兜底就读不到 → 用户存过的人格静默回退到全局默认，界面上完全看不出。
+// 只有读需要兜底；写永远写新名（见 set_persona_for）。
+std::string PersonaStore::override_path_read(const std::string& conv_id) const {
+  const std::string dir = cfg_.dir + "/sessions/";
+  const std::string fresh = dir + safe_filename(conv_id) + ".md";
+  std::error_code ec;
+  if (fs::exists(fresh, ec)) return fresh;
+
+  const std::string legacy = dir + legacy_filename(conv_id) + ".md";
+  if (fs::exists(legacy, ec)) {
+    // 顺手迁移：改名成功之后就走新名，下次不再走这条分支。
+    // 迁移失败不影响读取（旧文件还在）。
+    std::error_code mv_ec;
+    fs::rename(legacy, fresh, mv_ec);
+    if (!mv_ec) {
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "persona",
+                            "legacy_filename_migrated")
+          .field("conv", conv_id)
+          .field("to", safe_filename(conv_id));
+      return fresh;
+    }
+    return legacy;
+  }
+  return fresh;   // 两边都没有：返回新名（读出来是空串，写也写新名）
 }
 
 fish::core::Error PersonaStore::init() {
@@ -152,7 +200,7 @@ fish::core::Error PersonaStore::set_default_persona(const std::string& text) {
 
 fish::core::Result<std::string> PersonaStore::persona_for(
     const std::string& conv_id) const {
-  auto ov = read_text_file(override_path(conv_id));
+  auto ov = read_text_file(override_path_read(conv_id));
   if (!ov.ok()) return ov;
   if (!ov.value->empty()) return ov;
   return default_persona();
@@ -164,6 +212,8 @@ fish::core::Error PersonaStore::set_persona_for(const std::string& conv_id,
   if (text.empty()) {
     std::error_code ec;
     fs::remove(path, ec);
+    // 取消覆盖时连旧名一起删，否则读时兜底会把它又捡回来。
+    fs::remove(cfg_.dir + "/sessions/" + legacy_filename(conv_id) + ".md", ec);
     return fish::core::Error::none();
   }
   return write_text_file(path, text);
@@ -171,7 +221,7 @@ fish::core::Error PersonaStore::set_persona_for(const std::string& conv_id,
 
 bool PersonaStore::has_override(const std::string& conv_id) const {
   std::error_code ec;
-  const auto p = override_path(conv_id);
+  const auto p = override_path_read(conv_id);
   return fs::exists(p, ec) && fs::file_size(p, ec) > 0;
 }
 

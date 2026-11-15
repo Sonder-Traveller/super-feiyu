@@ -135,7 +135,6 @@ class Pipeline {
     fish::session::ConversationBook* convos{nullptr};
     fish::memory::MemorySystem* memory{nullptr};
     fish::memory::Consolidator* consolidator{nullptr};
-    bool group_voice{false};
     int passive_window_ms{300000};
     // DeepSeek 服务端联网工具（deepseek_web_search / deepseek_read_url）
     // 是否开启。orchestrator 拿不到 ChatConfig，由 main 装配时从

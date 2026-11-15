@@ -3,6 +3,7 @@
 module;
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -10,6 +11,7 @@ module;
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -543,6 +545,13 @@ bool parse_fact_line(const std::string& line, Fact* out) {
     out->superseded_by = tail;
     content = content.substr(0, arrow);
     content.erase(std::remove(content.begin(), content.end(), '~'), content.end());
+    // 「→ 被」前面那个空格还挂在尾部：不去掉的话，
+    // 检索过滤时按文本精确匹配会失败（索引里的文本没有这个空格），
+    // 被取代的事实照样被召回。
+    while (!content.empty() &&
+           (content.back() == ' ' || content.back() == '\t')) {
+      content.pop_back();
+    }
   }
   out->content = content;
   out->confidence = m[3].matched ? std::stod(m[3]) : 0.8;
@@ -550,6 +559,66 @@ bool parse_fact_line(const std::string& line, Fact* out) {
   return true;
 }
 
+// ── 事实取代（superseded_by）───────────────────────────
+//
+// 同一个主语下的两条事实互相矛盾时（「养了一只叫豆豆的猫」 vs
+// 「猫上个月死了」），旧实现两条并存、同时被召回，模型看到矛盾信息。
+//
+// 判据：**同主语 + 共享主题词 + 时间更新**。
+//   - 新事实的 created 不早于旧事实
+//   - 两条正文共享至少一个「主题词」（长度 ≥2 的字词）
+//
+// 这不是「关键词匹配用户意图」——不判断用户在问什么，
+// 只在写入时判断「这两条说的是不是同一件事」，是数据一致性维护。
+//
+// 为什么不用 LLM 判断：写入路径上一次 LLM 调用会让每次 consolidate
+// 多花几秒和一份钱，而「同主语 + 共享主题词」已经能覆盖绝大多数场景，
+// 误判的代价也只是少召回一条（原文还在文件里，能手工改回来）。
+
+// 在一批事实里标记取代关系。原地修改 facts。
+//
+// 【为什么不再自动猜】
+//   原先的写法是「同主语 + 共享主题词 + 时间更新 → 后者取代前者」。
+//   实测这个启发式在中文上根本不可靠：
+//     - 中文句子没有空格，整句会被当成一个「主题词」，
+//       「养了一只叫豆豆的猫」和「豆豆上个月死了」一个词都对不上 → 从不触发
+//     - 就算切成二元组，「豆豆」也会让「豆豆很可爱」取代「豆豆抓老鼠」，
+//       两句都是真的，没有矛盾，却被判成后者作废
+//   「这两句是不是在说同一件事、是不是互相矛盾」是需要理解语义的判断，
+//   程序不该猜——猜错的代价是真事实被静默丢出召回。
+//
+// 【现在的做法：由模型显式给出】
+//   巩固用的 LLM 在输出 facts 时，对每条可以带一个 supersedes 字段，
+//   写的是「这条推翻的那条事实的原文」。程序只做三件事：
+//     1. 按 supersedes 找到旧事实
+//     2. 打上 superseded_by = 新事实 id
+//     3. 重写 facts.md（原文保留，只是标记）
+//   猜的活交给模型，程序只执行明确指令。模型没给 supersedes 就不标记，
+//   宁可两条并存（用户自己能看出矛盾），也不静默删掉一条。
+//
+// 返回值：新标记的条数。
+int apply_supersedes(std::vector<Fact>& facts,
+                     const std::vector<std::pair<std::string, std::string>>&
+                         supersedes_pairs) {
+  int marked = 0;
+  for (const auto& [new_id, old_content] : supersedes_pairs) {
+    if (new_id.empty() || old_content.empty()) continue;
+    for (auto& old_fact : facts) {
+      if (old_fact.content != old_content) continue;
+      if (old_fact.id == new_id) continue;              // 不能自己取代自己
+      if (old_fact.superseded_by == new_id) continue;   // 已经标过
+      old_fact.superseded_by = new_id;
+      ++marked;
+      break;
+    }
+  }
+  if (marked > 0) {
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory",
+                          "facts_superseded_explicit")
+        .field("newly_marked", static_cast<long long>(marked));
+  }
+  return marked;
+}
 std::string json_extract(const std::string& raw) {
   const auto fence = raw.find("```");
   if (fence != std::string::npos) {
@@ -687,6 +756,72 @@ double keyword_relevance(const std::string& text, const std::string& keyword) {
   return static_cast<double>(count) + position_bonus;
 }
 
+// 把文本截到不超过 max_tokens（按 estimate_tokens 的口径）。
+//
+// 按**字符**边界走，不按字节：中文一个字 3 字节，从中间切就是乱码。
+// 优先切在句末标点上（句号 / 分号 / 换行），找不到才硬切在字符边界。
+//
+// 保留尾部而不保留头部：摘要是「越来越早的内容」的浓缩，
+// 头部讲的是最早的、已经最不相关的事，尾部更接近当前对话。
+// 所以从**前**面砍，保住后面。
+std::string truncate_to_tokens(const std::string& text, std::size_t max_tokens) {
+  if (max_tokens == 0 || text.empty()) return {};
+  if (estimate_tokens(text) <= max_tokens) return text;
+
+  // 先按字符切成符号序列（字符边界）
+  std::vector<std::size_t> offsets;   // 每个字符的起始字节位置
+  offsets.reserve(text.size());
+  for (std::size_t i = 0; i < text.size();) {
+    offsets.push_back(i);
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    std::size_t len = 1;
+    if ((c & 0xE0) == 0xC0) {
+      len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+    }
+    i += len;
+  }
+  offsets.push_back(text.size());   // 哨兵：结尾
+
+  // 从尾部往前累积，直到用完预算
+  std::size_t keep_from_idx = offsets.size() - 1;
+  std::size_t used = 0;
+  for (std::size_t k = offsets.size() - 1; k > 0; --k) {
+    const std::size_t start = offsets[k - 1];
+    const std::size_t end = offsets[k];
+    const std::string one = text.substr(start, end - start);
+    const std::size_t t = estimate_tokens(one);
+    if (used + t > max_tokens) break;
+    used += t;
+    keep_from_idx = k - 1;
+  }
+  // 一个字符都放不下时，至少保留最后一个字符
+  if (keep_from_idx >= offsets.size() - 1 && offsets.size() >= 2) {
+    keep_from_idx = offsets.size() - 2;
+  }
+
+  // 在保留区里找第一个句末标点，从它之后开始，避免摘要从半句话开头
+  std::size_t cut = offsets[keep_from_idx];
+  for (std::size_t k = keep_from_idx; k + 1 < offsets.size(); ++k) {
+    const std::string ch = text.substr(offsets[k], offsets[k + 1] - offsets[k]);
+    if (ch == "。" || ch == "；" || ch == "！" || ch == "？" || ch == "\n" ||
+        ch == ";" || ch == ".") {
+      cut = offsets[k + 1];
+      break;
+    }
+  }
+  std::string out = text.substr(cut);
+  // 去掉尾部空白
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r' ||
+                          out.back() == ' ' || out.back() == '\t')) {
+    out.pop_back();
+  }
+  return out;
+}
+
 std::string render_transcript(const std::vector<Message>& msgs) {
   std::ostringstream oss;
   for (const auto& m : msgs) {
@@ -723,9 +858,17 @@ constexpr const char* kConsolidatePrompt =
     "事实写成简洁陈述句；情景摘要一句话不超过 40 字。\n"
     "输出严格 JSON，不要解释：\n"
     R"({"episodes":[{"summary":"...","importance":0.5}],)"
-    R"("facts":[{"subject":"用户","content":"...","confidence":0.9}],)"
+    R"("facts":[{"subject":"用户","content":"...","confidence":0.9,)"
+    R"("supersedes":"..."}],)"
     R"("traits":[{"pattern":"...","evidence":1}]})"
-    "\n没有值得记的内容就三个数组都给空。";
+    "\n没有值得记的内容就三个数组都给空。\n"
+    "\n关于 facts 里的 supersedes 字段（可选）：\n"
+    "  只有当这条新事实**推翻了**一条已知的旧事实时才填，内容是旧事实的原文，"
+    "一字不差地照抄。例如旧事实是「养了一只叫豆豆的猫」，"
+    "现在说「豆豆上个月死了」，新事实就写 supersedes: \"养了一只叫豆豆的猫\"。\n"
+    "  两条事实同时成立（「喜欢猫」和「住在上海」）时**不要**填 —— "
+    "填错的后果是一条真事实被永久排除在回忆之外。\n"
+    "  拿不准就别填，宁可两条并存。";
 
 }  // namespace
 
@@ -1655,6 +1798,39 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     ++report.facts_written;
   }
 
+  // ── 事实取代（superseded_by）────────────────────────────
+  //
+  // 「这两条事实是不是在说同一件事、是不是互相矛盾」需要理解语义，
+  // 程序猜不准（中文尤其难：实测按主题词猜，要么从不触发，
+  // 要么把两句都成立的话判成一条作废）。
+  //
+  // 所以判断交给写入侧的模型：facts 里每条可以带一个 supersedes 字段，
+  // 内容是「这条推翻的那条旧事实的原文」。程序只按它执行标记 + 落盘。
+  // 模型没给就两条并存——用户自己能看出矛盾，好过程序静默丢一条。
+  //
+  // 标记写在 facts.md 的「→ 被 xxx 取代」后缀里（格式早就有），
+  // 检索时按 superseded_by 过滤：原文仍在文件里可查，但不再当现存事实召回。
+  if (notes != nullptr) {
+    std::vector<std::pair<std::string, std::string>> pairs;
+    for (const auto& f : body.value("facts", nlohmann::json::array())) {
+      const std::string content = f.value("content", "");
+      const std::string old_one = f.value("supersedes", "");
+      if (content.empty() || old_one.empty()) continue;
+      pairs.emplace_back("f" + content_hash(content).substr(0, 12), old_one);
+    }
+    if (!pairs.empty()) {
+      if (apply_supersedes(existing_facts, pairs) > 0) {
+        // 重写整个 facts.md：取代标记只有全量重写才写得进去
+        // （append 只能追加，改不了已有行的后缀）。
+        const auto e = notes->rewrite_facts(conv_id, existing_facts);
+        if (!e.ok()) {
+          ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory",
+                                "rewrite_facts_with_supersede_failed")
+              .field("detail", e.detail);
+        }
+      }
+    }
+  }
   auto existing = notes != nullptr ? notes->load_traits(conv_id)
                                    : Result<std::vector<Trait>>::ok({});
   std::vector<Trait> traits = existing.ok() ? *existing.value : std::vector<Trait>{};
@@ -1672,6 +1848,23 @@ Result<ConsolidateReport> Consolidator::apply_json(const std::string& json_text,
     ++report.traits_updated;
   }
   if (notes != nullptr && !traits.empty()) notes->save_traits(conv_id, traits);
+
+  // traits 也要进索引。
+  //
+  // 以前只写 traits.md、不进 SQLite，于是 traits 只能靠 load_traits 全量读，
+  // search_memory 永远搜不到「这个人有什么习惯」——模型明明记了，
+  // 却只能靠碰运气看到。这里把每条 pattern 单独索引成 kind="trait"。
+  //
+  // id 用 pattern 的内容哈希：同一个 pattern 重复出现只覆盖同一条，
+  // 不会因为 evidence 涨了就刷出多行。
+  if (index != nullptr && embedding != nullptr) {
+    for (const auto& t : traits) {
+      if (t.pattern.empty()) continue;
+      const std::string tid = "t" + content_hash(t.pattern).substr(0, 12);
+      auto vec = embedding->embed(t.pattern);
+      if (vec.ok()) index->upsert_item(conv_id, "trait", tid, t.pattern, *vec.value);
+    }
+  }
 
   ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory", "consolidated")
       .field("episodes", report.episodes_written)
@@ -1774,6 +1967,10 @@ std::size_t MemorySystem::count_source_items() const {
       if (facts.ok()) n += facts.value->size();
       auto episodes = notes_.load_episodes(conv_id);
       if (episodes.ok()) n += episodes.value->size();
+      // traits 也参与索引（kind="trait"），所以也算进真源条目数。
+      // 漏掉它会让「索引比真源少」永远为真，每次启动都白重建一遍。
+      auto traits = notes_.load_traits(conv_id);
+      if (traits.ok()) n += traits.value->size();
     }
   }
   return n;
@@ -1827,6 +2024,29 @@ Result<std::size_t> MemorySystem::rebuild_index() {
           auto vec = embedding_->embed(ep.summary);
           if (vec.ok()) {
             index_.upsert_item(conv_id, "episode", ep.id, ep.summary, *vec.value);
+            ++rebuilt;
+          }
+        }
+      }
+      // traits 同样是真源，重建时必须一起灌回来，否则 search_memory
+      // 对「这个人有什么习惯」这类问题永远搜不到。
+      auto traits = notes_.load_traits(conv_id);
+      if (traits.ok()) {
+        for (const auto& t : *traits.value) {
+          if (t.pattern.empty()) continue;
+          auto vec = embedding_->embed(t.pattern);
+          if (vec.ok()) {
+            // id 必须和 apply_json 里用的算法一致，否则重建后
+            // 同一个 pattern 会在索引里出现两条。
+            std::size_t h = 1469598103934665603ULL;
+            for (const char ch : t.pattern) {
+              h ^= static_cast<unsigned char>(ch);
+              h *= 1099511628211ULL;
+            }
+            char idbuf[20];
+            std::snprintf(idbuf, sizeof(idbuf), "t%012llx",
+                          static_cast<unsigned long long>(h) & 0xFFFFFFFFFFFFULL);
+            index_.upsert_item(conv_id, "trait", idbuf, t.pattern, *vec.value);
             ++rebuilt;
           }
         }
@@ -1948,6 +2168,25 @@ Result<ConsolidateReport> MemorySystem::compact(const std::string& conv_id,
     ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory", "summarize_failed");
   }
 
+  // 摘要也受预算约束。
+  //
+  // 以前 summary_budget 只被赋值、没人读：summarize() 让模型写
+  // 「不超过 200 字」，但模型不一定听话。摘要有一次写了近 2000 token，
+  // 直接把原文预算挤爆——压缩「成功」了，下一轮照样超窗口。
+  // 超预算时按字符边界截断，而不是硬切字节：硬切会把最后一个字切坏，
+  // 中文尤其明显（3 字节的字被切成 1~2 字节就是乱码）。
+  if (budget.summary_budget > 0) {
+    const std::size_t before = estimate_tokens(new_summary);
+    if (before > budget.summary_budget) {
+      new_summary = truncate_to_tokens(new_summary, budget.summary_budget);
+      ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory",
+                            "summary_over_budget_truncated")
+          .field("before", static_cast<long long>(before))
+          .field("limit", static_cast<long long>(budget.summary_budget))
+          .field("after", static_cast<long long>(estimate_tokens(new_summary)));
+    }
+  }
+
   // 原文落盘为情景记忆（不丢），并建索引供将来检索
   std::string transcript_text;
   for (const auto& m : to_compact) {
@@ -1975,9 +2214,7 @@ Result<ConsolidateReport> MemorySystem::compact(const std::string& conv_id,
   }
 
   // 事实沉淀：对被压缩的这批 transcript 追加一次 consolidate()，
-  // 把「事实 / 性格特征」写进长期记忆（facts.md / traits.md）。
-  //
-  // 为什么在这里而不是编排层：只有 compact 内部还持有 to_compact 这份原文，
+  // 把「事实 / 性格特征」写进长期记忆（facts.md / traits.md）。 为什么在这里而不是编排层：只有 compact 内部还持有 to_compact 这份原文，
   // 编排层调用 compact 后原文已经被 take/restore 掉，再读就是压缩后的剩余部分。
   // 为什么不放在持锁区：consolidate 会调一次 LLM（秒级）并回调
   // NotesStore/IndexStore（各自有锁），持 mu_ 调用会阻塞整个会话。
@@ -2019,41 +2256,133 @@ Result<std::vector<MemorySystem::SearchHit>> MemorySystem::search(const std::str
 
   const std::size_t cap = limit > 0 ? static_cast<std::size_t>(limit) : std::numeric_limits<std::size_t>::max();
 
-  // 向量路（若配了 embedding）
+  // ── 两路召回 + RRF 融合 ──────────────────────────────
+  //
+  // 两路的分数量纲根本不同：向量路是余弦相似度（0~1 的连续值），
+  // 关键词路是「精确命中 = 1.0」的定值。直接比较大小毫无意义
+  // （关键词路会永远压过向量路），而简单拼接（向量全在前）又会让
+  // 「关键词完全命中」的条目排在「向量勉强沾边」的条目后面。
+  //
+  // RRF（Reciprocal Rank Fusion）只看**排名**不看分值：
+  //   score(d) = Σ_路 1 / (k + 该路上的名次)
+  // k 取 60 是 RRF 的常用值，作用是压低头部差距：第 1 名 1/61 与
+  // 第 2 名 1/62 只差 1.6%，让「两路都排前面」的条目胜出，
+  // 而不是靠单路的高分。
+  //
+  // 为什么不把两路归一化到同一量纲：那才是真正的坑——
+  // 余弦 0.7 到底算不算高，取决于 embedding 模型和语料，没有通用阈值。
+  constexpr double kRrfK = 60.0;
+
+  struct Fused {
+    SearchHit hit;
+    double rrf{0.0};
+    int vec_rank{-1};   // 向量路上的名次（1 基，-1 = 该路没命中）
+    int kw_rank{-1};    // 关键词路上的名次
+  };
+  std::vector<Fused> fused;
+
+  auto find_fused = [&fused](const std::string& text) -> Fused* {
+    for (auto& f : fused) {
+      if (f.hit.text == text) return &f;
+    }
+    return nullptr;
+  };
+
+  // 路 1：向量召回（若配了 embedding）
   if (embedding_ != nullptr) {
     if (auto v = embedding_->embed(query); v.ok()) {
       if (auto hits = index_.search(*v.value, static_cast<int>(cap), conv_id); hits.ok()) {
+        int rank = 0;
         for (const auto& h : *hits.value) {
-          SearchHit sh;
-          sh.kind = h.kind;
-          sh.text = h.text;
-          sh.score = h.score;
-          out.push_back(std::move(sh));
+          ++rank;
+          if (auto* existing = find_fused(h.text)) {
+            existing->vec_rank = rank;
+            existing->rrf += 1.0 / (kRrfK + static_cast<double>(rank));
+            // 同一文本两路都命中：保留更高的原始分（余弦更可解释）
+            if (h.score > existing->hit.score) existing->hit.score = h.score;
+            continue;
+          }
+          Fused f;
+          f.hit.kind = h.kind;
+          f.hit.text = h.text;
+          f.hit.score = h.score;
+          f.vec_rank = rank;
+          f.rrf = 1.0 / (kRrfK + static_cast<double>(rank));
+          fused.push_back(std::move(f));
         }
       }
     }
   }
 
-  // 关键词路补足（向量不可用时也能用）
+  // 路 2：关键词召回（向量不可用时也能单独工作）
+  if (auto kw = index_.search_text(conv_id, query, static_cast<int>(cap)); kw.ok()) {
+    int rank = 0;
+    for (const auto& h : *kw.value) {
+      ++rank;
+      if (auto* existing = find_fused(h.text)) {
+        existing->kw_rank = rank;
+        existing->rrf += 1.0 / (kRrfK + static_cast<double>(rank));
+        continue;
+      }
+      Fused f;
+      f.hit.kind = h.kind;
+      f.hit.text = h.text;
+      f.hit.score = h.score;
+      f.kw_rank = rank;
+      f.rrf = 1.0 / (kRrfK + static_cast<double>(rank));
+      fused.push_back(std::move(f));
+    }
+  }
+
+  // 按 RRF 分倒序。同分时向量路名次靠前的优先（语义相近通常更贴题），
+  // 再退回到文本字典序保证结果稳定（同一个查询两次调用顺序一致）。
+  std::sort(fused.begin(), fused.end(), [](const Fused& a, const Fused& b) {
+    if (a.rrf != b.rrf) return a.rrf > b.rrf;
+    const int ar = a.vec_rank < 0 ? std::numeric_limits<int>::max() : a.vec_rank;
+    const int br = b.vec_rank < 0 ? std::numeric_limits<int>::max() : b.vec_rank;
+    if (ar != br) return ar < br;
+    return a.hit.text < b.hit.text;
+  });
+
+  // ── 过滤被取代的事实 ────────────────────────────────────
   //
-  // score 语义：向量路是余弦相似度（0~1），关键词路是「精确命中 = 1.0」。
-  // 两路**不融合**：结果按「向量路在前、关键词路补足」拼接，
-  // 关键词路的 1.0 不参与跨路比较（否则关键词路会压过向量路）。
-  // 关键词路内部已按相关度排好序（见 IndexStore::search_text）。
-  if (out.size() < cap) {
-    if (auto kw = index_.search_text(conv_id, query, static_cast<int>(cap)); kw.ok()) {
-      for (const auto& h : *kw.value) {
-        if (out.size() >= cap) break;
-        const bool dup = std::any_of(out.begin(), out.end(),
-                                     [&](const SearchHit& x) { return x.text == h.text; });
-        if (dup) continue;
-        SearchHit sh;
-        sh.kind = h.kind;
-        sh.text = h.text;
-        sh.score = h.score;   // = 1.0（精确命中）
-        out.push_back(std::move(sh));
+  // 被新事实取代的旧事实（superseded_by 非空）仍在 facts.md 里
+  // （原文不能删，用户要能查到历史），但**不该再被当成现存事实召回**：
+  // 否则「豆豆上个月死了」进来之后，模型还会同时召回
+  // 「养了一只叫豆豆的猫」，看到自相矛盾的两条。
+  //
+  // 索引里只有文本，没有 superseded_by 字段，所以这里按**文本**
+  // 反查旁路文件一次。代价是一次 load_facts（按会话，小文件），
+  // 换来的是检索结果里不再出现已作废的事实。
+  std::vector<std::string> superseded_texts;
+  {
+    auto facts = notes_.load_facts(conv_id);
+    if (facts.ok()) {
+      for (const auto& f : *facts.value) {
+        if (!f.superseded_by.empty()) superseded_texts.push_back(f.content);
       }
     }
+  }
+  if (!superseded_texts.empty()) {
+    const auto removed = std::remove_if(
+        fused.begin(), fused.end(), [&](const Fused& f) {
+          if (f.hit.kind != "fact") return false;
+          return std::find(superseded_texts.begin(), superseded_texts.end(),
+                           f.hit.text) != superseded_texts.end();
+        });
+    if (removed != fused.end()) {
+      const auto n = static_cast<long long>(std::distance(removed, fused.end()));
+      fused.erase(removed, fused.end());
+      ::fish::log::log_line(::fish::log::LogLevel::kInfo, "memory",
+                            "superseded_facts_filtered")
+          .field("filtered", n);
+    }
+  }
+
+  out.reserve(std::min(fused.size(), cap));
+  for (auto& f : fused) {
+    if (out.size() >= cap) break;
+    out.push_back(std::move(f.hit));
   }
 
   return Result<std::vector<SearchHit>>::ok(std::move(out));

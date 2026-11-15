@@ -234,7 +234,8 @@ void test_consolidate_json_apply() {
 
   auto facts = notes.load_facts(CONV);
   CHECK(facts.ok() && facts.value->size() == 1, "fact persisted to sidecar file");
-  CHECK(idx.item_count() == 2, "index has episode + fact");
+  // 3 条 = 1 episode + 1 fact + 1 trait（traits 现在也进索引）
+  CHECK(idx.item_count() == 3, "index has episode + fact + trait");
 
   // 证据累加：再来一次同样 trait
   const std::string model_out2 = R"({"episodes":[],"facts":[],"traits":[{"pattern":"不喜欢被追问","evidence":2}]})";

@@ -533,7 +533,8 @@ int main(int argc, char** argv) {
         }));
   }
 
-  // 网络热梗：把本地库的清单交给模型自己挑，未收录的由模型点名后联网学
+  // 网络热梗：按词查，本地没有就自动联网学一次并写回。
+  // 全部判断封装在工具内部，模型只传一个词。
   {
     fish::meme::MemeStore::Config meme_cfg;
     meme_cfg.dir = cfg.get_or("meme.dir", "data/memes");
@@ -616,7 +617,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  // 热梗：清单交给模型自己挑（与本地图片同一套做法），联网只用于「学新梗」
+  // 热梗：一个词进、释义出。本地库百分比匹配，没有就自动联网学一次并写回。
+  // 全部判断封装在工具内部，模型只传一个词，不知道这个流程存在。
   if (meme_store) {
     auto* ms = meme_store.get();
     auto* raw_search = search_holder.get();
@@ -624,12 +626,10 @@ int main(int argc, char** argv) {
     fish::tool::MemeLookupTool::RemoteSearcher remote;
     if (raw_search != nullptr) {
       // 有搜索后端时才启用联网学习。
-      //
-      // 入参是**模型点名的梗名**（learn 参数），不是整句话——
-      // 清单模式下程序不再从查询串里猜梗名（原 term_candidate 已删）。
+      // 入参是模型给的那个词（term 参数），不是整句话——程序不从句子里猜梗名。
       remote = [raw_search, provider_name = search_cfg.provider](
                    const std::string& term, std::string* error) {
-        std::vector<fish::tool::MemeLookupTool::Hit> out;
+        std::vector<fish::tool::MemeHit> out;
         if (error != nullptr) error->clear();
         if (term.empty()) {
           if (error != nullptr) *error = "empty_term";
@@ -648,9 +648,9 @@ int main(int argc, char** argv) {
           return out;
         }
         for (const auto& h : *r.value) {
-          fish::tool::MemeLookupTool::Hit hit;
+          fish::tool::MemeHit hit;
           hit.term = term;
-          // 释义：优先取摘要（snippet / summary），拿不到就取正文前几百字。
+          // 释义：优先取摘要（snippet / summary），拿不到就取标题前几百字。
           // **不自己编释义**——原文里是什么就是什么。
           hit.meaning = h.snippet;
           if (hit.meaning.empty() && !h.title.empty()) {
@@ -672,46 +672,28 @@ int main(int argc, char** argv) {
           .field("api_key_empty", search_cfg.api_key.empty())
           .field("hint", std::string(
                            "热梗联网学习不可用：capability.search 未配置 provider 或 api_key，"
-                           "模型要用 learn 学新梗时只能如实说没学到"));
+                           "库里没有的词只能如实说没查到"));
     }
 
     tools.add(std::make_shared<fish::tool::MemeLookupTool>(
-        // 清单：全部条目，不检索、不截断。
-        [ms]() {
-          std::vector<fish::tool::MemeLookupTool::Hit> out;
-          for (const auto& e : ms->all()) {
-            fish::tool::MemeLookupTool::Hit h;
-            h.term = e.term;
-            h.meaning = e.meaning;
-            h.usage = e.usage;
-            h.source = "local";
-            // 别名拼好给工具展示（清单里带上「也叫 …」，
-            // 用户用的可能是别名或另一种写法，模型看到就知道是同一条）
-            for (std::size_t i = 0; i < e.aliases.size(); ++i) {
-              if (i > 0) h.aliases += "、";
-              h.aliases += e.aliases[i];
-            }
-            out.push_back(std::move(h));
-          }
-          return out;
-        },
-        // 取详情：按清单序号拿一条（命中计数由 store 负责）
-        [ms](long long index, fish::tool::MemeLookupTool::Hit* out) {
-          if (out == nullptr || index < 0) return false;
-          fish::meme::Entry e;
-          if (!ms->detail(static_cast<std::size_t>(index), &e)) return false;
-          out->term = e.term;
-          out->meaning = e.meaning;
-          out->usage = e.usage;
+        // 本地查找：百分比匹配，命中时由 store 把这条的 hits +1
+        [ms](const std::string& term, fish::tool::MemeHit* out) {
+          if (out == nullptr) return false;
+          fish::meme::MemeStore::Match m;
+          if (!ms->find(term, &m)) return false;
+          out->term = m.entry.term;
+          out->meaning = m.entry.meaning;
+          out->usage = m.entry.usage;
           out->source = "local";
-          for (std::size_t i = 0; i < e.aliases.size(); ++i) {
+          out->percent = m.percent;
+          for (std::size_t i = 0; i < m.entry.aliases.size(); ++i) {
             if (i > 0) out->aliases += "、";
-            out->aliases += e.aliases[i];
+            out->aliases += m.entry.aliases[i];
           }
           return true;
         },
         remote,
-        [ms](const std::vector<fish::tool::MemeLookupTool::Hit>& hits) {
+        [ms](const std::vector<fish::tool::MemeHit>& hits) {
           std::vector<fish::meme::Entry> entries;
           for (const auto& h : hits) {
             fish::meme::Entry e;
@@ -730,8 +712,25 @@ int main(int argc, char** argv) {
                       const std::string& meaning) {
           memory_sys.remember_meme(conv_id, term, meaning);
         }));
-  }
 
+    // 纠错：只改释义，保留梗名/别名/来源，并打上 edited 标记，
+    // 之后自动学习不会再把纠正过的释义覆盖回去。
+    tools.add(std::make_shared<fish::tool::MemeFixTool>(
+        [ms](const std::string& term, const std::string& meaning,
+             fish::tool::MemeHit* out) {
+          fish::meme::MemeStore::Match m;
+          const auto e = ms->correct(term, meaning, &m);
+          if (!e.ok()) return false;
+          if (out != nullptr) {
+            out->term = m.entry.term;
+            out->meaning = m.entry.meaning;
+            out->usage = m.entry.usage;
+            out->source = "local";
+            out->percent = m.percent;
+          }
+          return true;
+        }));
+  }
   fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "tools_ready")
       .field("count", static_cast<long long>(tools.size()));
 
@@ -804,7 +803,6 @@ int main(int argc, char** argv) {
   deps.rate_limiter = &rate_limiter;
   deps.memory = &memory_sys;
   deps.consolidator = &consolidator;
-  deps.group_voice = cfg.get_bool_or("capability.tts.group_voice", false);
   deps.passive_window_ms =
       static_cast<int>(cfg.get_int_or("orchestrator.passive_window_ms", 300000));
   // DeepSeek 服务端联网工具：开了它本地 web_search/web_fetch 就不注册
@@ -984,6 +982,22 @@ int main(int argc, char** argv) {
           ::fish::log::log_line(fish::log::LogLevel::kInfo, "api",
                                 "restart_requested");
           std::raise(SIGTERM);
+        });
+        // /v1/memory/rebuild：从旁路 Markdown 真源重建 SQLite 索引。
+        //
+        // 启动时的自愈只在「条目数对不上」时触发，覆盖不到
+        // 「向量算错了但条数一样」（比如换了 embedding 模型）。
+        // 这个端点补上那个缺口，放在后台线程跑——重建要调 embedding，
+        // 几十秒起步，不能同步阻塞 HTTP 请求。
+        api_server->set_memory_rebuild_callback([&memory_sys]() -> long long {
+          auto r = memory_sys.rebuild_index();
+          if (!r.ok()) {
+            ::fish::log::log_line(fish::log::LogLevel::kWarn, "api",
+                                  "memory_rebuild_failed")
+                .field("detail", r.error.detail);
+            return -1;
+          }
+          return static_cast<long long>(*r.value);
         });
         // /v1/status 的通道信息：用回调注入，api 模块不需要认识 ChannelStats。
         //

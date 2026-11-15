@@ -124,6 +124,8 @@ enum class ErrorCode : std::uint8_t {
   kRateLimited,
   kUnauthorized,
   kBadRequest,
+  // 要找的东西不存在（区别于参数写错）。热梗库查不到词、纠正目标不存在用它。
+  kNotFound,
   kUpstreamUnavailable,
   kBudgetExhausted,
   kUnsupported,
