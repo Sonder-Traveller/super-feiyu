@@ -974,6 +974,26 @@ Result<int> Pipeline::handle(fish::core::IChannel& channel,
 
       tool_block += "【工具调用】" + call.name + "\n";
       tool_block += "【返回】" + outcome.content + "\n\n";
+
+      // 把「模型自己调用了这个工具」写进历史（assistant 侧）。
+      //
+      // 为什么必须：工具结果以 user 消息回传时，下一轮请求里**没有**
+      // 「模型调过工具」的任何痕迹（上一轮的 tool_calls 只存在于响应里，
+      // 不会写进 history）。模型看到的是「用户突然发来一份图库清单」，
+      // 完全不知道这是自己调用的返回 → 直接回复文字、不复调工具
+      // → send_image 拿到清单后图永远发不出去（实测两次）。
+      //
+      // 文字化意图而不是回放 OpenAI 的 tool_calls 消息格式：
+      // history 是 memory::Message/ContentBlock（纯文本），协议层不支持
+      // tool 角色；文字形式对所有上游兼容。
+      {
+        fish::core::ContentBlock intent;
+        intent.kind = fish::core::BlockKind::kText;
+        intent.role = "assistant";
+        intent.text = "（我调用了工具 " + call.name +
+                      "，参数 " + call.arguments + "，正在等待结果）";
+        req.history.push_back(std::move(intent));
+      }
     }
 
     if (tool_block.empty()) break;

@@ -577,7 +577,9 @@ Outcome ImageSearchTool::run(const Call& call) {
       s += "[" + std::to_string(i) + "] " +
            (all[i].caption.empty() ? "一张照片" : all[i].caption) + "\n";
     }
-    s += "选一张最合适的，带 index 参数再调用一次 send_image。";
+    s += "这是你刚才调用 send_image 的返回结果。现在就从中选出最合适的一张，"
+            "立刻再次调用 send_image 并带上它的 index——不要用文字回复，"
+            "只有再调用一次这个工具，图片才会真正发出去。";
     out.ok = true;
     out.content = detail::truncate(std::move(s));
     return out;
