@@ -8,6 +8,9 @@ cmake-build-*/
 # 二维码 / 绑定日志（含临时凭据痕迹）
 .qq_*.png
 .wechat_qr.png
+# 热梗库的备份文件不入库（含原始 24 条，仅本地留档）
+data/memes/memes-backup-*.tsv
+data/memes/*.bak.tsv
 .qq_*.log
 .qq_*.err
 .bridge.log

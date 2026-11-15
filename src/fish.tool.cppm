@@ -109,8 +109,9 @@ class MemorySearchTool final : public ITool {
   explicit MemorySearchTool(Searcher s) : search_(std::move(s)) {}
   [[nodiscard]] std::string name() const override { return "search_memory"; }
   [[nodiscard]] std::string description() const override {
-    return "在长期记忆里检索与查询相关的事实和过往对话。"
-           "当对方提到很久以前的事、或你需要回忆背景时使用。";
+    return "Search long-term memory: facts and past conversations related to "
+           "the query. Use it when the user refers to something long ago, or "
+           "when you need background you do not have in context.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -134,11 +135,12 @@ class ImageSearchTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
-    return "查看并发送你自己的形象库图片。\n"
-           "第一次调用不要带 index：会返回全部图片的清单。\n"
-           "然后你读清单，挑出最贴合当前对话的一张，再带 index 调一次发出去。\n"
-           "注意：没有「搜索」这回事，每次不带 index 都返回完整清单，"
-           "所以不要反复用不同的词试探——清单里就是全部可用的图。";
+    return "Send one of your own portrait images.\n"
+           "Call with no arguments first: it returns the full list of images "
+           "with an index for each. Pick the one that fits the conversation, "
+           "then call again with its index to send it. There is no search: "
+           "every no-argument call returns the entire list, so do not retry "
+           "with different words.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -162,9 +164,9 @@ class SendVoiceTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_voice"; }
   [[nodiscard]] std::string description() const override {
-    return "把一句话用你的声音发给对方。适合语气需要、或对方在用语音聊天的场合。"
-           "参数就是你要念出来的话，会用你自己的说话风格念。"
-           "不要长篇大论，一两句为宜。";
+    return "Send a short spoken message in your own voice. Use it when tone "
+           "matters or when the conversation is already spoken. The argument is "
+           "the text to speak. Keep it to one or two sentences.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -185,13 +187,12 @@ class WebSearchTool final : public ITool {
   explicit WebSearchTool(Searcher s) : search_(std::move(s)) {}
   [[nodiscard]] std::string name() const override { return "web_search"; }
   [[nodiscard]] std::string description() const override {
-    return "搜索互联网获取信息。适用于：近期事件、你不确定的事实、需要外部资料。\n"
-           "提高结果质量的技巧：\n"
-           "- 优先搜原始出处，而不是转述文章\n"
-           "- 用搜索语法把范围限死在可信站点或时间窗，而不是泛泛地搜\n"
-           "- 用「原文」「出处」「官方」这类词找一手来源\n"
-           "注意：搜索结果里混着大量营销号和 AI 生成内容，"
-           "多条结果说法一致也可能是因为互相转载。拿到结果后要自己判断可信度。";
+    return "Search the web for information you do not have: recent events, "
+           "facts you are unsure about, external sources.\n"
+           "Prefer primary sources over retellings. Narrow the query with search "
+           "operators instead of searching vaguely.\n"
+           "Results contain marketing content and AI-written pages, and agreeing "
+           "sources may just be copying each other. Judge credibility yourself.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -212,8 +213,9 @@ class WebFetchTool final : public ITool {
   explicit WebFetchTool(Fetcher f) : fetch_(std::move(f)) {}
   [[nodiscard]] std::string name() const override { return "web_fetch"; }
   [[nodiscard]] std::string description() const override {
-    return "抓取指定网页的正文内容（Markdown）。"
-           "当 web_search 找到链接、或对方给了链接需要你读内容时使用。";
+    return "Fetch the body text (Markdown) of a web page. Use it when "
+           "web_search returned a link you need to read, or when the user gave "
+           "you a link.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -274,30 +276,16 @@ class MemeLookupTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "lookup_meme"; }
   [[nodiscard]] std::string description() const override {
-    return "查网络热梗 / 网络用语 / 缩写 / 谐音 / 黑话是什么意思、怎么用。\n"
+    return "Look up internet slang, memes, abbreviations, homophones and niche "
+           "online expressions: what they mean and how they are used.\n"
            "\n"
-           "【什么时候用】遇到下面三种情况，先弄清楚再回答：\n"
-           "1. 陌生词汇：对方说了个你不认识的词。\n"
-           "2. 无规则文字组合：一串看着不像正常词语的文字。\n"
-           "3. 看不懂的表达：对方说的话、或图片上的文字，你不确定是什么意思。\n"
+           "Use before answering when you hit a word you do not know, a string "
+           "of characters that does not look like a normal word, or anything the "
+           "user said, or text in an image, whose meaning you are unsure about.\n"
            "\n"
-           "【它怎么工作】\n"
-           "第一次调用不要带任何参数：会返回全部热梗条目的清单。\n"
-           "你读清单，找到对应的那一条，再带 index 调一次，"
-           "拿到它的完整释义和用法。\n"
-           "注意：**没有「搜索」这回事**，每次不带参数都返回完整清单，"
-           "所以不要反复用不同的词试探——清单里就是全部可用的条目。\n"
-           "清单可能很长，你只需要找其中一条。\n"
-           "\n"
-           "【清单里没有的】带 learn 参数，把那个词原样填进去，"
-           "我会联网查一次，学到就写进库里并告诉你释义。"
-           "learn 只填那个词本身，不要填整句话。\n"
-           "\n"
-           "【边界】只管网络用语 / 梗 / 黑话。查一般事实用 web_search，"
-           "不要用这个工具。\n"
-           "\n"
-           "【都没查到怎么办】清单里没有、learn 也没学到，就如实说不认识，"
-           "或者直接问对方。**不要自己编一个解释**。";
+           "Online expressions only. For general facts use web_search.\n"
+           "If nothing is found, say you do not know or ask the user. Never "
+           "invent an explanation.";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;
@@ -470,8 +458,8 @@ std::string MemorySearchTool::parameters_schema() const {
   return R"({
     "type": "object",
     "properties": {
-      "query": {"type": "string", "description": "要检索的关键内容"},
-      "top_k": {"type": "integer", "description": "返回条数，默认 5", "minimum": 1, "maximum": 20}
+      "query": {"type": "string", "description": "what to look for"},
+      "top_k": {"type": "integer", "description": "how many results, default 5", "minimum": 1, "maximum": 20}
     },
     "required": ["query"]
   })";
@@ -517,7 +505,7 @@ std::string ImageSearchTool::parameters_schema() const {
     "type": "object",
     "properties": {
       "index": {"type": "integer",
-                "description": "清单里的序号。不填则只返回清单让你挑；填了就发那一张"}
+                "description": "index from the list. Omit to get the list; set it to send that image"}
     }
   })";
 }
@@ -573,7 +561,7 @@ std::string SendVoiceTool::parameters_schema() const {
   return R"({
     "type": "object",
     "properties": {
-      "text": {"type": "string", "description": "要念出来的话，一两句以内，保持你的说话风格"}
+      "text": {"type": "string", "description": "the words to speak, one or two sentences"}
     },
     "required": ["text"]
   })";
@@ -615,8 +603,8 @@ std::string WebSearchTool::parameters_schema() const {
   return R"({
     "type": "object",
     "properties": {
-      "query": {"type": "string", "description": "搜索关键词"},
-      "max_results": {"type": "integer", "description": "返回条数，默认 5", "minimum": 1, "maximum": 10}
+      "query": {"type": "string", "description": "search query"},
+      "max_results": {"type": "integer", "description": "how many results, default 5", "minimum": 1, "maximum": 10}
     },
     "required": ["query"]
   })";
@@ -667,7 +655,7 @@ std::string WebFetchTool::parameters_schema() const {
   return R"({
     "type": "object",
     "properties": {
-      "url": {"type": "string", "description": "要抓取的网页地址（http/https）"}
+      "url": {"type": "string", "description": "page URL, http or https"}
     },
     "required": ["url"]
   })";
@@ -713,9 +701,9 @@ std::string MemeLookupTool::parameters_schema() const {
     "type": "object",
     "properties": {
       "index": {"type": "integer",
-                "description": "清单里的序号（从 0 开始）。不填则只返回全部条目的清单让你挑；填了就返回那一条的完整释义和用法"},
+                "description": "index from the list, 0-based. Omit to get the full list; set it to get that entry"},
       "learn": {"type": "string",
-                "description": "清单里没有的新梗，把那个词本身填在这里（不要填整句话），会联网查一次并写进库里"}
+                "description": "a term missing from the list. Pass the bare term, not a sentence. It will be looked up online once and added."}
     }
   })";
 }
