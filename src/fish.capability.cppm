@@ -3222,9 +3222,14 @@ Result<std::unique_ptr<fish::core::ISpeechToText>> make_stt(const SttConfig& cfg
     // 官方 ASR 的硬约束直接在这里套默认值，配置里不用记：
     // 端点是 /v1/tools/asr（不是 OpenAI 的 /audio/transcriptions）；
     // 只收 16bit PCM WAV / Ogg Opus；≤8MiB ≤120s。
+    //
+    // base_url **强制覆盖**而不是「为空才填」：换 provider 后 config 里
+    // 残留的旧地址（如 siliconflow 的 https://api.siliconflow.cn/v1）会和
+    // 官方 path 拼成 /v1/v1/tools/asr（实测 404）。provider 决定端点归属，
+    // 旧 base_url 对新 provider 毫无意义，留着只会出错。
     SttConfig d = cfg;
-    if (d.base_url.empty()) d.base_url = "https://api.deepseek.com";
-    if (d.path.empty()) d.path = "/v1/tools/asr";
+    d.base_url = "https://api.deepseek.com";
+    d.path = "/v1/tools/asr";
     d.need_wav16k = true;
     if (d.max_upload_bytes == 0) d.max_upload_bytes = 8u << 20;
     return Result<std::unique_ptr<fish::core::ISpeechToText>>::ok(
