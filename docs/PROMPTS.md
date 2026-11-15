@@ -37,9 +37,14 @@
 | `messages[last].content` | **D. 本轮输入** | 每轮必发 |
 | `messages[n].content` | **E. 工具结果回灌** | 模型调了工具时 |
 | `tools` / `tool_choice` | 工具声明 | 注册表非空时 |
-| `reasoning_effort` | `high` | 配置里写了才发 |
+| `reasoning_effort` | `high` | 每轮必发（**锁定值**，见下） |
 
 > `max_tokens` 与 `temperature` **不发**，用上游默认值。
+>
+> `reasoning_effort` 锁死 `high`（产品要求）：控制面 PUT 拒绝修改，
+> 配置里手改成别的合法档位仍会发送，非法值由发送侧退回 `high`。
+> 锁定值的唯一来源是 `fish::capability::locked_reasoning_effort()`，
+> 控制面回显、PUT 报错、运行时默认值三处同源。
 
 ---
 

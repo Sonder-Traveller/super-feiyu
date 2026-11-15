@@ -14,6 +14,7 @@ module;
 #include <algorithm>
 #include <atomic>
 #include <random>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -27,6 +28,7 @@ module;
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -254,6 +256,24 @@ unsigned long long next_msg_seq() {
     return static_cast<unsigned long long>(rd() % 900000) + 1;
   }();
   return base + (++counter);
+}
+
+// 从图片 URL 后缀推断 mime。
+// 为什么需要：OneBot 的 image 段不带 mime，原来一律写 image/jpeg，
+// 于是 png/webp 被当成 jpeg（下游按扩展名存盘后再按 jpeg 编码发给上游）。
+// 认不出就退回 image/jpeg，保持旧行为。
+std::string mime_from_url(const std::string& url) {
+  const auto q = url.find('?');
+  const std::string path = (q == std::string::npos) ? url : url.substr(0, q);
+  const auto dot = path.find_last_of('.');
+  if (dot == std::string::npos) return "image/jpeg";
+  std::string ext = path.substr(dot + 1);
+  for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (ext == "png") return "image/png";
+  if (ext == "webp") return "image/webp";
+  if (ext == "gif") return "image/gif";
+  if (ext == "bmp") return "image/bmp";
+  return "image/jpeg";
 }
 
 }  // namespace
@@ -546,8 +566,8 @@ Result<std::string> QQOfficialChannel::upload_media(const std::string& conv_id, 
     file_data_b64 = base64_encode(bytes);
   }
 
-  std::string conv = conv_id;
-  if (is_group && conv.rfind("g:", 0) == 0) conv = conv.substr(2);
+  // conv_id 是原始 openid（"g:" 前缀只在会话键里），这里不再截前缀
+  const std::string& conv = conv_id;
   const std::string api_url = cfg_.api_base +
                               (is_group ? "/v2/groups/" + conv + "/files"
                                         : "/v2/users/" + conv + "/files");
@@ -610,8 +630,14 @@ Error QQOfficialChannel::send(const fish::core::OutboundMessage& msg, int attemp
     if (!e.ok()) return e;
   }
 
-  const bool is_group = msg.conversation_id.rfind("g:", 0) == 0;
-  std::string conv = is_group ? msg.conversation_id.substr(2) : msg.conversation_id;
+  // conversation_id 不带 "g:" 前缀（前缀由 session_key() 统一加），
+  // 群/私聊由消息本身携带（OutboundMessage::kind）。
+  //
+  // 以前靠「收消息时登记的群 id 集合」反推：服务重启后、群里还没发过
+  // 消息时，机器人主动往群里发消息 → 走 /v2/users/<group_id> →
+  // 消息发到了私聊。QQ 官方与 QQ 小号还各有一份集合，跨通道不共享。
+  const bool is_group = (msg.kind == fish::core::ChatKind::kGroup);
+  const std::string& conv = msg.conversation_id;
   const std::string url = cfg_.api_base +
                           (is_group ? "/v2/groups/" + conv + "/messages"
                                     : "/v2/users/" + conv + "/messages");
@@ -694,7 +720,8 @@ Error QQOneBotChannel::connect() {
     fish::core::InboundMessage msg;
     msg.channel = fish::core::Channel::kQQ;
     msg.kind = ev.is_group ? fish::core::ChatKind::kGroup : fish::core::ChatKind::kPrivate;
-    msg.conversation_id = ev.is_group ? ("g:" + ev.group_id) : ev.user_id;
+    // 只放原始 group_id / user_id：群聊前缀 "g:" 由 session_key() 统一加
+    msg.conversation_id = ev.is_group ? ev.group_id : ev.user_id;
     msg.sender_id = ev.user_id;
     msg.sender_name = ev.nickname;
     msg.message_id = ev.message_id;
@@ -711,7 +738,8 @@ Error QQOneBotChannel::connect() {
         fish::core::ContentBlock b;
         b.kind = fish::core::BlockKind::kImage;
         b.media_url = s.url;
-        b.mime = "image/jpeg";
+        // OneBot 不告诉我们真实类型，只能按 URL 后缀猜（原来写死 jpeg）
+        b.mime = mime_from_url(s.url);
         msg.blocks.push_back(std::move(b));
       } else if (s.type == "record" && !s.url.empty()) {
         fish::core::ContentBlock b;
@@ -756,7 +784,9 @@ Result<fish::core::InboundMessage> QQOneBotChannel::poll() {
 Error QQOneBotChannel::send(const fish::core::OutboundMessage& msg, int) {
   const std::string base =
       cfg_.http_url.empty() ? http_base_from_ws(cfg_.ws_url) : cfg_.http_url;
-  const bool is_group = msg.conversation_id.rfind("g:", 0) == 0;
+  // 群/私聊由消息本身携带（OutboundMessage::kind），不再靠收消息时
+  // 登记的群 id 集合反推（重启后 / 主动发言时那份集合是空的）。
+  const bool is_group = (msg.kind == fish::core::ChatKind::kGroup);
 
   for (const auto& block : msg.blocks) {
     json payload;
@@ -774,7 +804,12 @@ Error QQOneBotChannel::send(const fish::core::OutboundMessage& msg, int) {
     payload["auto_escape"] = false;
 
     if (is_group) {
-      payload["group_id"] = std::stoll(msg.conversation_id.substr(2));
+      // conversation_id 已是原始 group_id，不要再截前缀
+      try {
+        payload["group_id"] = std::stoll(msg.conversation_id);
+      } catch (...) {
+        payload["group_id"] = msg.conversation_id;
+      }
       endpoint = "/send_group_msg";
     } else {
       try {

@@ -18,6 +18,7 @@ import fish.core;
 import fish.log;
 import fish.config;
 import fish.capability;
+import fish.doc;
 import fish.probe;
 import fish.memory;
 import fish.media;
@@ -245,13 +246,100 @@ int main(int argc, char** argv) {
           .field("detail", e.error.detail);
     }
   }
-  if (!stub_mode && tts_cfg.provider != "none") {
-    auto t = fish::capability::make_tts(tts_cfg);
-    if (t.ok()) tts = std::move(*t.value);
+  // ── 语音合成 / 语音识别 ──
+  //
+  // 以前这两块成功和失败都不打日志：运维时无法从 journal 确认
+  // 「发语音」「对方发语音」到底能不能用、用的是哪家 provider。
+  // 现在参照 embedding 的写法补齐：成功打 provider/model，
+  // 失败打 detail，被显式关掉和缺 key 也各自说清楚。
+  if (!stub_mode) {
+    // ── TTS ──
+    if (tts_cfg.provider == "none") {
+      // 语音合成未启用：模型看不到 send_voice 工具。
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "tts_disabled")
+          .field("provider", tts_cfg.provider)
+          .field("hint", "语音合成未启用（capability.tts.provider = none）");
+    } else {
+      // edge 是本地命令，不需要 key；其余厂商缺 key 要到实际合成时才 401，
+      // 那时语音已经发不出去了。启动时就说清楚。
+      auto t = fish::capability::make_tts(tts_cfg);
+      if (t.ok()) {
+        tts = std::move(*t.value);
+        if (tts_cfg.provider != "edge" && tts_cfg.api_key.empty()) {
+          // 构造成功 ≠ 能用：非 edge 的厂商缺 key 时请求必 401。
+          // 用这条代替 tts_provider，免得运维看到「provider 就绪」而误判。
+          fish::log::log_line(fish::log::LogLevel::kWarn, "runtime",
+                              "tts_api_key_missing")
+              .field("provider", tts_cfg.provider)
+              .field("model", tts_cfg.model)
+              .field("hint", "语音合成 api_key 为空，实际合成会失败（换 provider 忘了填 key？）");
+        } else {
+          fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "tts_provider")
+              .field("provider", tts_cfg.provider)
+              .field("model", tts_cfg.model)
+              .field("voice", tts_cfg.voice);
+        }
+      } else {
+        fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "tts_init_failed")
+            .field("provider", tts_cfg.provider)
+            .field("detail", t.error.detail);
+      }
+    }
+
+    // ── STT ──
+    if (stt_cfg.provider == "none") {
+      // 语音识别未启用：收到语音只会回一句「[语音消息，未启用转写]」。
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "stt_disabled")
+          .field("provider", stt_cfg.provider)
+          .field("hint", "语音识别未启用（capability.stt.provider = none）");
+    } else if (stt_cfg.api_key.empty()) {
+      // 切 provider 后忘了填 key 是最常见的原因（config.toml 里的
+      // capability.stt.api_key 还绑着旧厂商的 ${VAR}）。以前这里直接跳过，
+      // 一条日志都没有，用户只知道「对方发语音没反应」。
+      //
+      // 走这条分支就不再 make_stt：缺 key 时它必定返回 kUnauthorized，
+      // 只会把同一条原因用两个事件名打两遍。
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "stt_api_key_missing")
+          .field("provider", stt_cfg.provider)
+          .field("model", stt_cfg.model)
+          .field("hint", "语音识别未初始化：api_key 为空（换 provider 后忘了填 key？）");
+    } else {
+      auto s = fish::capability::make_stt(stt_cfg);
+      if (s.ok()) {
+        stt = std::move(*s.value);
+        fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "stt_provider")
+            .field("provider", stt_cfg.provider)
+            .field("model", stt_cfg.model);
+      } else {
+        fish::log::log_line(fish::log::LogLevel::kWarn, "runtime", "stt_init_failed")
+            .field("provider", stt_cfg.provider)
+            .field("detail", s.error.detail);
+      }
+    }
   }
-  if (!stub_mode && stt_cfg.provider != "none" && !stt_cfg.api_key.empty()) {
-    auto s = fish::capability::make_stt(stt_cfg);
-    if (s.ok()) stt = std::move(*s.value);
+
+  // ── 文档解析 ──
+  // 独立一层：文档有自己的失败模式（页数、加密、超时）和成本模型（按页计费）。
+  const auto doc_cfg = fish::doc::load_config(cfg);
+  std::unique_ptr<fish::doc::IDocumentParser> docs;
+  if (!stub_mode) {
+    docs = fish::doc::make_parser(doc_cfg);
+    if (docs != nullptr) {
+      fish::log::log_line(fish::log::LogLevel::kInfo, "runtime", "document_provider")
+          .field("provider", doc_cfg.provider);
+    } else {
+      // 以前完全静默：解析器没建起来（provider=none 或 api_key 为空）
+      // 时一条日志都没有，用户只知道「发 PDF 没反应」，无从排查。
+      //
+      // 常见原因：只在 chat 里填了 DeepSeek key，document 没填 ——
+      // 现在 load_config 会走共享密钥，但共享不到时必须说清楚。
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime",
+                          "document_parser_disabled")
+          .field("provider", doc_cfg.provider)
+          .field("api_key_empty", doc_cfg.api_key.empty())
+          .field("hint", std::string("文档解析未启用：在对话里填过同一提供方的 key "
+                                     "即可自动复用（capability.document.api_key）"));
+    }
   }
 
   // ── 生图 + 形象库 ──
@@ -306,6 +394,8 @@ int main(int argc, char** argv) {
   //   会话覆盖由 PersonaStore 管，存 data/persona/sessions/<hash>.md。
   std::unique_ptr<fish::core::IPersona> persona_holder;
   std::unique_ptr<fish::persona::PersonaStore> persona_store;
+  // 会话登记表（pipeline / api 共用一份）。声明在这里以便 outlive deps。
+  std::unique_ptr<fish::session::ConversationBook> convos_book_;
   {
     fish::persona::PersonaStore::Config pc;
     pc.dir = cfg.get_or("persona.store_dir", "data/persona");
@@ -454,8 +544,14 @@ int main(int argc, char** argv) {
     }
   }
 
-  // 网络搜索：只有配置了 provider 才注册
-  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
+  // 网络搜索：只有配置了 provider 才注册。
+  // DeepSeek 服务端联网工具（capability.chat.deepseek_web_tools）开启时
+  // 不注册本地 web_search/web_fetch——两者不能混用，且服务端搜索免本地配额
+  //（判断依据直接读 config，与装配给 orchestrator 的是同一来源）。
+  const bool deepseek_web_tools_on =
+      cfg.get_bool_or("capability.chat.deepseek_web_tools", false);
+  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty() &&
+      !deepseek_web_tools_on) {
     auto searcher = fish::capability::make_search(search_cfg);
     if (searcher.ok() && *searcher.value) {
       search_holder = std::move(*searcher.value);
@@ -475,7 +571,9 @@ int main(int argc, char** argv) {
   }
 
   // 网页抓取：与搜索配套，search 找链接、fetch 读内容
-  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty()) {
+  // （deepseek_web_tools 开启时同样不注册，理由同上）
+  if (!stub_mode && search_cfg.provider != "none" && !search_cfg.api_key.empty() &&
+      !deepseek_web_tools_on) {
     auto fetcher = fish::capability::make_fetch(search_cfg);
     if (fetcher.ok() && *fetcher.value) {
       fetch_holder = std::move(*fetcher.value);
@@ -568,6 +666,34 @@ int main(int argc, char** argv) {
   fish::guard::RateLimiter rate_limiter(rate_cfg);
 
   fish::orchestrator::Pipeline::Deps deps;
+
+  // 会话登记表：人格页 bot 卡片列表的数据来源（api 与 pipeline 共用一份）。
+  // 放在 deps 之前——pipeline 和 api 都持有它的指针。
+  //
+  // 路径按 config.toml 所在目录拼 data/conversations.json。
+  // parent_path() 在 config_path 只是 "config.toml"（默认值）时返回**空串**，
+  // 直接拼会得到 "/data/conversations.json"（写到根目录！）。这里回退到 "."，
+  // 并把父目录建出来（不建目录 → ofstream 打不开 → 登记表永远不落盘）。
+  {
+    const std::filesystem::path cfg_dir =
+        std::filesystem::path(opt.config_path).parent_path();
+    const std::filesystem::path base = cfg_dir.empty()
+                                           ? std::filesystem::path(".")
+                                           : cfg_dir;
+    const std::filesystem::path conv_path = base / "data" / "conversations.json";
+    std::error_code dir_ec;
+    std::filesystem::create_directories(conv_path.parent_path(), dir_ec);
+    if (dir_ec) {
+      fish::log::log_line(fish::log::LogLevel::kWarn, "runtime",
+                          "conversations_dir_failed")
+          .field("path", conv_path.parent_path().string())
+          .field("detail", dir_ec.message());
+    }
+    convos_book_ = std::make_unique<fish::session::ConversationBook>(
+        conv_path.string());
+    deps.convos = convos_book_.get();
+  }
+
   deps.chat = chat.get();
   deps.embedding = embedding.get();
   deps.persona = persona_holder.get();
@@ -575,6 +701,7 @@ int main(int argc, char** argv) {
   deps.budget = &budget;
   deps.tts = tts.get();
   deps.stt = stt.get();
+  deps.docs = docs.get();
   deps.image = image_model.get();
   deps.portraits = &portraits;
   deps.media = &media_cache;
@@ -588,6 +715,10 @@ int main(int argc, char** argv) {
   deps.group_voice = cfg.get_bool_or("capability.tts.group_voice", false);
   deps.passive_window_ms =
       static_cast<int>(cfg.get_int_or("orchestrator.passive_window_ms", 300000));
+  // DeepSeek 服务端联网工具：开了它本地 web_search/web_fetch 就不注册
+  // （见下方工具装配与 orchestrator 的工具声明过滤）
+  deps.deepseek_web_tools =
+      cfg.get_bool_or("capability.chat.deepseek_web_tools", false);
 
   fish::orchestrator::Pipeline pipeline(deps);
 
@@ -614,7 +745,7 @@ int main(int argc, char** argv) {
     std::printf("sent count: %zu (expected 2)\n", sent.size());
     for (const auto& s : sent) std::printf("  -> %s\n", s.c_str());
     std::printf("working memory rounds(group): %d\n",
-                memory_sys.round_count("self-test-group"));
+                memory_sys.round_count("g:self-test-group"));
     if (sent.size() != 2) {
       std::printf("FAIL: expected 2 replies\n");
       return 1;
@@ -638,6 +769,9 @@ int main(int argc, char** argv) {
           .field("channel", "qq_official");
       channels.push_back(std::move(ch));
       channel_names.push_back("qq_official");
+      // 人格页卡片：bot 在 QQ 官方侧的唯一标识是 AppID
+      convos_book_->register_bot("qq:" + qc.app_id, "qq_official",
+                                "QQ 机器人", qc.app_id);
     } else {
       fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
           .field("channel", "qq_official")
@@ -658,6 +792,8 @@ int main(int argc, char** argv) {
           .field("channel", "qq_onebot");
       channels.push_back(std::move(ch));
       channel_names.push_back("qq_onebot");
+      convos_book_->register_bot("ob:" + oc.self_id, "qq_onebot",
+                                "QQ 小号", oc.self_id);
     } else {
       fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
           .field("channel", "qq_onebot")
@@ -675,6 +811,11 @@ int main(int argc, char** argv) {
           .field("channel", "wechat");
       channels.push_back(std::move(ch));
       channel_names.push_back("wechat");
+      // 微信侧没有稳定的 bot id，用 token 的前几位做展示标识
+      const std::string tok = wc.bot_token;
+      convos_book_->register_bot("wx:" + tok.substr(0, 8), "wechat",
+                                "微信机器人",
+                                tok.size() > 8 ? tok.substr(0, 8) + "…" : tok);
     } else {
       fish::log::log_line(fish::log::LogLevel::kError, "runtime", "channel_connect_failed")
           .field("channel", "wechat")
@@ -739,6 +880,7 @@ int main(int argc, char** argv) {
 
         api_server = std::make_unique<fish::api::Server>(ac, persona_store.get(),
                                                          control.get());
+        api_server->set_conversation_book(convos_book_.get());
         // /v1/restart：优雅退出自己，systemd Restart=always 拉起新进程。
         // 扫码绑定/改配置后凭据要重启才生效，GUI 调这个接口即可。
         api_server->set_restart_callback([]() {
@@ -746,12 +888,52 @@ int main(int argc, char** argv) {
                                 "restart_requested");
           std::raise(SIGTERM);
         });
-        // /v1/status 的通道信息：用回调注入，api 模块不需要认识 ChannelStats
-        api_server->set_status_provider([&stats, &channel_names]() {
+        // /v1/status 的通道信息：用回调注入，api 模块不需要认识 ChannelStats。
+        //
+        // connected 的判断依据（改动最小的真话方案）：
+        //   IChannel 接口没有在线状态虚方法，但三个生产通道类
+        //   （QQOfficial/QQOneBot/WeChatIlink）各自暴露了 connected()
+        //   （QQOfficial: ws_->running()；OneBot 同理；WeChat: connected_）。
+        //   main 持有的是基类指针，所以按类型 dynamic_cast 分派：
+        //   探到具体类就问真状态；LocalChannel（自检用）恒报 true。
+        //   last_poll_ok 与 connected 同源；api 层对缺失字段另有保底。
+        api_server->set_status_provider([&stats, &channel_names,
+                                          &channels]() {
           std::string out = "[";
           for (std::size_t i = 0; i < channel_names.size(); ++i) {
             if (i > 0) out += ",";
-            out += R"({"name":")" + channel_names[i] + R"(","connected":true,"received":)";
+            bool connected = false;
+            const auto* ch =
+                i < channels.size() ? channels[i].get() : nullptr;
+            if (ch != nullptr) {
+              // 通道类的 connected() 都是 const 成员，直接对 const 指针
+              // dynamic_cast 到 const 具体类即可。
+              if (auto* l =
+                      dynamic_cast<const fish::channels::LocalChannel*>(ch);
+                  l != nullptr) {
+                connected = true;
+              } else if (auto* q =
+                             dynamic_cast<const fish::channels::QQOfficialChannel*>(
+                                 ch);
+                         q != nullptr) {
+                connected = q->connected();
+              } else if (auto* o =
+                             dynamic_cast<const fish::channels::QQOneBotChannel*>(
+                                 ch);
+                         o != nullptr) {
+                connected = o->connected();
+              } else if (auto* w =
+                             dynamic_cast<const fish::channels::WeChatIlinkChannel*>(
+                                 ch);
+                         w != nullptr) {
+                connected = w->connected();
+              }
+            }
+            out += R"({"name":")" + channel_names[i] + R"(","connected":)";
+            out += connected ? "true" : "false";
+            out += R"(,"last_poll_ok":)";
+            out += connected ? "true" : "false";
+            out += R"(,"received":)";
             out += std::to_string(i < stats.size() ? stats[i]->polled.load() : 0);
             out += R"(,"errors":)";
             out += std::to_string(i < stats.size() ? stats[i]->errors.load() : 0);

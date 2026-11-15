@@ -120,11 +120,11 @@ class ImageSearchTool final : public ITool {
 
   [[nodiscard]] std::string name() const override { return "send_image"; }
   [[nodiscard]] std::string description() const override {
-    return "从你自己的形象库里挑一张图发给对方。\n"
-           "调用方式：\n"
-           "1) send_image() 不带参数 → 返回形象库的图片清单（每张带序号和内容说明）\n"
-           "2) send_image(index=N) → 发出第 N 张\n"
-           "清单里的说明就是那张图的实际内容，你看着上下文自己挑最合适的。";
+    return "查看并发送你自己的形象库图片。\n"
+           "第一次调用不要带 index：会返回**全部图片的清单**（序号 + 每张的内容说明）。\n"
+           "然后你读清单，挑出最贴合当前对话的一张，再带 index 调一次发出去。\n"
+           "注意：没有「搜索」这回事，每次不带 index 都返回完整清单，"
+           "所以不要反复用不同的词试探——清单里就是全部可用的图。";
   }
   [[nodiscard]] std::string parameters_schema() const override;
   Outcome run(const Call& call) override;

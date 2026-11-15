@@ -68,7 +68,43 @@
  QQ官方      DeepSeek    SQLite    persona.md
  微信iLink   硅基流动     + 向量     + rules.md
              Edge-TTS
+             文档解析（fish.doc，独立一层）
 ```
+
+### 3.0 模块清单（22 个 C++20 模块）
+
+| 模块 | 职责 |
+|---|---|
+| `fish.core` | 领域类型、`Result`、接口定义 |
+| `fish.log` | 结构化 JSON 日志 |
+| `fish.config` | TOML 子集解析 + `${VAR}` 环境变量展开 |
+| `fish.memory` | 三层记忆（短期 / 情景 / 语义 / 程序） |
+| `fish.capability` | 多 provider 统一接口（对话 / 向量 / STT / TTS / 搜索 / 生图） |
+| `fish.doc` | **文档解析层**（上传 + 解析 PDF/Office/图片/表格） |
+| `fish.probe` | 上游能力探测与缓存 |
+| `fish.media` | 媒体去重缓存（内容哈希） |
+| `fish.image` | 立绘库（manifest 权威 + 目录扫描） |
+| `fish.meme` | 热梗库（本地优先 + 命中计数） |
+| `fish.persona` | 人格分层拼装（稳定前缀 / 动态后缀） |
+| `fish.session` | 会话注册表 + 每会话互斥 |
+| `fish.control` | 配置 / 凭据 / 扫码绑定的控制面服务实现 |
+| `fish.api` | 控制面 HTTP API（带鉴权） |
+| `fish.tool` | 工具注册表（记忆 / 图片 / 搜索 / 抓取 / 梗） |
+| `fish.guard` | 输入注入防护 + 输出脱敏 + 限流 |
+| `fish.ws` | libcurl WebSocket 客户端 + 自动重连 |
+| `fish.qq_ws` | QQ 网关协议栈（op 码 / 心跳 / RESUME） |
+| `fish.onebot_ws` | OneBot v11 事件解析 |
+| `fish.channels` | 四个通道实现（含富媒体上传） |
+| `fish.dispatcher` | 线程池调度，通道线程只投递 |
+| `fish.orchestrator` | 流水线、被动策略、预算、去重 |
+
+`fish.doc` 之所以**独立成层**而不并进 `fish.capability`：文档有自己的失败模式
+（页数超限、加密、解析超时）和成本模型（按页计费），
+和「调一次模型 API」的能力模型不是一回事。详见
+[modules/doc.md](modules/doc.md)。
+
+> 模块必须按依赖顺序编译，见 `build.sh` 的 `MODULES` 数组；
+> `CMakeLists.txt` 的 `fish_modules` 源文件列表与它保持同一顺序。
 
 ### 3.1 依赖规则（编译期强制）
 
@@ -107,6 +143,7 @@
                       ▼
               ┌───────────────┐
               │ 多模态归一化   │  语音→STT→文本；图片透传
+              │               │  文档→fish.doc 上传解析
               └───────┬───────┘
                       ▼
               ┌───────────────┐
@@ -333,7 +370,8 @@ prompt_tokens / cached_tokens / output_tokens / 估算成本
 |---|---|
 | [core](modules/core.md) | 领域类型、Result、接口契约 |
 | [transport](modules/transport.md) | 通道抽象、QQ 官方、微信 iLink |
-| [capability](modules/capability.md) | 四类远程能力的调用与降级 |
+| [capability](modules/capability.md) | 多类远程能力的调用与降级 |
+| [doc](modules/doc.md) | 文档解析层（上传 / 解析 / 降级） |
 | [store](modules/store.md) | 记忆存储、向量检索、容量控制 |
 | [persona](modules/persona.md) | 分层提示词、前缀缓存纪律 |
 | [orchestrator](modules/orchestrator.md) | 流水线、策略、预算、去重、串行化 |

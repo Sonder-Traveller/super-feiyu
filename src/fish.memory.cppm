@@ -42,6 +42,16 @@ struct Message {
   fish::core::Speaker speaker;
   // 发送时刻（unix 毫秒），让模型理解"昨天""刚才"这类时间指代
   std::int64_t at_ms{0};
+  // 服务端联网工具（deepseek_web_search / deepseek_read_url）的原始调用
+  // 记录与引用，JSON 文本。
+  //
+  // 为什么单独存字段而不是塞进 text：
+  //   塞进 text 的做法（\x01stc:...\x01ann:...\x01）会让这串控制字符
+  //   一起进 episodes.md、进 SQLite 向量索引、还被喂给 consolidate 的
+  //   LLM —— 模型看到的是乱码，还白烧 token。
+  // 单独存字段后：记忆里的正文始终干净，回传时从这两个字段取。
+  std::string server_tool_calls_json;
+  std::string annotations_json;
 };
 
 struct Fact {
@@ -133,6 +143,28 @@ class NotesStore {
   // 导致 A 会话的事实和情景记忆会串到 B 会话里。
   [[nodiscard]] std::string session_dir(const std::string& conv_id) const;
 
+  // 旧编码的目录名（':' 一律换成 '_'）。
+  //
+  // 用途：兼容**已存在的旧数据目录**。新编码把 ':' 写成 "__COLON__"，
+  // 旧目录名是 "g_<openid>" 形式，读取时若新目录不存在就回退到旧目录，
+  // 这样已有的事实/情景记忆不会因为改编码而失效。
+  [[nodiscard]] std::string session_dir_legacy(const std::string& conv_id) const;
+
+  // **读**用哪个目录：新目录优先，没有就回退旧目录。
+  //
+  // 写永远写新目录（session_dir）。启动时的 migrate_legacy_dirs() 会把
+  // 旧目录改名过来；迁移失败（权限等）时至少还能读到旧数据。
+  [[nodiscard]] std::string session_dir_read(const std::string& conv_id) const;
+
+  // 从磁盘目录名反推 conv_id。
+  //
+  // 新编码：目录名里的 "__COLON__" 还原成 ':'；kind=="group" 时补回
+  // "g:" 前缀（目录名里存的是去掉前缀后的 openid）。
+  // 旧编码：目录名里没有 ':' 痕迹，只能按 kind 补 "g:" 前缀 ——
+  // 这正是原来反推多一个 "g:" 的地方（"g:" + "g_<openid>"）。
+  [[nodiscard]] static std::string conv_id_from_dir(const std::string& kind,
+                                                    const std::string& dir_name);
+
   fish::core::Result<std::vector<Fact>> load_facts(const std::string& conv_id) const;
   fish::core::Error append_fact(const std::string& conv_id, const Fact& f) const;
   // 全量改写（按 subject 分组），用于合并后重写权威文件
@@ -150,6 +182,9 @@ class NotesStore {
 
  private:
   fish::core::Error ensure_session_dir(const std::string& conv_id) const;
+
+  // 旧编码目录 → 新编码目录的一次性迁移（启动时做，见实现）。
+  void migrate_legacy_dirs() const;
 
   std::string dir_;
   mutable std::mutex mu_;
@@ -411,6 +446,28 @@ std::string render_transcript(const std::vector<Message>& msgs) {
   return oss.str();
 }
 
+// 剥掉正文里残留的服务端工具留痕标记。
+//
+// 旧格式：正文末尾接一段 "\n\x01stc:<json>\x01ann:<json>\x01"。
+// 现在正常路径不再产生这种正文（改用 Message 的两个独立字段），
+// 但历史数据里还有，读取/落盘时必须剥掉，否则会：
+//   - 进 episodes.md（用户可见的垃圾）
+//   - 进 SQLite 向量索引（召回出来的片段带乱码）
+//   - 被喂给 consolidate 的 LLM（模型看到控制字符）
+//
+// 做法：从第一个 "\x01stc:" 起全部截掉（标记段后面没有正文了）。
+void strip_tool_markers(Message& m) {
+  static const std::string kMark = "\x01stc:";
+  const auto pos = m.text.find(kMark);
+  if (pos == std::string::npos) return;
+  m.text.resize(pos);
+  // 顺手把尾部空白去掉
+  while (!m.text.empty() && (m.text.back() == '\n' || m.text.back() == '\r' ||
+                             m.text.back() == ' ' || m.text.back() == '\t')) {
+    m.text.pop_back();
+  }
+}
+
 constexpr const char* kConsolidatePrompt =
     "你是一个记忆整理器。输入是一段对话，提取三类信息。\n"
     "规则：只提取真的说过的内容，绝不编造；客套话与重复内容忽略；"
@@ -475,11 +532,115 @@ Error NotesStore::ensure_dirs() const {
   std::error_code ec;
   fs::create_directories(dir_, ec);
   if (ec) return Error::make(ErrorCode::kInternal, "mkdir:" + ec.message());
+  migrate_legacy_dirs();
   return Error::none();
+}
+
+void NotesStore::migrate_legacy_dirs() const {
+  // 旧编码 → 新编码的一次性迁移。
+  //
+  // 旧编码把 ':' 一律换成 '_'，于是群会话 "g:<openid>" 的目录名是
+  // "g_<openid>"；新编码用 "__COLON__" 标记，目录名是
+  // "g__COLON__<openid>"。改编码后旧目录读不到 → 已有的事实/情景记忆
+  // 失效、索引重建扫不到任何东西。
+  //
+  // 做法：启动时扫一遍 notes/{group,user}/，把旧名目录 rename 成新名。
+  // 群里 conv_id 必然以 "g:" 开头，所以旧名必然以 "g_" 开头，
+  // 还原规则是确定的；私聊 conv_id 就是 openid 本身（不含 ':'），
+  // 新旧同名，不需要迁移。
+  //
+  // 迁移失败不阻塞启动：旧目录还在，数据没丢，只是仍走旧名读取。
+  std::error_code ec;
+  for (const char* kind : {"group", "user"}) {
+    const fs::path base = fs::path(dir_) / kind;
+    if (!fs::exists(base, ec)) continue;
+    std::vector<fs::path> names;
+    for (const auto& entry : fs::directory_iterator(base, ec)) {
+      if (!entry.is_directory()) continue;
+      names.push_back(entry.path());
+    }
+    for (const auto& p : names) {
+      const std::string old_name = p.filename().string();
+      // 只迁旧名：以 "g_" 开头（= 编码过的 "g:"）**且**不含新标记。
+      //
+      // 注意新名 "g__COLON__<openid>" 同样以 "g_" 开头，所以必须额外
+      // 排除含 "__COLON__" 的目录 —— 否则会被二次迁移成
+      // "g__COLON____COLON__<openid>"。
+      if (std::string(kind) != "group") continue;         // 私聊新旧同名
+      if (old_name.find("__COLON__") != std::string::npos) continue;  // 已是新名
+      if (old_name.rfind("g_", 0) != 0) continue;         // 不是旧名
+      const std::string new_name = "g__COLON__" + old_name.substr(2);
+      const fs::path target = base / new_name;
+      if (fs::exists(target, ec)) continue;   // 目标已存在，保留两边不覆盖
+      fs::rename(p, target, ec);
+      if (ec) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory",
+                              "session_dir_migrate_failed")
+            .field("from", old_name)
+            .field("to", new_name)
+            .field("detail", ec.message());
+      }
+    }
+  }
+}
+
+std::string NotesStore::conv_id_from_dir(const std::string& kind,
+                                        const std::string& dir_name) {
+  static const std::string kColonMark = "__COLON__";
+  // 新编码：目录名里带 "__COLON__"
+  if (dir_name.find(kColonMark) != std::string::npos) {
+    std::string restored;
+    restored.reserve(dir_name.size());
+    std::size_t pos = 0;
+    while (pos < dir_name.size()) {
+      if (dir_name.compare(pos, kColonMark.size(), kColonMark) == 0) {
+        restored += ':';
+        pos += kColonMark.size();
+        continue;
+      }
+      restored += dir_name[pos];
+      ++pos;
+    }
+    // 群会话：目录名存的是去掉 "g:" 前缀的 openid，这里补回来。
+    if (kind == "group" && restored.rfind("g:", 0) != 0) restored = "g:" + restored;
+    return restored;
+  }
+  // 旧编码：群目录名必然以 "g_" 开头（那是编码后的 "g:"），
+  // 还原成 "g:"；私聊目录名就是 openid 本身。
+  if (kind == "group" && dir_name.rfind("g_", 0) == 0) {
+    return "g:" + dir_name.substr(2);
+  }
+  return dir_name;
 }
 
 std::string NotesStore::session_dir(const std::string& conv_id) const {
   // 会话 id 直接做目录名不安全（可能含 / : 等），只保留 [A-Za-z0-9-_]。
+  //
+  // 但 ':' 必须是**可逆**的：群会话键是 "g:<openid>"，索引重建时要从
+  // 目录名反推回 conv_id。以前 ':' 被换成 '_'，反推时又拼一个 "g:"，
+  // 得到 "g:g_<openid>" → 读不到任何文件 → 索引重建静默为空。
+  //
+  // 现在用 "__COLON__" 标记 ':'（openid 是 base64url 风格，不含下划线，
+  // 不会撞车），反推时还原。
+  std::string safe;
+  safe.reserve(conv_id.size());
+  for (const char c : conv_id) {
+    if (c == ':') {
+      safe += "__COLON__";
+      continue;
+    }
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_';
+    safe += ok ? c : '_';
+  }
+  if (safe.empty()) safe = "default";
+  // 前缀区分群聊/私聊，避免 openid 恰好同名的极端情况
+  const std::string kind = (conv_id.rfind("g:", 0) == 0) ? "group" : "user";
+  return dir_ + "/" + kind + "/" + safe;
+}
+
+std::string NotesStore::session_dir_legacy(const std::string& conv_id) const {
+  // 旧编码：':' 一律换成 '_'。保留是为了读旧数据（见 load_* 的兼容分支）。
   std::string safe;
   safe.reserve(conv_id.size());
   for (const char c : conv_id) {
@@ -488,7 +649,6 @@ std::string NotesStore::session_dir(const std::string& conv_id) const {
     safe += ok ? c : '_';
   }
   if (safe.empty()) safe = "default";
-  // 前缀区分群聊/私聊，避免 openid 恰好同名的极端情况
   const std::string kind = (conv_id.rfind("g:", 0) == 0) ? "group" : "user";
   return dir_ + "/" + kind + "/" + safe;
 }
@@ -500,9 +660,18 @@ Error NotesStore::ensure_session_dir(const std::string& conv_id) const {
   return Error::none();
 }
 
+std::string NotesStore::session_dir_read(const std::string& conv_id) const {
+  const std::string fresh = session_dir(conv_id);
+  std::error_code ec;
+  if (fs::exists(fresh, ec)) return fresh;
+  const std::string old = session_dir_legacy(conv_id);
+  if (old != fresh && fs::exists(old, ec)) return old;
+  return fresh;
+}
+
 Result<std::vector<Fact>> NotesStore::load_facts(const std::string& conv_id) const {
   std::lock_guard<std::mutex> lock(mu_);
-  std::ifstream in(session_dir(conv_id) + "/facts.md");
+  std::ifstream in(session_dir_read(conv_id) + "/facts.md");
   std::vector<Fact> out;
   if (!in) return Result<std::vector<Fact>>::ok({});
 
@@ -532,10 +701,14 @@ Error NotesStore::append_fact(const std::string& conv_id, const Fact& f) const {
   const std::string sdir = session_dir(conv_id);
   fs::create_directories(sdir, ec);
 
-  // 读现有内容（已持锁，内联读取避免重入）
+  // 读现有内容（已持锁，内联读取避免重入）。
+  //
+  // 读源用 session_dir_read：迁移没跑成功时旧数据还在旧目录里，
+  // 这里必须从旧目录读，否则会把已有事实当成空表重写（丢数据）。
+  const std::string read_dir = session_dir_read(conv_id);
   std::vector<Fact> all;
   {
-    std::ifstream in(sdir + "/facts.md");
+    std::ifstream in(read_dir + "/facts.md");
     std::string line;
     std::string section;
     while (std::getline(in, line)) {
@@ -672,7 +845,7 @@ Result<std::vector<Episode>> NotesStore::load_episodes(const std::string& conv_i
   std::lock_guard<std::mutex> lock(mu_);
   std::vector<Episode> out;
   std::error_code ec;
-  const fs::path ep_dir = session_dir(conv_id) + "/episodes";
+  const fs::path ep_dir = session_dir_read(conv_id) + "/episodes";
   if (!fs::exists(ep_dir, ec)) return Result<std::vector<Episode>>::ok({});
 
   std::vector<fs::path> files;
@@ -708,7 +881,7 @@ Result<std::vector<Episode>> NotesStore::load_episodes(const std::string& conv_i
 
 Result<std::vector<Trait>> NotesStore::load_traits(const std::string& conv_id) const {
   std::lock_guard<std::mutex> lock(mu_);
-  std::ifstream in(session_dir(conv_id) + "/traits.md");
+  std::ifstream in(session_dir_read(conv_id) + "/traits.md");
   std::vector<Trait> out;
   if (!in) return Result<std::vector<Trait>>::ok({});
 
@@ -1122,10 +1295,17 @@ Error MemorySystem::init() {
       if (!fs::exists(base, dir_ec)) continue;
       for (const auto& entry : fs::directory_iterator(base, dir_ec)) {
         if (!entry.is_directory()) continue;
-        // 目录名是脱敏后的会话 id，重建时用它反推 conv_id 去读文件
-        const std::string safe_id = entry.path().filename().string();
+        // 目录名是脱敏后的会话 id，重建时用它反推 conv_id 去读文件。
+        //
+        // 反推必须**可逆**：群会话键是 "g:<openid>"，目录名（新编码）
+        // 是 "g__COLON__<openid>"，还原回来是 "g:<openid>"。
+        //
+        // 原来这里写的是 "g:" + safe_id，而 safe_id 已经是编码过的
+        // "g_<openid>" → 得到 "g:g_<openid>" → 读不到任何文件 →
+        // 索引重建静默为空。
+        const std::string dir_name = entry.path().filename().string();
         const std::string conv_id =
-            std::string(kind) == "group" ? ("g:" + safe_id) : safe_id;
+            NotesStore::conv_id_from_dir(std::string(kind), dir_name);
 
         auto facts = notes_.load_facts(conv_id);
         if (facts.ok()) {
@@ -1178,7 +1358,20 @@ Error MemorySystem::record(const std::string& conv_id, const Message& user,
   std::lock_guard<std::mutex> lock(mu_);
   auto& wm = working_[conv_id];
   if (!wm) wm = std::make_unique<WorkingMemory>(0);   // 0 = 不按轮数截断
-  wm->push(user, assistant);
+  // 兜底：正文里的服务端工具标记必须在进记忆前剥掉。
+  //
+  // 现在编排层已经改用 server_tool_calls_json / annotations_json 两个
+  // 独立字段，正常路径下正文是干净的。但历史数据（旧版本写入的
+  // "\x01stc:...\x01ann:...\x01"）或别的调用方塞进来的正文仍可能带标记，
+  // 留着就会进 episodes.md、进向量索引、还被喂给 consolidate 的 LLM。
+  //
+  // 这里统一在入口剥一次：宁可在记忆层做这个保证，也不要依赖每个
+  // 调用方都记得清理。
+  Message u = user;
+  Message a = assistant;
+  strip_tool_markers(u);
+  strip_tool_markers(a);
+  wm->push(u, a);
   return Error::none();
 }
 
@@ -1283,6 +1476,27 @@ Result<ConsolidateReport> MemorySystem::compact(const std::string& conv_id,
     summaries_[conv_id] = new_summary;
     auto it = working_.find(conv_id);
     if (it != working_.end() && it->second) it->second->restore(to_keep);
+  }
+
+  // 事实沉淀：对被压缩的这批 transcript 追加一次 consolidate()，
+  // 把「事实 / 性格特征」写进长期记忆（facts.md / traits.md）。
+  //
+  // 为什么在这里而不是编排层：只有 compact 内部还持有 to_compact 这份原文，
+  // 编排层调用 compact 后原文已经被 take/restore 掉，再读就是压缩后的剩余部分。
+  // 为什么不放在持锁区：consolidate 会调一次 LLM（秒级）并回调
+  // NotesStore/IndexStore（各自有锁），持 mu_ 调用会阻塞整个会话。
+  // 上面那段作用域已经释放 mu_，这里调用不会递归加锁。
+  //
+  // 幂等：Consolidator::apply_json 对 facts 按 content 去重、episodes 按
+  // summary 去重，重复调用不会重复写入。
+  // 失败只打 warn：压缩本身已经成功，沉淀是增强项，不能反过来让主链路失败。
+  if (!to_compact.empty()) {
+    auto cr = consolidator.consolidate(conv_id, to_compact);
+    if (!cr.ok()) {
+      ::fish::log::log_line(::fish::log::LogLevel::kWarn, "memory",
+                            "consolidate_after_compact_failed")
+          .field("detail", cr.error.detail);
+    }
   }
 
   ConsolidateReport rep;

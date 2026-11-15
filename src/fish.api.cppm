@@ -14,8 +14,10 @@ module;
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -24,11 +26,16 @@ module;
 #include <thread>
 #include <vector>
 
+// control::json 是 fish.control 导出的 nlohmann 别名；这里显式 include
+// 一次，保证本 TU 里能用它的成员（/v1/status 补字段、/v1/conversations）。
+#include <nlohmann/json.hpp>
+
 export module fish.api;
 
 import fish.core;
 import fish.log;
 import fish.persona;
+import fish.session;
 import fish.control;
 
 export namespace fish::api {
@@ -53,6 +60,12 @@ struct AuthConfig {
   bool enabled{true};
   // Bearer token。由 main 从环境变量读入，不写死在这里。
   std::string token;
+  // 凭据端点专用令牌（清空 = 走控制面自动生成的那个）。
+  //
+  // 为什么单独一个：这个端点返回明文 access_token。主 token 是给 GUI
+  // 用的（可能被展示、截图、贴进工单），拿它换明文凭据风险太大。
+  // 独立令牌只认这一个端点，泄露了也只泄露 WorkBuddy 凭据。
+  std::string credential_token;
 };
 
 class Server {
@@ -86,6 +99,15 @@ class Server {
 
   // 注册运行时状态回调，供 /v1/status 返回通道连接情况。
   // 用回调而不是持有 dispatcher：api 不该知道 dispatcher 存在。
+  //
+  // 回调产出的是一段 JSON 数组文本，每项至少含 name / received / errors。
+  // 在线与否由回调自己算：api 层不知道「最近一次 poll 是成功还是失败」，
+  // 也不该猜——早期这里对每项硬编码了 connected:true，看起来永远在线。
+  // 现在：
+  //   - 回调给了 connected 就原样透传（真实状态）；
+  //   - 没给就按 received/errors 推断，并且保守返回 false 而不是 true；
+  //   - 另外统一补一个 last_poll_ok（有 connected 就是它，没有就是 null），
+  //     GUI 想区分「没连上」和「连上了但没消息」时有字段可用。
   void set_status_provider(std::function<std::string()> cb) {
     status_cb_ = std::move(cb);
   }
@@ -94,6 +116,11 @@ class Server {
   // main 里实现成 raise(SIGTERM)，让 systemd Restart=always 接住拉起新进程。
   void set_restart_callback(std::function<void()> cb) { restart_cb_ = std::move(cb); }
 
+  // 会话登记表：GET /v1/conversations 从这读。可为空（空时返回空列表）。
+  void set_conversation_book(fish::session::ConversationBook* book) {
+    convos_ = book;
+  }
+
  private:
   void accept_loop();
   void handle_connection(int fd);
@@ -101,13 +128,37 @@ class Server {
   Response builtin_route(const Request& req);
   bool check_auth(const Request& req) const;
 
+  // 该路径是否允许「凭据专用令牌」通过（白名单）。
+  //
+  // 白名单只有凭据端点一个：主 token 能干的事很多（改配置、扫码登录、
+  // 改人格），凭据令牌只能读 WorkBuddy 凭据这一个动作。
+  static bool credential_path_allowed(const std::string& path);
+
+  // 绑定地址是不是回环。
+  //
+  // 只有回环时，「无鉴权模式下也放行凭据端点」才是可接受的：
+  // 回环只有本机能连。非回环（0.0.0.0 等）时凭据端点必须带令牌。
+  [[nodiscard]] bool loopback_bind() const;
+
+  // 凭据专用令牌（懒加载 + 缓存）。
+  //
+  // 为什么要懒加载而不是在 main 里塞进 Config：凭据令牌要能从
+  // config.toml 读、也要能在没配时自动生成到 data/ 下，这两件事都得
+  // 控制面知道。api 层只负责问控制面要一次并缓存起来。
+  [[nodiscard]] std::string credential_token() const;
+
   Config cfg_;
   fish::persona::PersonaStore* store_{nullptr};
   fish::control::ControlService* control_{nullptr};
+  fish::session::ConversationBook* convos_{nullptr};
   std::map<std::string, Handler> routes_;   // "GET /x" → handler
   std::mutex routes_mu_;
   std::function<std::string()> status_cb_;
   std::function<void()> restart_cb_;
+  // 凭据令牌缓存（mutable：check_auth 是 const 的）。
+  mutable std::mutex cred_token_mu_;
+  mutable std::string cred_token_cache_;
+  mutable bool cred_token_loaded_{false};
 
   // 启动时刻，用来算 uptime
   std::chrono::steady_clock::time_point started_at_{std::chrono::steady_clock::now()};
@@ -271,8 +322,104 @@ bool json_get_string(const std::string& json, const std::string& key, std::strin
   return false;
 }
 
-// URL 里取查询参数值（不做 %XX 解码，控制面够用）
-std::string query_param(const std::string& path, const std::string& key) {
+// ── URL 查询串解码 ───────────────────────────────────────
+
+// 十六进制字符 → 数值；不是十六进制返回 -1
+int hex_val(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// UTF-8 合法性校验：拒绝过长编码、代理区码点、越界码点。
+bool valid_utf8(const std::string& s) {
+  std::size_t i = 0;
+  const std::size_t n = s.size();
+  while (i < n) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    std::size_t len = 0;
+    unsigned int cp = 0;
+    if (c < 0x80) {
+      ++i;
+      continue;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2;
+      cp = c & 0x1Fu;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+      cp = c & 0x0Fu;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+      cp = c & 0x07u;
+    } else {
+      return false;  // 孤立的续字节，或 0xF8 以上
+    }
+    if (i + len > n) return false;
+    for (std::size_t k = 1; k < len; ++k) {
+      const auto cc = static_cast<unsigned char>(s[i + k]);
+      if ((cc & 0xC0) != 0x80) return false;
+      cp = (cp << 6) | (cc & 0x3Fu);
+    }
+    if (len == 2 && cp < 0x80) return false;      // 过长编码
+    if (len == 3 && cp < 0x800) return false;
+    if (len == 4 && cp < 0x10000) return false;
+    if (cp > 0x10FFFF) return false;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return false;  // 代理区
+    i += len;
+  }
+  return true;
+}
+
+// percent-decode：先把 %XX 还原成字节，再整体按 UTF-8 解码。
+//
+// 为什么必须解码：GUI 用 urllib.parse.quote(x, safe="") 编码后发过来的是
+// conv_id=qq%3A1906397285。服务端若按字面量切分，落盘的 key 就是
+// "qq%3A1906397285"，而运行时读的是 "qq:1906397285" —— 两个不同的会话，
+// 于是 GUI 保存的人格和会话人格机器人都读不到。GUI 自己 GET 同一个
+// 编码 URL 能读回（自洽），所以界面上完全看不出问题。
+//
+// UTF-8 多字节（%E4%B8%AD 这种）不能一个 %XX 解一个字符：先还原成字节
+// 序列，整体再按 UTF-8 解，顺序反了就是乱码。
+//
+// plus_as_space：
+//   true  —— '+' 还原成空格（application/x-www-form-urlencoded 语义，
+//           Python 的 urlencode / requests 就是用 '+' 表示空格）。
+//   false —— '+' 保持字面量。给不透明 token 用：base64 token 里的 '+'
+//           是内容的一部分，按空格解就再也对不上原值了。
+//
+// 解不出来（非法 % 转义、截断的转义、非法 UTF-8）就原样返回：
+// 不抛异常、不 500 —— 一个畸形查询串不该把整个请求打死。
+std::string percent_decode(const std::string& in, bool plus_as_space) {
+  std::string bytes;
+  bytes.reserve(in.size());
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    const char c = in[i];
+    if (c == '%') {
+      if (i + 2 >= in.size()) return in;   // 转义被截断
+      const int hi = hex_val(in[i + 1]);
+      const int lo = hex_val(in[i + 2]);
+      if (hi < 0 || lo < 0) return in;     // 非法 %XX
+      bytes += static_cast<char>((hi << 4) | lo);
+      i += 2;
+      continue;
+    }
+    if (c == '+' && plus_as_space) {
+      bytes += ' ';
+      continue;
+    }
+    bytes += c;
+  }
+  if (!valid_utf8(bytes)) return in;       // 不是合法 UTF-8 → 原样
+  return bytes;
+}
+
+// URL 里取查询参数值（会做 percent-decode）。
+//
+// 解码规则见 percent_decode：conv_id 这类标识按 form 规范把 '+' 当空格，
+// task_id / qrcode / login_id 这类不透明 token 传 false，'+' 保持字面量。
+std::string query_param(const std::string& path, const std::string& key,
+                        bool plus_as_space = true) {
   const auto q = path.find('?');
   if (q == std::string::npos) return {};
   const std::string qs = path.substr(q + 1);
@@ -283,7 +430,7 @@ std::string query_param(const std::string& path, const std::string& key) {
                                                                  : amp - start);
     const auto eq = piece.find('=');
     if (eq != std::string::npos && piece.substr(0, eq) == key) {
-      return piece.substr(eq + 1);
+      return percent_decode(piece.substr(eq + 1), plus_as_space);
     }
     if (amp == std::string::npos) break;
     start = amp + 1;
@@ -423,6 +570,25 @@ fish::core::Error Server::start() {
       .field("addr", cfg_.bind_addr)
       .field("port", static_cast<long long>(actual_port_))
       .field("auth", cfg_.auth.enabled);
+
+  // 凭据端点返回**明文** access_token。绑到 0.0.0.0 意味着同网段任何
+  // 人都能来取这个 token（只要有凭据令牌，而令牌就在本机的文件里）。
+  //
+  // 所以绑非回环地址时必须显式说「我知道风险」，否则这个端点就是一个
+  // 半公开的凭据分发口。默认拒绝，用户确实需要（比如桥接层在另一台机器）
+  // 再显式打开。
+  if (!loopback_bind()) {
+    const char* allow = std::getenv("FEIYU_ALLOW_REMOTE_CREDENTIAL");
+    if (allow == nullptr || std::string(allow).empty() ||
+        std::string(allow) == "0" || std::string(allow) == "false") {
+      ::fish::log::log_line(::fish::log::LogLevel::kWarn, "api",
+                            "credential_endpoint_exposed")
+          .field("bind", cfg_.bind_addr)
+          .field("hint",
+                 "凭据端点会返回明文 token。确认要暴露到非回环地址，"
+                 "请设 FEIYU_ALLOW_REMOTE_CREDENTIAL=1");
+    }
+  }
   return fish::core::Error::none();
 }
 
@@ -451,8 +617,47 @@ void Server::accept_loop() {
   }
 }
 
+bool Server::credential_path_allowed(const std::string& path) {
+  // 只有这一个端点。刻意不放宽到「所有 /v1/capability/workbuddy/*」：
+  // 登录 / 测试端点不需要凭据令牌。
+  return path == "/v1/capability/workbuddy/credential";
+}
+
+bool Server::loopback_bind() const {
+  const std::string& a = cfg_.bind_addr;
+  return a == "127.0.0.1" || a == "localhost" || a == "::1";
+}
+
+std::string Server::credential_token() const {
+  // 配置里显式给的优先（main 里可以传，也可以留空走控制面自动生成）
+  if (!cfg_.auth.credential_token.empty()) return cfg_.auth.credential_token;
+  if (control_ == nullptr) return {};
+
+  {
+    std::lock_guard<std::mutex> lock(cred_token_mu_);
+    if (cred_token_loaded_) return cred_token_cache_;
+  }
+  // 控制面负责：读 config.toml 的 capability.workbuddy.credential_token，
+  // 没配就生成并写到 data/control_credential_token.txt。
+  const std::string tok = control_->workbuddy_credential_token();
+  std::lock_guard<std::mutex> lock(cred_token_mu_);
+  cred_token_cache_ = tok;
+  cred_token_loaded_ = true;
+  return cred_token_cache_;
+}
+
 bool Server::check_auth(const Request& req) const {
-  if (!cfg_.auth.enabled) return true;
+  const std::string path = path_only(req.path);
+  const bool cred_path = credential_path_allowed(path);
+
+  if (!cfg_.auth.enabled) {
+    // 无鉴权模式（本机调试）：其他端点照常放行。
+    //
+    // 但凭据端点返回**明文** access_token，不能跟着一起裸奔：
+    // 绑到非回环地址时直接拒绝，让用户改用「开启鉴权 + 凭据令牌」。
+    if (cred_path && !loopback_bind()) return false;
+    return true;
+  }
   if (cfg_.auth.token.empty()) return false;
 
   const auto it = req.headers.find("authorization");
@@ -462,7 +667,19 @@ bool Server::check_auth(const Request& req) const {
   const std::string prefix = "bearer ";
   if (v.size() <= prefix.size()) return false;
   if (to_lower(v.substr(0, prefix.size())) != prefix) return false;
-  return constant_time_equal(v.substr(prefix.size()), cfg_.auth.token);
+  const std::string presented = v.substr(prefix.size());
+
+  if (constant_time_equal(presented, cfg_.auth.token)) return true;
+
+  // 凭据专用令牌：只对白名单路径生效。
+  //
+  // 顺序很重要：先比主 token（绝大多数请求走这条），主 token 不匹配才
+  // 考虑凭据令牌，且凭据令牌只放行白名单里的那一个端点。
+  if (cred_path) {
+    const std::string ct = credential_token();
+    if (!ct.empty() && constant_time_equal(presented, ct)) return true;
+  }
+  return false;
 }
 
 Response Server::builtin_route(const Request& req) {
@@ -474,9 +691,33 @@ Response Server::builtin_route(const Request& req) {
     const auto up = std::chrono::duration_cast<std::chrono::seconds>(
                         std::chrono::steady_clock::now() - started_at_)
                         .count();
+    // 通道状态：回调给什么就是什么，但这里补两点：
+    //   1) connected 缺省时不再假装在线（原来是硬编码 true）；
+    //   2) 统一补 last_poll_ok，让调用方能区分「通道没连上」和
+    //      「连上了只是最近没消息」。
+    // 回调文本解析不了时原样透传，不影响 /v1/status 本身可用。
+    std::string channels = status_cb_ ? status_cb_() : "[]";
+    try {
+      auto arr = control::json::parse(channels);
+      if (arr.is_array()) {
+        for (auto& item : arr) {
+          if (!item.is_object()) continue;
+          if (!item.contains("connected")) item["connected"] = false;
+          if (!item.contains("last_poll_ok")) {
+            // 回调没说「上次 poll 成没成」就明确给 null，不要拿 connected
+            // 顶替——main 里 connected 目前还是硬编码 true，照抄等于
+            // 把假信号伪装成真状态。
+            item["last_poll_ok"] = nullptr;
+          }
+        }
+        channels = arr.dump();
+      }
+    } catch (const std::exception&) {
+      // 回调给的不是合法 JSON：保留原样，至少不 500
+    }
     std::string body = R"({"version":")" + json_escape(cfg_.version) +
                        R"(","uptime_s":)" + std::to_string(up) + R"(,"channels":)";
-    body += status_cb_ ? status_cb_() : "[]";
+    body += channels;
     body += "}";
     Response r;
     r.body = std::move(body);
@@ -575,7 +816,8 @@ Response Server::builtin_route(const Request& req) {
     }
 
     if (req.method == "GET" && path == "/v1/channel/qq/qr/status") {
-      auto j = control_->qq_qr_status(query_param(req.path, "task_id"));
+      // task_id 是上游给的透明 token，'+' 可能就是内容的一部分 → 不当空格解
+      auto j = control_->qq_qr_status(query_param(req.path, "task_id", false));
       Response r;
       if (!j.ok()) {
         r.status = 502;
@@ -601,7 +843,8 @@ Response Server::builtin_route(const Request& req) {
     }
 
     if (req.method == "GET" && path == "/v1/channel/wechat/qr/status") {
-      auto j = control_->wechat_qr_status(query_param(req.path, "qrcode"));
+      // qrcode 同样是上游给的透明 token → '+' 不当空格解
+      auto j = control_->wechat_qr_status(query_param(req.path, "qrcode", false));
       Response r;
       if (!j.ok()) {
         r.status = 502;
@@ -611,6 +854,71 @@ Response Server::builtin_route(const Request& req) {
       r.body = *j.value;
       return r;
     }
+    // ── WorkBuddy 链接登录 ──
+    // 不用填 Key：拿一个授权链接，用户在浏览器里登录，我们再查结果。
+    if (req.method == "POST" && path == "/v1/capability/workbuddy/login") {
+      auto j = control_->workbuddy_login_start();
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"ok":false,"error":"login_start_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "GET" && path == "/v1/capability/workbuddy/login/status") {
+      // login_id 是本进程生成的 "wb_" + 16 位 hex，只可能是 [0-9a-f_]，
+      // 但仍按不透明 token 处理（'+' 不当空格），将来改生成方式也不会中招
+      auto j = control_->workbuddy_login_status(query_param(req.path, "login_id", false));
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"ok":false,"error":"status_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    if (req.method == "POST" && path == "/v1/capability/workbuddy/test") {
+      auto j = control_->workbuddy_test();
+      Response r;
+      if (!j.ok()) {
+        r.status = 502;
+        r.body = R"({"ok":false,"error":"test_failed","detail":")" +
+                 json_escape(j.error.detail) + R"("})";
+        return r;
+      }
+      r.body = *j.value;
+      return r;
+    }
+
+    // ── WorkBuddy 凭据（跨平台桥接层拉取）──
+    //
+    // 这个端点返回**明文** access_token，所以它只认「凭据专用令牌」
+    // （见 check_auth / AuthConfig::credential_token），主 token 也行，
+    // 但桥接层应该用专用令牌。
+    //
+    // 为什么需要它：控制面在 WSL、桥接层在 Windows 宿主时，两边看到的
+    // 不是同一个路径（`\\wsl$\...` vs `C:\...`），--cred-file 永远对不上，
+    // GUI 扫码登录对桥就是零效果。走 HTTP 与文件系统视图无关。
+    if (req.method == "GET" && path == "/v1/capability/workbuddy/credential") {
+      auto c = control_->workbuddy_credential();
+      Response r;
+      if (!c.found) {
+        r.status = 404;
+        r.body = R"({"error":"no_credential","detail":")" +
+                 json_escape(c.detail) + R"("})";
+        return r;
+      }
+      r.body = c.body;
+      return r;
+    }
+
     // ── 重启服务 ──
     // 扫码绑定/改配置后，通道凭据要重启进程才生效。GUI 调这个接口
     // 触发优雅退出（SIGTERM），systemd Restart=always 拉起新进程。
@@ -668,6 +976,26 @@ Response Server::builtin_route(const Request& req) {
       return r;
     }
     r.body = R"({"ok":true})";
+    return r;
+  }
+
+  // GET /v1/conversations —— 会话登记表（人格页 bot 卡片列表）
+  if (req.method == "GET" && path == "/v1/conversations") {
+    Response r;
+    control::json arr = control::json::array();
+    if (convos_ != nullptr) {
+      for (const auto& e : convos_->list()) {
+        arr.push_back({{"key", e.key},
+                       {"channel", e.channel},
+                       {"kind", e.kind},
+                       {"title", e.title},
+                       {"sender_name", e.sender_name},
+                       {"sender_id", e.sender_id},
+                       {"last_active_ms", e.last_active_ms},
+                       {"handled", e.handled}});
+      }
+    }
+    r.body = control::json{{"conversations", arr}}.dump();
     return r;
   }
 

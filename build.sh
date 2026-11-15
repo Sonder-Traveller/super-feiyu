@@ -22,7 +22,7 @@ INC=(-Iinclude -I"$PREFIX/include" -I"$PREFIX/include/x86_64-linux-gnu" -Isrc -I
      -Ithird_party/thread-pool/pool/include)
 # 编译顺序：依赖在前。
 # persona / api 只依赖 core + log，所以排在 capability 之后、orchestrator 之前。
-MODULES=(core log config memory capability probe media image meme persona control api session tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
+MODULES=(core log config memory capability doc probe media image meme persona session control api tool guard ws qq_ws onebot_ws channels dispatcher orchestrator)
 
 if [[ "${1:-}" == "--clean" ]]; then
   rm -rf "$OUT"
@@ -67,7 +67,7 @@ echo "==> 3/4 编译主程序与测试"
 # 测试二进制统一由这个列表驱动：加测试只需往这里添名字。
 # 之前是逐个 if [ -f ... ] 硬写，结果 test_memory 一直没被构建，
 # 里面的代码停留在头文件时代（include 了早已不存在的 hpp）也没人发现。
-TESTS=(test_all test_e2e test_protocol test_lifecycle test_memory)
+TESTS=(test_all test_e2e test_protocol test_lifecycle test_memory probe_capability)
 COMPILED_TESTS=()
 for t in "${TESTS[@]}"; do
   if [ -f "tests/$t.cpp" ]; then

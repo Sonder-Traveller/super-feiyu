@@ -112,7 +112,7 @@ class IChatModel {
     std::string system_prompt;          // 恒定，命中前缀缓存
     std::vector<ContentBlock> history;  // 追加式
     std::vector<ContentBlock> user_blocks;
-    int max_tokens; double temperature;
+    int max_tokens{0}; double temperature{-1.0};  // 0 / 负数 = 不发送，用上游默认值
   };
   struct Response {
     std::string text;

@@ -1,5 +1,10 @@
-# super-feiyu 配置示例
-# 复制为 config.toml 后填写。密钥用 ${ENV_VAR} 引用，不要写明文。
+# super-feiyu 配置示例（出厂模板）
+#
+# 本文件是**出厂模板**：复制为 config.toml 后再按自己的环境填写。
+# 实际运行的配置在 config.toml（该文件被 gitignore，不入库）。
+#
+# 密钥全部走 ${ENV_VAR} 引用，不要写明文。变量放在 .env.local / .env 里，
+# 或由 systemd unit 的 Environment= 注入。
 
 [log]
 level = "info"          # debug | info | warn | error
@@ -27,19 +32,49 @@ enabled = false
 bot_token = "${WECHAT_BOT_TOKEN}"
 
 # ══════════ 能力（换厂商只改 provider/base_url/model）══════════
+#
+# 下面每个能力段只列**真托管 DeepSeek 的厂商**：底层模型锁死 DeepSeek，
+# 列一家不托管 DeepSeek 的云，用户选了也只会拿到别的模型，
+# 等于绕过了锁定，所以干脆不列。
 
-# 对话。可选 provider: deepseek | openai | anthropic | siliconflow | ollama
-# 想把 WorkBuddy 桥接层接进来：provider="openai", base_url="http://127.0.0.1:18081/v1"
+# ── 对话 ──
+# provider 清单：deepseek（官方 key）| workbuddy（本机桥接层，扫码登录）
+# 想把 WorkBuddy 桥接层接进来：provider="workbuddy"，
+# base_url 指向桥接层的 OpenAI 兼容端点。
 [capability.chat]
 provider = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-flash"
-max_tokens = 512
-temperature = 1.0
+# max_tokens / temperature 不设：写死等于替上游设一个它没要求的限制。
+# 不写这两个键 = 不发这两个字段 = 用上游默认值。
+# 思考强度锁死 high（产品要求），控制面也拒绝修改。
+reasoning_effort = "high"
+# DeepSeek 服务端联网工具（deepseek_web_search / deepseek_read_url）。
+# 仅 provider=deepseek 生效；开启后本地 web_search/web_fetch 不注册，
+# 服务端执行搜索（按次计费）。
+deepseek_web_tools = false
 timeout_ms = 30000
 
-# 向量。DeepSeek 没有 embeddings 接口，必须另配。
+# ── WorkBuddy 桥接 ──
+# 只有 provider 用 workbuddy（本机桥接）时才相关。
+#
+# GUI「登录 WorkBuddy」把凭据写进 cred_file；桥接层用 --cred-file 读它，
+# 或用 --control-url 通过 HTTP 从控制面拉（跨平台部署必须用后者：
+# 控制面在 WSL、桥在 Windows 时，两边看到的不是同一个文件）。
+[capability.workbuddy]
+# 凭据落盘路径。留空 = data/workbuddy.json（相对 config.toml 所在目录）。
+# 跨平台时填桥接层那边能读到的路径，例如：
+#   /mnt/c/Users/Assistant/projects/super-feiyu/data/workbuddy.json
+cred_file = ""
+# 桥接层拉凭据用的独立令牌（不是 FEIYU_API_TOKEN）。
+# 留空 = 自动生成到 data/control_credential_token.txt（权限 600）。
+# 按密钥处理：这里写 "${VAR}" 引用 .env.local 里的变量。
+credential_token = ""
+
+# ── 向量 ──
+# provider 清单：ark | dashscope | qianfan | siliconflow | workbuddy
+# DeepSeek 官方没有向量接口，所以不在清单里。
 # 免费选项：siliconflow 的 BAAI/bge-m3（需实名）
 [capability.embedding]
 provider = "siliconflow"
@@ -47,27 +82,120 @@ base_url = "https://api.siliconflow.cn/v1"
 api_key = "${SILICONFLOW_API_KEY}"
 model = "BAAI/bge-m3"
 dimension = 1024
+# 请求路径，空 = /embeddings
+path = ""
+# 输出维度字段名：留空 = 不发（默认）。
+#
+# 多数模型的维度固定，多传这个字段会被拒——实测硅基流动的 bge-m3
+# 收到 dimensions 直接返回 20015 invalid。
+# 只在模型明确支持 Matryoshka 截断时才填。
+dimensions_field = ""
+# 额外固定字段，JSON 原样合并进请求体，一般留空
+extra_json = ""
+timeout_ms = 20000
 
-# 语音识别。免费：siliconflow 的 FunAudioLLM/SenseVoiceSmall（需实名）
+# ── 语音识别 ──
+# provider 清单：dashscope | deepseek | siliconflow | volcengine
+#
+# 收到的语音先按文件头嗅探真实格式（QQ 发 SILK，微信发 AMR/SILK），
+# 需要时自动转 16k 单声道 WAV。云端一律走 multipart 上传。
 [capability.stt]
 provider = "siliconflow"
 base_url = "https://api.siliconflow.cn/v1"
 api_key = "${SILICONFLOW_API_KEY}"
 model = "FunAudioLLM/SenseVoiceSmall"
+# auto = 自动识别语种（多数厂商不发这个字段）
 language = "auto"
+# 端点路径，空 = 按 provider 用默认值
+path = ""
+# 强制转 16k 单声道 WAV（百度需要）
+need_wav16k = false
+# 上传大小上限，0 = 不限（DeepSeek 是 8388608）
+max_upload_bytes = 0
+timeout_ms = 30000
 
-# 语音合成。edge 无需 key，但依赖系统装有 edge-tts
+# ── 语音合成 ──
+# provider 清单：dashscope | deepseek | edge | siliconflow | volcengine
+# edge 无需 key，但依赖系统装有 edge-tts。
 [capability.tts]
 provider = "edge"
+base_url = ""
+api_key = ""
+# HTTP 类厂商用；edge 用 voice 字段
+model = ""
+# 音色：edge 用微软音色名，火山用音色 ID
 voice = "zh-CN-XiaoyiNeural"
+# 输出格式：mp3 / wav / ogg（火山 v1 支持 mp3 ogg_opus pcm wav）
 format = "mp3"
-group_voice = false     # 群里不发语音（避免刷屏与占配额）
+# 端点路径，空 = 按 provider 用默认值
+path = ""
+# 火山专用：appid 与 cluster
+app_id = ""
+cluster = ""
+# 额外参数直通（火山可覆盖 audio 段的 speed_ratio / volume_ratio 等）
+# 例：{"audio":{"speed_ratio":1.1,"volume_ratio":1.2}}
+extra_json = ""
+timeout_ms = 20000
+# 群里是否也发语音（false = 只在私聊发）
+group_voice = false
 
-# 网页搜索（被动对话场景用得少，默认关闭）
+# ── 文档输入 ──
+# provider 清单：deepseek | none
+#
+# 对方发来 PDF / Word / PPT / 图片 / 表格时自动解析，内容进上下文。
+# 单独一层：文档有自己的失败模式（页数超限、加密、解析超时）
+# 和成本模型（按页计费），不和模型能力混在一起。
+#
+#   deepseek —— Files API（POST /files），上传时完成解析，拿回 file_id，
+#               后续轮次只传 id；图片走 rich_layout_recognition 时模型能看到图表
+#   none     —— 不启用（收到文件时模型只看到「收到一个文件」）
+#
+# 纯文本（txt/md/csv/json/代码）本地直读，不上传、不计费。
+[capability.document]
+provider = "none"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+timeout_ms = 180000
+# 单文件大小上限，0 = 不限制
+max_bytes = 104857600
+
+# ── 网络搜索 ──
+# provider 清单：bocha | brave | deepseek | exa | generic | google | jina
+#                | none | searxng | serper | tavily | zhipu
+#
+# 聚合成一层：provider 选哪家协议，换一家只改这里。
+# 各家字段差异（url vs link、title vs name）已在实现里适配。
 [capability.search]
-provider = "none"       # none | deepseek | tavily | bocha
-api_key = "${TAVILY_API_KEY}"
+provider = "none"
+# 空 = 按 provider 用官方默认地址
+base_url = "https://api.deepseek.com"
+# 请求路径，空 = 按 provider 用默认值
+path = ""
+api_key = "${DEEPSEEK_API_KEY}"
+# generic 专用：需要额外标识时填（如 Google cx / 智谱 search_engine）
+api_engine = ""
 max_results = 5
+timeout_ms = 15000
+
+# search：是否在结果里带网页正文（更全但更慢/更大）
+need_content = false
+# fetch：给模型看的正文上限（超长页面会截断，防撑爆上下文）
+fetch_max_chars = 6000
+
+# 以下仅 generic 直连模式使用
+# 是否允许访问内网地址（默认 false，SSRF 防护）
+allow_private_hosts = false
+fetch_max_bytes = 2097152
+
+# ── 生图 ──
+# provider 清单：bridge | openai | siliconflow
+# 默认关闭：只用形象库库存图（生图后端待定）。
+[capability.image]
+provider = "none"
+base_url = ""
+api_key = ""
+model = ""
+default_size = "1024x1024"
 
 # ══════════ 记忆（三层）══════════
 
@@ -88,6 +216,39 @@ summary_ratio = 0.25
 
 notes_dir = "data/memory/notes"    # 旁路文件（权威源，人可读、可手改）
 db_path = "data/memory/index.db"   # SQLite 索引（可随时从文件重建）
+portraits_dir = "data/memory/portraits"   # 形象库：放你自己的图，manifest.md 可手改
+media_dir = "data/memory/media"           # 媒体缓存：入站/出站的图片语音落本地副本
+
+# ══════════ 上游能力探测 ══════════
+# 不用配置开关：启动时真实探测上游支持哪些特性，结果写盘缓存。
+# 上游会静默变更行为（如 WorkBuddy 在 HTTP 200 下丢弃 assistant 图片），
+# 靠人工配置必然过时，所以自动探测。
+[probe]
+cache_path = "data/probe/capabilities.json"
+ttl_days = 30          # 缓存有效期，过期自动重探
+on_start = true        # 启动时同步探测（false = 只用缓存，后台再探）
+
+# ══════════ 工具调用 ══════════
+# 模型可主动调用的工具：search_memory / search_images / web_search
+# web_search 只在 capability.search.provider != "none" 时注册
+[tool]
+max_rounds = 0         # 单轮最多几次工具调用；0 = 不限制，由模型自己决定何时停
+
+# ══════════ 安全防护 ══════════
+[guard]
+max_input_bytes = 0        # 单条消息上限；0 = 不限制
+detect_injection = true    # 检测提示注入
+reject_injection = true    # true=直接拒绝，false=保留但加防护
+max_output_bytes = 0       # 单条回复上限；0 = 不限制
+redact_secrets = true      # 脱敏 API key / token
+strip_links = true         # 去链接（QQ 会因链接拒绝整条消息）
+rate_limit = 12            # 窗口内最多几条
+rate_window_s = 60         # 窗口长度（秒）
+
+[dispatcher]
+# 工作线程数。0 = 自动（核数，上限 4，至少 2；2 核机器即 2 线程）。
+# 任务以等模型和网络为主，线程开太多没收益。
+threads = 0
 
 [orchestrator]
 max_replies = 4                # 单条入站最多回几条（QQ 官方：单聊 4 / 群 5）
@@ -99,20 +260,33 @@ passive_window_ms = 300000     # 被动回复窗口；超过 80% 放弃，避免
 persona_file = "persona/persona.md"
 # 人格存储目录
 store_dir = "data/persona"
+# rules_file 是可选的，不配就只有人格文件
+# rules_file = "persona/rules.md"
 
 # ── 控制面 API ──
-# 只暴露 HTTP API，不带界面，供另一个进程管理人格。
+# 只暴露 HTTP API，不带界面，供另一个进程（GUI）管理人格与通道。
 #
 # 鉴权：token 从环境变量 FEIYU_API_TOKEN 读，不写在这里。
 # 开着鉴权又没设 token 时，服务不会启动（不会静默降级成无鉴权）。
 #
 # 端点：
 #   GET    /healthz                          探活（免鉴权）
+#   GET    /v1/config                        读当前生效配置
+#   PUT    /v1/config                        部分更新配置
+#   GET    /v1/conversations                 会话登记表（GUI 卡片列表的数据源）
 #   GET    /v1/persona/default               读全局默认人格
 #   PUT    /v1/persona/default               写全局默认  {"persona":"..."}
 #   GET    /v1/persona/session?conv_id=X     读某会话人格
 #   PUT    /v1/persona/session?conv_id=X     设某会话人格 {"persona":"..."}
 #   DELETE /v1/persona/session?conv_id=X     清除会话覆盖
+#   POST   /v1/capability/workbuddy/login        发起 WorkBuddy 扫码登录
+#   GET    /v1/capability/workbuddy/login/status 查登录状态
+#   POST   /v1/capability/workbuddy/test         测桥接层连通性
+#   GET    /v1/capability/workbuddy/credential   取 WorkBuddy 凭据（明文）
+#
+# 凭据端点（credential）返回明文 access_token，只认**凭据专用令牌**
+# （capability.workbuddy.credential_token）。主令牌也能过，但桥接层
+# 应该用专用令牌——主令牌能改配置、扫码登录，权限太大。
 [api]
 port = 0                 # 0 = 不启动
 bind = "127.0.0.1"       # 只监听本机；要对外改成 0.0.0.0 并自己加防火墙

@@ -25,11 +25,14 @@ module;
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -135,6 +138,37 @@ struct WeChatLogin {
   std::int64_t created_ms{0};
 };
 
+// WorkBuddy OAuth 登录会话。
+//
+// state 与登录进度只放内存：进程重启即作废，这与上游语义一致
+// （授权链接本身就是一次性的）。凭据落盘到 data/workbuddy.json。
+struct WorkBuddyLogin {
+  std::string login_id;
+  std::string state;
+  std::string auth_url;
+  std::int64_t expires_ms{0};
+  bool done{false};
+  std::string error;
+  // 登录成功后的账号信息（只用于展示）
+  std::string nickname;
+  std::string uid;
+};
+
+// WorkBuddy 凭据查询结果（给桥接层跨平台拉取用）。
+//
+// 为什么需要它：控制面跑在 WSL、桥接层跑在 Windows 宿主时，两边看到的
+// 不是同一个文件系统路径（`\\wsl$\...` 与 `C:\...` 是两个不同的文件），
+// --cred-file 永远对不上，GUI 扫码登录对桥就是零效果。改走 HTTP 拉取
+// 与路径无关。
+struct WorkBuddyCredentialResult {
+  bool found{false};
+  // found=true 时是凭据 JSON（access_token / refresh_token / expires_at /
+  // domain / nickname / uid），与落盘文件同构。
+  std::string body;
+  // found=false 时说明原因：no_credential = 还没登录 / 文件不存在。
+  std::string detail;
+};
+
 // ── 控制面服务 ──────────────────────────────────────────
 class ControlService {
  public:
@@ -169,18 +203,94 @@ class ControlService {
   fish::core::Result<std::string> wechat_qr_create();
   fish::core::Result<std::string> wechat_qr_status(const std::string& qrcode);
 
+  // ── WorkBuddy 链接登录（OAuth）──
+  //
+  // 不需要填 Key：向桥接层申请一个 state，把授权链接交给 GUI 打开，
+  // 用户在浏览器里登录后，桥接层轮询拿到凭据，我们只负责查结果。
+  //
+  // 三步与 dsh-connect-workbuddy 一致：
+  //   POST /v2/plugin/auth/state?platform=workbuddy  → state + authUrl
+  //   GET  /v2/plugin/auth/token?state=...           → accessToken + 账号资料
+  //   GET  /v2/plugin/login/account                  → 昵称/uid（仅展示）
+  fish::core::Result<std::string> workbuddy_login_start();
+  fish::core::Result<std::string> workbuddy_login_status(const std::string& login_id);
+  // 用已保存的凭据探一次桥接层，确认真的能出 DeepSeek。
+  fish::core::Result<std::string> workbuddy_test();
+
+  // ── WorkBuddy 凭据查询（跨平台桥接层用）──
+  //
+  // 读凭据文件并原样返回。文件不存在 → found=false（HTTP 404 + no_credential）。
+  //
+  // 凭据落盘路径可配：capability.workbuddy.cred_file（空 = data_dir 下的
+  // workbuddy.json）。WSL 部署时把它指到 Windows 侧可见的路径即可，
+  // 不必再让桥接层去猜路径。
+  WorkBuddyCredentialResult workbuddy_credential();
+
+  // 桥接层专用的独立令牌：只对凭据端点有效，不给主 token 用。
+  //
+  // 为什么要有独立令牌：这个端点返回明文 access_token。主 token 是给
+  // GUI 用的（GUI 可能把配置展示出来、甚至截图分享），拿它换明文凭据
+  // 风险太大。独立令牌只写在本机文件里、只认这一个端点，泄露了也只
+  // 泄露 WorkBuddy 凭据，不会连带暴露控制面的其他能力。
+  //
+  // 优先读 config.toml 的 capability.workbuddy.credential_token；
+  // 没配就用 data/control_credential_token.txt 里的（首次访问时自动生成）。
+  [[nodiscard]] std::string workbuddy_credential_token();
+
  private:
+  // 一次调用内复用的解析上下文：config.toml / .env.local 各只读一次，
+  // resolved() 的结果按 "section.key" 记忆。
+  //
+  // 为什么需要：config_json() 会走 130+ 次 resolved()（每个字段一次，
+  // 每个能力的 key_ready 又各自遍历 6 个 section），原来每次都重新
+  // load 一遍文件，等于一次 GET /v1/config 上百次文件打开。
+  //
+  // 只在持 mu_ 的调用里使用，不跨调用共享，所以不需要额外同步；
+  // 也因为是「一次调用即弃」，写操作（set_secret / apply_config_json）
+  // 之后天然不会有陈旧缓存。
+  struct ResolveCache {
+    ResolveCache(ConfigFile& c, EnvFile& e) : cf(c), ef(e) {}
+    ConfigFile& cf;
+    EnvFile& ef;
+    bool env_loaded{false};
+    std::map<std::string, std::string> memo;
+  };
+
   // 把密钥写进 .env.local，并把 config.toml 里的值保持为 ${VAR}
   fish::core::Error set_secret(const std::string& section, const std::string& key,
                                const std::string& value);
 
+  // 同上，但改动用调用方已加载的 cf 承载（由调用方统一 save）。
+  // apply_config_json 里必须用这个版本：否则 set_secret 自己 save 一次、
+  // 调用方再 save 一次自己的旧快照，后写的把前一次改动覆盖掉。
+  fish::core::Error set_secret(ConfigFile& cf, const std::string& section,
+                               const std::string& key, const std::string& value,
+                               bool* cf_changed);
+
   // 读当前生效的密钥值（config.toml 的 ${VAR} → .env.local → 进程环境）
   [[nodiscard]] std::string resolved(const std::string& section, const std::string& key);
+  [[nodiscard]] std::string resolved(ResolveCache& rc, const std::string& section,
+                                     const std::string& key);
+
+  // 共享密钥：同一提供方在任一能力填过 key，其他能力选它时复用。
+  // section 是「要用 key 的那个能力」，provider 是该能力当前选的提供方。
+  [[nodiscard]] std::string shared_api_key(const std::string& section,
+                                           const std::string& provider);
+  [[nodiscard]] std::string shared_api_key(ResolveCache& rc, const std::string& section,
+                                           const std::string& provider);
+
+  // 凭据落盘路径。capability.workbuddy.cred_file 配了就用它（相对路径
+  // 按 config.toml 所在目录解析），没配就是 data_dir/workbuddy.json。
+  [[nodiscard]] std::string workbuddy_cred_path();
 
   Config cfg_;
   std::mutex mu_;
   QqBindTask qq_task_;
   WeChatLogin wx_login_;
+  std::map<std::string, WorkBuddyLogin> wb_logins_;
+  // 凭据专用令牌缓存：第一次用时生成并落盘，之后一直用同一个。
+  // 不缓存的话每次鉴权都重读文件，桥接层就拿不到稳定的令牌了。
+  std::string wb_credential_token_;
 };
 
 // ── 工具（导出便于测试）────────────────────────────────
@@ -659,21 +769,62 @@ fish::core::Error EnvFile::save() {
 
 // ═══ ControlService ═════════════════════════════════════
 
-ControlService::ControlService(Config cfg) : cfg_(std::move(cfg)) {}
+ControlService::ControlService(Config cfg) : cfg_(std::move(cfg)) {
+  // data_dir 默认是相对路径 "data"，会随进程 cwd 漂移：从 systemd 拉起时
+  // cwd 是 /，从仓库目录手跑时是仓库根，workbuddy.json / probe 缓存就会
+  // 落到两个完全不同的地方，重启后「登录状态消失」这类怪事都出在这。
+  //
+  // 这里统一按「config.toml 所在目录」解析相对路径，与 config.toml /
+  // .env.local / data/conversations.json 的定位口径一致；调用方显式传
+  // 绝对路径时不动它。
+  if (!cfg_.data_dir.empty()) {
+    const fs::path p(cfg_.data_dir);
+    if (p.is_relative()) {
+      const fs::path base = fs::path(cfg_.config_path).parent_path();
+      // config_path 只是 "config.toml"（没有目录）时 parent_path() 为空，
+      // 那就等价于 cwd，用 absolute() 固定下来，别再留一个相对路径。
+      std::error_code ec;
+      const fs::path joined = base.empty() ? p : (base / p);
+      const fs::path abs = fs::absolute(joined, ec);
+      cfg_.data_dir = (ec ? joined : abs).lexically_normal().string();
+    }
+  }
+}
 
 std::string ControlService::resolved(const std::string& section, const std::string& key) {
   ConfigFile cf(cfg_.config_path);
   cf.load();
+  EnvFile ef(cfg_.env_path);
+  ResolveCache rc(cf, ef);
+  return resolved(rc, section, key);
+}
+
+// 带缓存版本：config.toml / .env.local 由调用方加载一次，结果按
+// "section.key" 记忆。config_json() 里每个字段都会调一次，缓存后
+// 一次 GET /v1/config 只开两个文件。
+std::string ControlService::resolved(ResolveCache& rc, const std::string& section,
+                                     const std::string& key) {
+  const std::string memo_key = section + '\x1f' + key;
+  if (auto it = rc.memo.find(memo_key); it != rc.memo.end()) return it->second;
+
+  std::string out;
   // 1) config.toml 里是 ${VAR} 占位符 → 去 .env.local / 环境变量找
-  if (auto var = cf.env_var_of(section, key)) {
-    EnvFile ef(cfg_.env_path);
-    ef.load();
-    if (auto v = ef.get(*var)) return *v;
-    if (const char* e = std::getenv(var->c_str()); e != nullptr) return e;
-    return {};
+  if (auto var = rc.cf.env_var_of(section, key)) {
+    if (!rc.env_loaded) {
+      rc.ef.load();
+      rc.env_loaded = true;
+    }
+    if (auto v = rc.ef.get(*var)) {
+      out = *v;
+    } else if (const char* e = std::getenv(var->c_str()); e != nullptr) {
+      out = e;
+    }
+  } else {
+    // 2) 直接写字面值 → 用它
+    out = rc.cf.get_or(section, key, "");
   }
-  // 2) 直接写字面值 → 用它
-  return cf.get_or(section, key, "");
+  rc.memo.emplace(memo_key, out);
+  return out;
 }
 
 fish::core::Error ControlService::set_secret(const std::string& section,
@@ -682,6 +833,19 @@ fish::core::Error ControlService::set_secret(const std::string& section,
   ConfigFile cf(cfg_.config_path);
   if (auto e = cf.load(); !e.ok()) return e;
 
+  bool cf_changed = false;
+  if (auto e = set_secret(cf, section, key, value, &cf_changed); !e.ok()) return e;
+  if (cf_changed) return cf.save();
+  return fish::core::Error::none();
+}
+
+// 密钥落盘的核心逻辑：变量名进 .env.local，config.toml 里只留 ${VAR}。
+// config.toml 的改动交给调用方 save（cf_changed 告知是否改了），
+// 这样 apply_config_json 能把自己的一批改动合并成一次写盘。
+fish::core::Error ControlService::set_secret(ConfigFile& cf, const std::string& section,
+                                              const std::string& key,
+                                              const std::string& value,
+                                              bool* cf_changed) {
   // 变量名优先取 config.toml 里已声明的 ${VAR}；没有就按惯例生成
   std::string var;
   if (auto v = cf.env_var_of(section, key)) {
@@ -695,13 +859,62 @@ fish::core::Error ControlService::set_secret(const std::string& section,
     }
     // config.toml 里的值改成 ${VAR}，从此它就是「密钥」而不是明文字段
     cf.set(section, key, "${" + var + "}");
-    if (auto e = cf.save(); !e.ok()) return e;
+    if (cf_changed != nullptr) *cf_changed = true;
   }
 
   EnvFile ef(cfg_.env_path);
   if (auto e = ef.load(); !e.ok()) return e;
   ef.set(var, value);
   return ef.save();
+}
+
+// ── 共享密钥 ────────────────────────────────────────────
+//
+// 同一提供方在任一能力里填过密钥，其他能力选它时直接复用：
+//   capability.chat.api_key / capability.search.api_key /
+//   capability.document.api_key / capability.embedding.api_key /
+//   capability.stt.api_key / capability.tts.api_key
+//
+// 解析顺序：自己的 → 同提供方其他能力的 → DEEPSEEK_API_KEY 环境变量。
+// 典型场景：DeepSeek 的 key 在对话里填过，搜索/文档选 DeepSeek 官方
+// 时就不用再填一遍。
+std::string ControlService::shared_api_key(const std::string& section,
+                                           const std::string& provider) {
+  ConfigFile cf(cfg_.config_path);
+  cf.load();
+  EnvFile ef(cfg_.env_path);
+  ResolveCache rc(cf, ef);
+  return shared_api_key(rc, section, provider);
+}
+
+std::string ControlService::shared_api_key(ResolveCache& rc, const std::string& section,
+                                           const std::string& provider) {
+  if (provider.empty() || provider == "workbuddy") return {};  // 桥接不校验
+  if (std::string mine = resolved(rc, section, "api_key"); !mine.empty()) return mine;
+
+  static constexpr const char* kKeySections[] = {
+      "capability.chat",    "capability.search",
+      "capability.document", "capability.embedding",
+      "capability.stt",     "capability.tts",
+  };
+  for (const char* sec : kKeySections) {
+    if (section == sec) continue;
+    if (std::string p = resolved(rc, std::string(sec), "provider"); p == provider) {
+      if (std::string k = resolved(rc, std::string(sec), "api_key"); !k.empty()) {
+        return k;
+      }
+    }
+  }
+  // 兜底：DEEPSEEK_API_KEY 是官方唯一专用变量，很多用户只放这一把
+  if (provider == "deepseek") {
+    if (!rc.env_loaded) {
+      rc.ef.load();
+      rc.env_loaded = true;
+    }
+    if (auto v = rc.ef.get("DEEPSEEK_API_KEY")) return *v;
+    if (const char* e = std::getenv("DEEPSEEK_API_KEY"); e != nullptr) return e;
+  }
+  return {};
 }
 
 // ── 配置视图 ────────────────────────────────────────────
@@ -720,20 +933,22 @@ struct FieldDef {
 
 // 提供方预设。GUI 只选提供方，base_url / model 由这里定，用户不填。
 //
-// 底层模型锁定：deepseek-flash。不管接哪家提供方，换的只是「从哪里
-// 拿到这个模型」，模型本身不换——这是产品决定，不是技术限制。
+// 只列「真能出 DeepSeek」的两家：底层模型锁死 deepseek-flash，
+// 列一家不托管 DeepSeek 的厂商，用户选了也只会拿到别的模型，
+// 等于绕开了锁定。
 struct ProviderPreset {
   const char* provider;     // GUI 下拉里的选项值
   const char* base_url;
-  const char* model;        // 固定 deepseek-flash
+  const char* model;
   const char* api_key_hint; // GUI 提示文案
 };
 
 constexpr ProviderPreset kChatPresets[] = {
-    // WorkBuddy：本机桥接层，key 随便填（桥不校验）。GUI 里走扫码。
-    {"workbuddy", "http://127.0.0.1:18091/v1", "fast-model", "桥接层不校验，扫码登录即可"},
+    // WorkBuddy：本机桥接层，走扫码/链接登录，key 桥不校验。
+    // deep-model 实测路由到 deepseek-v4.1-flash（支持读图，上下文 1M）。
+    {"workbuddy", "http://127.0.0.1:18091/v1", "deep-model", "点击下方按钮登录"},
+    // DeepSeek 官方：直接填 API Key
     {"deepseek", "https://api.deepseek.com", "deepseek-flash", "sk-开头的 DeepSeek API Key"},
-    {"siliconflow", "https://api.siliconflow.cn/v1", "deepseek-flash", "sk-开头的硅基流动 Key"},
 };
 
 // 接入方式统一是 OpenAI 兼容协议；provider 字段只决定 dialect，
@@ -745,6 +960,73 @@ const ProviderPreset* find_chat_preset(const std::string& provider) {
     if (provider == p.provider) return &p;
   }
   return nullptr;
+}
+
+// 非 chat 能力的「provider → base_url」默认表。
+//
+// 两处共用同一份数据，必须只有一份定义：
+//   1) config_json() 下发 capability.defaults，GUI 据此在切提供方时自动填；
+//   2) apply_config_json() 在 provider 变化时据此改写 base_url。
+// 原来只在 config_json() 里内联构造，后端切提供方时 base_url 停在旧值，
+// 用户选了「阿里云百炼」实际连的还是硅基流动。
+//
+// 注意 chat 不在这里：chat 的预设还带 model / api_key_hint，
+// 用上面的 kChatPresets。
+struct ProviderDefault {
+  const char* capability;   // embedding / stt / tts / search / document
+  const char* provider;
+  const char* base_url;
+};
+
+constexpr ProviderDefault kProviderDefaults[] = {
+    // 向量
+    {"embedding", "siliconflow", "https://api.siliconflow.cn/v1"},
+    {"embedding", "ark", "https://ark.cn-beijing.volces.com/api/v3"},
+    {"embedding", "dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+    {"embedding", "qianfan", "https://qianfan.baidubce.com/v2"},
+    // 语音识别
+    {"stt", "siliconflow", "https://api.siliconflow.cn/v1"},
+    {"stt", "volcengine", "https://openspeech.bytedance.com"},
+    {"stt", "dashscope", "https://dashscope.aliyuncs.com"},
+    {"stt", "baidu", "https://vop.baidu.com"},
+    // 语音合成
+    {"tts", "volcengine", "https://openspeech.bytedance.com"},
+    {"tts", "dashscope", "https://dashscope.aliyuncs.com"},
+    {"tts", "siliconflow", "https://api.siliconflow.cn/v1"},
+    // 搜索 / 文档
+    {"search", "deepseek", "https://api.deepseek.com"},
+    {"document", "deepseek", "https://api.deepseek.com"},
+};
+
+// 该能力下 provider 的默认 base_url；没有预设返回 nullptr。
+const char* find_provider_base_url(const std::string& capability,
+                                   const std::string& provider) {
+  for (const auto& d : kProviderDefaults) {
+    if (capability == d.capability && provider == d.provider) return d.base_url;
+  }
+  return nullptr;
+}
+
+// 会被 GUI 当作「能力」暴露出来的五项（不含 chat，chat 单独走预设）。
+constexpr const char* kPresetCapabilities[] = {"embedding", "stt", "tts", "search",
+                                              "document"};
+
+// 锁定字段的生效值。
+//
+// 目前只有 reasoning_effort 一个锁定字段，它的值**不来自 config.toml**：
+// 出厂配置里根本没有这个键（运行时用的是 load_chat_config 的默认值），
+// 原样返回就是空串。于是 /v1/config 回显 ""、GUI 显示空，而运行时
+// 实际发给上游的是 "high" —— 显示层和真实行为对不上。
+//
+// 所以锁定字段一律回显锁定值本身，来源统一走
+// fish::capability::locked_reasoning_effort()，与 PUT 拒绝时的
+// effort_locked:<值>、运行时的兜底默认值同源。
+std::string locked_field_value(const std::string& section, const std::string& key,
+                                const ConfigFile& cf) {
+  if (section == "capability.chat" && key == "reasoning_effort") {
+    return fish::capability::locked_reasoning_effort();
+  }
+  return cf.get_or(section, key, "");
 }
 
 constexpr FieldDef kFields[] = {
@@ -766,6 +1048,12 @@ constexpr FieldDef kFields[] = {
     {"capability.chat", "model", FieldKind::kString},
     {"capability.chat", "reasoning_effort", FieldKind::kLocked},
     {"capability.chat", "api_key", FieldKind::kSecret},
+    // WorkBuddy 桥接（跨平台部署用）
+    //   cred_file       凭据落盘路径；空 = data_dir/workbuddy.json
+    //   credential_token 桥接层拉凭据用的独立令牌；空 = 自动生成到
+    //                   data/control_credential_token.txt
+    {"capability.workbuddy", "cred_file", FieldKind::kString},
+    {"capability.workbuddy", "credential_token", FieldKind::kSecret},
     {"capability.embedding", "provider", FieldKind::kString},
     {"capability.embedding", "base_url", FieldKind::kString},
     {"capability.embedding", "model", FieldKind::kString},
@@ -774,14 +1062,25 @@ constexpr FieldDef kFields[] = {
     {"capability.stt", "base_url", FieldKind::kString},
     {"capability.stt", "model", FieldKind::kString},
     {"capability.stt", "language", FieldKind::kString},
+    {"capability.stt", "path", FieldKind::kString},
+    {"capability.stt", "need_wav16k", FieldKind::kBool},
     {"capability.stt", "api_key", FieldKind::kSecret},
     {"capability.tts", "provider", FieldKind::kString},
+    {"capability.tts", "base_url", FieldKind::kString},
+    {"capability.tts", "model", FieldKind::kString},
     {"capability.tts", "voice", FieldKind::kString},
     {"capability.tts", "format", FieldKind::kString},
+    {"capability.tts", "app_id", FieldKind::kString},
+    {"capability.tts", "cluster", FieldKind::kString},
+    {"capability.tts", "api_key", FieldKind::kSecret},
     {"capability.tts", "group_voice", FieldKind::kBool},
+    {"capability.document", "provider", FieldKind::kString},
+    {"capability.document", "base_url", FieldKind::kString},
+    {"capability.document", "api_key", FieldKind::kSecret},
     {"capability.search", "provider", FieldKind::kString},
     {"capability.search", "base_url", FieldKind::kString},
     {"capability.search", "api_key", FieldKind::kSecret},
+    {"capability.search", "api_engine", FieldKind::kString},
     {"capability.search", "max_results", FieldKind::kInt},
     {"capability.image", "provider", FieldKind::kString},
     {"capability.image", "base_url", FieldKind::kString},
@@ -830,6 +1129,11 @@ fish::core::Result<std::string> ControlService::config_json() {
   std::lock_guard<std::mutex> lock(mu_);
   ConfigFile cf(cfg_.config_path);
   cf.load();
+  // 本次调用内共用的解析缓存：下面的 resolved() / shared_api_key()
+  // 都走它，一次 GET /v1/config 只开 config.toml 和 .env.local 各一次
+  // （原来是每个字段一次，130+ 次文件打开）。
+  EnvFile ef(cfg_.env_path);
+  ResolveCache rc(cf, ef);
 
   json root = json::object();
   for (const auto& f : kFields) {
@@ -861,7 +1165,7 @@ fish::core::Result<std::string> ControlService::config_json() {
         const auto raw = cf.get(f.section, f.key);
         if (raw && !raw->empty() && raw->size() > 4 && (*raw)[0] == '$' &&
             (*raw)[1] == '{' && raw->back() == '}') {
-          (*node)[f.key] = resolved(f.section, f.key);
+          (*node)[f.key] = resolved(rc, f.section, f.key);
         } else {
           (*node)[f.key] = raw.value_or("");
         }
@@ -882,12 +1186,28 @@ fish::core::Result<std::string> ControlService::config_json() {
         (*node)[f.key] = (raw == "true" || raw == "1" || raw == "yes" || raw == "on");
         break;
       }
-      case FieldKind::kSecret:
-        (*node)[std::string(f.key) + "_set"] = !resolved(f.section, f.key).empty();
+      case FieldKind::kSecret: {
+        const bool own = !resolved(rc, f.section, f.key).empty();
+        (*node)[std::string(f.key) + "_set"] = own;
+        // key_ready：自己填过，或同一提供方在其他能力填过（共享密钥）。
+        // GUI 用它决定还要不要让用户填 key。
+        if (f.section == std::string_view("capability.embedding") ||
+            f.section == std::string_view("capability.stt") ||
+            f.section == std::string_view("capability.tts") ||
+            f.section == std::string_view("capability.search") ||
+            f.section == std::string_view("capability.document")) {
+          const std::string sec(f.section);
+          const std::string provider = resolved(rc, sec, "provider");
+          (*node)["key_ready"] =
+              own || !shared_api_key(rc, sec, provider).empty();
+        }
         break;
+      }
       case FieldKind::kLocked:
-        // 锁定字段：原样返回（GUI 显示成只读），PUT 拒绝改。
-        (*node)[f.key] = cf.get_or(f.section, f.key, "");
+        // 锁定字段：回显锁定值（GUI 显示成只读），PUT 拒绝改。
+        // 不能原样读 config.toml —— reasoning_effort 压根不在文件里，
+        // 原样读就是空串，和运行时实际发出去的 "high" 对不上。
+        (*node)[f.key] = locked_field_value(f.section, f.key, cf);
         break;
     }
   }
@@ -903,6 +1223,59 @@ fish::core::Result<std::string> ControlService::config_json() {
     }
     chat["presets"] = items;
     chat["model_locked"] = "deepseek-flash";
+  }
+
+  // 各能力的提供方清单：GUI 下拉直接用这个，前端不硬编码。
+  // 加一家厂商只改 capability 模块，控制面自动暴露出去。
+  {
+    auto& cap = root["capability"];
+    json providers = json::object();
+    providers["embedding"] = {
+        {"values", fish::capability::embedding_provider_list()},
+        {"labels",
+         json::object({{"siliconflow", "硅基流动"},
+                       {"ark", "火山方舟"},
+                       {"dashscope", "阿里云百炼"},
+                       {"qianfan", "百度千帆"},
+                       {"workbuddy", "WorkBuddy（本机桥接）"}})}};
+    providers["stt"] = {
+        {"values", fish::capability::stt_provider_list()},
+        {"labels",
+         json::object({{"siliconflow", "硅基流动（免费 SenseVoice）"},
+                       {"volcengine", "火山引擎"},
+                       {"dashscope", "阿里云百炼"},
+                       {"deepseek", "DeepSeek 官方"}})}};
+    providers["tts"] = {
+        {"values", fish::capability::tts_provider_list()},
+        {"labels",
+         json::object({{"edge", "Edge TTS（免费，本机）"},
+                       {"volcengine", "火山引擎"},
+                       {"dashscope", "阿里云百炼 CosyVoice"},
+                       {"siliconflow", "硅基流动 CosyVoice2"},
+                       {"deepseek", "DeepSeek 官方"}})}};
+    providers["search"] = {
+        {"values", fish::capability::search_provider_list()},
+        {"labels",
+         json::object({{"none", "不启用"},
+                       {"deepseek", "DeepSeek 官方"},
+                       {"generic", "自定义端点"}})}};
+    providers["document"] = {{"values", "deepseek,none"},
+                             {"labels", json::object({{"deepseek", "DeepSeek Files API"},
+                                                      {"none", "不启用"}})}};
+    cap["providers"] = std::move(providers);
+  }
+
+  // 各能力里「换提供方时 base_url 也要跟着改」的默认值。
+  // GUI 选了提供方后据此自动填，用户不必记各家的域名；
+  // apply_config_json() 也读同一张 kProviderDefaults，两处不会跑偏。
+  {
+    auto& cap = root["capability"];
+    json defaults = json::object();
+    for (const char* name : kPresetCapabilities) defaults[name] = json::object();
+    for (const auto& d : kProviderDefaults) {
+      defaults[d.capability][d.provider] = d.base_url;
+    }
+    cap["defaults"] = std::move(defaults);
   }
 
   return fish::core::Result<std::string>::ok(root.dump());
@@ -925,6 +1298,11 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
   std::lock_guard<std::mutex> lock(mu_);
   ConfigFile cf(cfg_.config_path);
   if (auto e = cf.load(); !e.ok()) return e;
+  // 解析缓存：下面「占位符键值没变就不覆盖」的判断会用到 resolved()，
+  // 走缓存避免每个字符串字段都重开一次文件。写操作只碰 cf / ef，
+  // 缓存随本函数结束丢弃，不存在陈旧问题。
+  EnvFile ef(cfg_.env_path);
+  ResolveCache rc(cf, ef);
 
   bool dirty = false;
   bool restart = false;
@@ -933,6 +1311,109 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
   // "section.key" 对得上（section 本身可能带点）。
   std::vector<std::pair<std::string, json>> flat;
   flatten_json("", in, &flat);
+
+  // 请求里显式给了 base_url 的字段：能力切提供方时不能覆盖用户的显式值。
+  // 必须先扫一遍——摊平后的顺序不保证 provider 在 base_url 之前。
+  std::set<std::string> explicit_base_urls;
+  for (const auto& [full, val] : flat) {
+    if (val.is_string() && full.size() > 9 &&
+        full.compare(full.size() - 9, 9, ".base_url") == 0) {
+      explicit_base_urls.insert(full);
+    }
+  }
+
+  // 请求里显式带了 api_key 的能力：用户自己填了 key。
+  std::set<std::string> sections_with_explicit_key;
+  for (const auto& [full, val] : flat) {
+    if (val.is_string() && full.size() > 8 &&
+        full.compare(full.size() - 8, 8, ".api_key") == 0) {
+      sections_with_explicit_key.insert(full.substr(0, full.size() - 8));
+    }
+  }
+
+  // ── 切提供方 → 旧 key 解绑（前置处理）────────────────────
+  //
+  // 为什么必须清：config.toml 里 capability.stt.api_key 往往写的是
+  // ${SILICONFLOW_API_KEY}，展开后是硅基流动那把真 key。从 siliconflow
+  // 切到 deepseek 后若不动它，运行时 resolve_provider_key 第一步
+  // 「自己的 api_key 非空」就命中 → 拿硅基流动的 key 去请求 DeepSeek
+  // → 401。清空后落到共享密钥逻辑（同提供方其他能力借一把，
+  // 或 DEEPSEEK_API_KEY 环境变量兜底）。
+  //
+  // 必须在主循环**之前**做，原因有两个：
+  //   1) JSON 对象的键是按字典序摊平的（api_key < base_url < provider），
+  //      同一个 section 里 api_key 会先于 provider 被处理。先解绑，
+  //      set_secret 才会给新 key 建一个新的 ${VAR}，而不是把新 key
+  //      写进旧提供方那个共享变量里（那会让 embedding 之类的其他能力
+  //      也拿到这把新 key，直接串了）。
+  //   2) 用户这次填了新 key 的话，先解绑再 set_secret，
+  //      新旧两把 key 各归各位。
+  //
+  // 只在 provider 真的变了时才清：GUI 每次保存都会把 provider 带上，
+  // 不比对就会把用户刚填的 key 每次保存都抹掉。
+  //
+  // .env.local 里的变量不动 —— 同一个 ${VAR} 可能被别的能力引用，
+  // 而且切回原提供方时还能靠共享密钥逻辑借回来。
+  //
+  // 只对「运行时走 resolve_provider_key 的能力」清：
+  //   能清：embedding / stt / tts / search —— 它们找不到自己的 key 时
+  //         会去同提供方别的能力借一把，或用 DEEPSEEK_API_KEY 兜底。
+  //   不能清：chat / document / image —— 它们的 key 是直读的
+  //         （load_chat_config / load_config），一清空这个能力直接瘫掉：
+  //         chat 空 key → make_chat 失败 → 退回 EchoChat 桩（只复读不报错），
+  //         document 空 key → make_parser 返回 nullptr → 文档解析整个停掉。
+  //         这两个宁可 401（用户看得见），也不能静默降级。
+  static constexpr const char* kClearableKeySections[] = {
+      "capability.embedding", "capability.stt", "capability.tts", "capability.search",
+  };
+  auto clearable_key_section = [](const std::string& sec) {
+    for (const char* s : kClearableKeySections) {
+      if (sec == s) return true;
+    }
+    return false;
+  };
+  for (const auto& [full, val] : flat) {
+    if (!val.is_string()) continue;
+    if (full.size() <= 9 || full.compare(full.size() - 9, 9, ".provider") != 0) continue;
+    const std::string sec = full.substr(0, full.size() - 9);
+    // chat 的 provider 在 config.toml 里存的是 dialect（"openai"），
+    // 不是预设名，拿它跟预设名比永远不相等 → 会误判成「换提供方」。
+    // chat 由下面的预设分支处理，而且它的 key 也不能清（见上）。
+    if (sec == "capability.chat") continue;
+    if (!clearable_key_section(sec)) continue;
+    const std::string new_provider = val.get<std::string>();
+    const std::string old_provider = cf.get_or(sec, "provider", "");
+    if (old_provider == new_provider) continue;   // 没换提供方，不动 key
+    // 只清「占位符绑定」（值形如 ${VAR}）：真 key 还在 .env.local 里，
+    // 清掉只是解绑，随时能借回来，丢不了东西。
+    //
+    // 手写的明文 key（api_key = "sk-xxx"）不动：清掉就是永久丢失用户
+    // 手抄的密钥，换来的是一个一样的 401（错的 key 一样 401）。这种
+    // 情况只记一条日志，提示用户自己换。
+    const auto var = cf.env_var_of(sec, "api_key");
+    if (!var.has_value()) {
+      if (!cf.get_or(sec, "api_key", "").empty()) {
+        ::fish::log::log_line(::fish::log::LogLevel::kWarn, "control",
+                              "api_key_may_not_match_provider")
+            .field("section", sec)
+            .field("from", old_provider)
+            .field("to", new_provider);
+      }
+      continue;
+    }
+    cf.set(sec, "api_key", "");
+    rc.memo.clear();   // cf 变了，缓存作废（后面 resolved() 要用）
+    changed->push_back(sec + ".api_key");
+    dirty = true;
+    restart = true;
+    ::fish::log::log_line(::fish::log::LogLevel::kInfo, "control",
+                          "api_key_unbound_on_provider_change")
+        .field("section", sec)
+        .field("from", old_provider)
+        .field("to", new_provider)
+        .field("user_supplied_new_key",
+               sections_with_explicit_key.count(sec) > 0);
+  }
 
   for (const auto& [full, val] : flat) {
     // 特例优先：chat.provider 发的是预设名（workbuddy / deepseek /
@@ -943,6 +1424,9 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
     if (full == "capability.chat.provider" && val.is_string()) {
       const std::string name = val.get<std::string>();
       if (const auto* preset = find_chat_preset(name)) {
+        // 旧 base_url 要在覆盖之前取：它就是「原来用的是哪个提供方」的
+        // 判据（config.toml 里存的是 dialect "openai"，不存预设名）。
+        const std::string old_base = cf.get_or("capability.chat", "base_url", "");
         if (cf.get_or("capability.chat", "provider", "") != kChatDialect) {
           cf.set("capability.chat", "provider", kChatDialect);
           changed->push_back("capability.chat.provider");
@@ -962,7 +1446,54 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
           dirty = true;
           restart = true;
         }
+        // 换提供方了，旧 key 不再属于新提供方。
+        //
+        // 注意这里**不**清空 chat 的 api_key（其它能力会清）：
+        //   - chat 的 key 在运行时是直读 capability.chat.api_key 的，
+        //     没有共享密钥兜底（load_chat_config 不走 resolve_provider_key）；
+        //   - 而 make_chat 要求 key 非空，空了会退回 EchoChat 桩 ——
+        //     机器人从此只会复读，不报错，比 401 更难查。
+        // 所以这里只记一条日志，由 GUI 提示用户重新填 Key。
+        if (old_base != preset->base_url) {
+          if (sections_with_explicit_key.count("capability.chat") == 0) {
+            ::fish::log::log_line(::fish::log::LogLevel::kWarn, "control",
+                                  "chat_key_may_not_match_provider")
+                .field("old_base", old_base)
+                .field("new_base", preset->base_url);
+          }
+        }
         continue;
+      }
+    }
+
+    // 非 chat 能力切提供方：base_url 要跟着改，否则用户选了别家
+    // 实际连的还是老地址。与上面 chat 的分支同理，必须在 FieldDef
+    // 匹配之前处理，否则只改到 provider 一个字段。
+    //
+    // 用户显式传了 base_url 时以用户为准（explicit_base_urls）。
+    if (val.is_string() && full.size() > 9 &&
+        full.compare(full.size() - 9, 9, ".provider") == 0) {
+      const std::string sec = full.substr(0, full.size() - 9);
+      // chat 不走这个分支：它的 provider 在 config.toml 里存的是 dialect
+      // （"openai"），不是预设名，拿它跟预设名比永远不相等 —— 会误判成
+      // 「换提供方」。chat 由上面的预设分支处理。
+      if (sec != "capability.chat") {
+      const std::string base_key = sec + ".base_url";
+      const std::string new_provider = val.get<std::string>();
+      if (explicit_base_urls.find(base_key) == explicit_base_urls.end()) {
+        const auto dot = sec.rfind('.');
+        const std::string cap = dot == std::string::npos ? sec : sec.substr(dot + 1);
+        if (const char* url = find_provider_base_url(cap, new_provider);
+            url != nullptr && !std::string_view(url).empty()) {
+          if (cf.get_or(sec, "base_url", "") != url) {
+            cf.set(sec, "base_url", url);
+            rc.memo.clear();   // cf 变了，缓存作废（下面还要用 resolved）
+            changed->push_back(base_key);
+            dirty = true;
+            restart = true;
+          }
+        }
+      }
       }
     }
 
@@ -984,10 +1515,12 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
       return fish::core::Error::make(fish::core::ErrorCode::kBadRequest,
                                      "model_locked:deepseek-flash");
     }
-    // 思考强度锁死 high：产品决定，不允许切换
+    // 思考强度锁死 high：产品决定，不允许切换。
+    // 报错里的值和 GET 回显、运行时默认值同源（locked_reasoning_effort）。
     if (full == "capability.chat.reasoning_effort") {
       return fish::core::Error::make(fish::core::ErrorCode::kBadRequest,
-                                     "effort_locked:high");
+                                     std::string("effort_locked:") +
+                                         fish::capability::locked_reasoning_effort());
     }
 
     // 密钥三态：__keep__ 不动，空串清除，其余覆盖
@@ -998,9 +1531,17 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
       }
       const std::string v = val.get<std::string>();
       if (v == "__keep__") continue;
-      if (auto e = set_secret(def->section, def->key, v); !e.ok()) return e;
+      // 用带 cf 的重载：config.toml 的改动留给本函数最后统一 save，
+      // 否则 set_secret 先写一次、这里再写一次自己的旧快照，互相覆盖。
+      bool cf_changed = false;
+      if (auto e = set_secret(cf, def->section, def->key, v, &cf_changed); !e.ok()) {
+        return e;
+      }
+      if (cf_changed) {
+        dirty = true;
+        rc.memo.clear();   // cf 变了，缓存作废
+      }
       changed->push_back(full);
-      dirty = true;
       restart = true;
       continue;
     }
@@ -1036,7 +1577,7 @@ fish::core::Error ControlService::apply_config_json(const std::string& body,
     // GUI 会把 GET 到的解析值原样 PUT 回来；如果和当前解析值一致，
     // 绝不能把占位符覆盖成字面值，否则环境变量引用被杀死。
     if (def->kind == FieldKind::kString && cf.env_var_of(def->section, def->key)) {
-      if (resolved(def->section, def->key) == text) continue;
+      if (resolved(rc, def->section, def->key) == text) continue;
     }
 
     if (cf.get_or(def->section, def->key, "") == text) continue;  // 无变化不记
@@ -1191,6 +1732,478 @@ fish::core::Result<std::string> ControlService::wechat_test(const std::string& b
   return fish::core::Result<std::string>::ok(out.dump());
 }
 
+// ── WorkBuddy 链接登录 ──────────────────────────────────
+//
+// 与 dsh-connect-workbuddy 的 oauth.ts 同一套流程：
+//   1. POST {base}/v2/plugin/auth/state?platform=workbuddy
+//      → { state, authUrl }
+//   2. 用户在浏览器里打开 authUrl 完成登录
+//   3. GET  {base}/v2/plugin/auth/token?state={state}
+//      → code 为 0/200 且带 accessToken 即成
+//
+// 凭据落到 data/workbuddy.json，之后桥接层每次请求读它。
+
+namespace {
+
+constexpr const char* kWorkBuddyBase = "https://www.codebuddy.cn";
+constexpr const char* kWorkBuddyGlobalBase = "https://www.workbuddy.ai";
+constexpr const char* kWorkBuddyApiPrefix = "/v2/plugin";
+
+// 上游字段名有 camelCase / snake_case 两种写法，都要认。
+std::string first_str(const json& j, std::initializer_list<const char*> keys) {
+  for (const char* k : keys) {
+    if (j.contains(k) && j[k].is_string()) {
+      const auto v = j[k].get<std::string>();
+      if (!v.empty()) return v;
+    }
+  }
+  return {};
+}
+
+// 响应可能是 {data: {...}} 包了一层，也可能就是扁平的
+const json& envelope(const json& j) {
+  if (j.is_object() && j.contains("data") && j["data"].is_object()) return j["data"];
+  return j;
+}
+
+std::string random_id() {
+  std::string raw(8, '\0');
+  if (FILE* f = std::fopen("/dev/urandom", "rb")) {
+    std::fread(raw.data(), 1, raw.size(), f);
+    std::fclose(f);
+  }
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  for (unsigned char c : raw) {
+    out += hex[c >> 4];
+    out += hex[c & 0x0F];
+  }
+  return out;
+}
+
+}  // namespace
+
+fish::core::Result<std::string> ControlService::workbuddy_login_start() {
+  json out;
+  const std::string url = std::string(kWorkBuddyBase) + kWorkBuddyApiPrefix +
+                          "/auth/state?platform=workbuddy";
+  auto r = fish::capability::HttpClient::instance().post_json(
+      url, {{"Content-Type", "application/json"}}, "{}", 30000);
+  if (!r.ok()) {
+    out["ok"] = false;
+    out["error"] = "unreachable";
+    out["detail"] = r.error.detail;
+    return fish::core::Result<std::string>::ok(out.dump());
+  }
+
+  try {
+    const auto j = json::parse(r.value->body);
+    const auto data = envelope(j);
+    const std::string state = first_str(data, {"state", "State"});
+    if (state.empty()) {
+      out["ok"] = false;
+      out["error"] = "no_state";
+      out["detail"] = r.value->body.substr(0, 200);
+      return fish::core::Result<std::string>::ok(out.dump());
+    }
+    // 上游通常直接给 authUrl；没给就按约定自己拼
+    std::string auth = first_str(data, {"authUrl", "auth_url", "url", "Url"});
+    if (auth.empty()) {
+      auth = std::string(kWorkBuddyBase) + "/login?state=" + state;
+    }
+
+    WorkBuddyLogin s;
+    s.login_id = "wb_" + random_id();
+    s.state = state;
+    s.auth_url = auth;
+    s.expires_ms = now_ms() + 600000;   // 10 分钟，与上游一致
+
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      // 会话表上限 8：先淘汰所有已过期的（正常过期，不打扰任何人），
+      // 还满就删最旧的一个。绝不能 clear()——用户连点几次「登录」会把
+      // 正在扫码的会话一起废掉，GUI 那边全部收到 session_not_found。
+      const std::int64_t now = now_ms();
+      for (auto it = wb_logins_.begin(); it != wb_logins_.end();) {
+        if (it->second.expires_ms > 0 && it->second.expires_ms < now) {
+          it = wb_logins_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (wb_logins_.size() >= 8) {
+        auto oldest = wb_logins_.begin();
+        for (auto it = wb_logins_.begin(); it != wb_logins_.end(); ++it) {
+          if (it->second.expires_ms < oldest->second.expires_ms) oldest = it;
+        }
+        wb_logins_.erase(oldest);
+      }
+      wb_logins_[s.login_id] = s;
+    }
+
+    out["ok"] = true;
+    out["login_id"] = s.login_id;
+    out["auth_url"] = auth;
+    out["expires_in"] = 600;
+    // 同一个链接也渲染成二维码，手机扫比在电脑上点更顺
+    out["qr_png_base64"] = qr_png_base64(auth);
+  } catch (const std::exception& e) {
+    out["ok"] = false;
+    out["error"] = "parse_failed";
+    out["detail"] = e.what();
+  }
+  return fish::core::Result<std::string>::ok(out.dump());
+}
+
+fish::core::Result<std::string> ControlService::workbuddy_login_status(
+    const std::string& login_id) {
+  json out;
+  WorkBuddyLogin snapshot;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = wb_logins_.find(login_id);
+    if (it == wb_logins_.end()) {
+      out["ok"] = false;
+      out["done"] = true;
+      out["error"] = "session_not_found";
+      out["detail"] = "登录会话不存在或已过期，请重新发起";
+      return fish::core::Result<std::string>::ok(out.dump());
+    }
+    snapshot = it->second;
+  }
+
+  if (snapshot.done) {
+    out["ok"] = true;
+    out["done"] = true;
+    if (!snapshot.error.empty()) {
+      out["success"] = false;
+      out["error"] = snapshot.error;
+    } else {
+      out["success"] = true;
+      out["nickname"] = snapshot.nickname;
+      out["uid"] = snapshot.uid;
+    }
+    return fish::core::Result<std::string>::ok(out.dump());
+  }
+  if (now_ms() > snapshot.expires_ms) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = wb_logins_.find(login_id);
+    if (it != wb_logins_.end()) {
+      it->second.done = true;
+      it->second.error = "timeout";
+    }
+    out["ok"] = true;
+    out["done"] = true;
+    out["success"] = false;
+    out["error"] = "timeout";
+    return fish::core::Result<std::string>::ok(out.dump());
+  }
+
+  // 轮询上游。用户还没登录时 code 不为 0/200，属于正常「未完成」。
+  const std::string url = std::string(kWorkBuddyBase) + kWorkBuddyApiPrefix +
+                          "/auth/token?state=" + snapshot.state;
+  fish::core::Result<fish::capability::HttpResult> r =
+      fish::core::Result<fish::capability::HttpResult>::fail(
+          fish::core::ErrorCode::kInternal, "unset");
+  {
+    fish::capability::HttpRequest req;
+    req.method = "GET";
+    req.url = url;
+    req.headers = {{"Accept", "application/json"}};
+    req.timeout_ms = 20000;
+    req.max_retries = 0;
+    r = fish::capability::HttpClient::instance().perform(req);
+  }
+  if (!r.ok()) {
+    // 网络抖动不算结束，让前端继续轮询
+    out["ok"] = true;
+    out["done"] = false;
+    return fish::core::Result<std::string>::ok(out.dump());
+  }
+
+  try {
+    const auto j = json::parse(r.value->body);
+    const int code = j.contains("code") && j["code"].is_number() ? j["code"].get<int>() : -1;
+    const auto data = envelope(j);
+    const std::string token = first_str(data, {"accessToken", "access_token", "AccessToken"});
+    if ((code != 0 && code != 200) || token.empty()) {
+      out["ok"] = true;
+      out["done"] = false;   // 用户还没完成
+      return fish::core::Result<std::string>::ok(out.dump());
+    }
+
+    // 拿账号资料，只为展示
+    std::string nickname, uid;
+    {
+      std::map<std::string, std::string> h{{"Accept", "application/json"},
+                                           {"Authorization", "Bearer " + token}};
+      const std::string domain = first_str(data, {"domain", "Domain"});
+      if (!domain.empty()) h["X-Domain"] = domain;
+      fish::capability::HttpRequest req;
+      req.method = "GET";
+      req.url = std::string(kWorkBuddyBase) + kWorkBuddyApiPrefix + "/login/account";
+      req.headers = h;
+      req.timeout_ms = 20000;
+      req.max_retries = 0;
+      if (auto pr = fish::capability::HttpClient::instance().perform(req); pr.ok()) {
+        try {
+          const auto pj = envelope(json::parse(pr.value->body));
+          nickname = first_str(pj, {"nickname", "NickName", "ScreenName"});
+          uid = first_str(pj, {"uid", "Uid", "userId", "UserID"});
+        } catch (const std::exception&) {
+        }
+      }
+    }
+
+    // 落盘：桥接层下次请求读它
+    //
+    // 路径可配：capability.workbuddy.cred_file 配了就写那儿（跨平台部署
+    // 时控制面和桥接层看到的路径不同时，这是唯一能对上的办法）；
+    // 没配就是 data_dir/workbuddy.json（保持原有行为）。
+    //
+    // data_dir 已在构造函数里解析成绝对路径，但目录本身可能还不存在
+    // （首次部署、只带了 config.toml）。先建目录，否则 ofstream 静默失败，
+    // 用户看到「登录成功」而凭据根本没写下去。
+    const std::string path = workbuddy_cred_path();
+    {
+      std::error_code ec;
+      const fs::path parent = fs::path(path).parent_path();
+      if (!parent.empty()) fs::create_directories(parent, ec);
+    }
+    json file;
+    file["version"] = 1;
+    file["access_token"] = token;
+    file["refresh_token"] = first_str(data, {"refreshToken", "refresh_token"});
+    file["expires_at"] = data.value("expiresAt", std::int64_t{0});
+    file["domain"] = first_str(data, {"domain", "Domain"});
+    file["nickname"] = nickname;
+    file["uid"] = uid;
+    file["saved_at"] = now_ms();
+    std::ofstream f(path, std::ios::binary);
+    if (f) {
+      f << file.dump(2);
+      f.close();
+    } else {
+      ::fish::log::log_line(::fish::log::LogLevel::kWarn, "control",
+                            "workbuddy_save_failed")
+          .field("path", path);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = wb_logins_.find(login_id);
+      if (it != wb_logins_.end()) {
+        it->second.done = true;
+        it->second.nickname = nickname;
+        it->second.uid = uid;
+      }
+    }
+
+    out["ok"] = true;
+    out["done"] = true;
+    out["success"] = true;
+    out["nickname"] = nickname;
+    out["uid"] = uid;
+  } catch (const std::exception& e) {
+    out["ok"] = true;
+    out["done"] = false;
+    out["detail"] = e.what();
+  }
+  return fish::core::Result<std::string>::ok(out.dump());
+}
+
+// ── WorkBuddy 凭据查询 ──────────────────────────────────
+
+std::string ControlService::workbuddy_cred_path() {
+  // 优先级：config.toml 的 capability.workbuddy.cred_file > data_dir/workbuddy.json
+  //
+  // 相对路径按 config.toml 所在目录解析（与 data_dir / .env.local 口径一致），
+  // 否则 cwd 一变，凭据就写到别处去了。
+  const std::string configured = resolved("capability.workbuddy", "cred_file");
+  if (!configured.empty()) {
+    const fs::path p(configured);
+    if (p.is_absolute()) return p.lexically_normal().string();
+    const fs::path base = fs::path(cfg_.config_path).parent_path();
+    std::error_code ec;
+    const fs::path joined = base.empty() ? p : (base / p);
+    const fs::path abs = fs::absolute(joined, ec);
+    return (ec ? joined : abs).lexically_normal().string();
+  }
+  return (fs::path(cfg_.data_dir) / "workbuddy.json").lexically_normal().string();
+}
+
+WorkBuddyCredentialResult ControlService::workbuddy_credential() {
+  WorkBuddyCredentialResult out;
+  const std::string path = workbuddy_cred_path();
+
+  std::error_code ec;
+  if (!fs::exists(path, ec) || fs::is_directory(path, ec)) {
+    out.found = false;
+    out.detail = "凭据文件不存在：" + path;
+    return out;
+  }
+
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    out.found = false;
+    out.detail = "凭据文件读不了：" + path;
+    return out;
+  }
+  std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  f.close();
+
+  // 原样透传给桥接层：桥接层已经认识这个格式（access_token /
+  // refresh_token / expires_at / domain / nickname / uid），
+  // 控制面不重复解析，避免两边对「expires_at 是秒还是毫秒」的理解漂移。
+  //
+  // 但要确认它确实是个带 access_token 的 JSON：把一份坏文件当凭据发给
+  // 桥接层，只会让桥接层报一句莫名其妙的 401。
+  try {
+    const auto j = json::parse(body);
+    if (!j.is_object() || !j.contains("access_token") ||
+        !j["access_token"].is_string() || j["access_token"].get<std::string>().empty()) {
+      out.found = false;
+      out.detail = "凭据文件格式不对（缺 access_token）：" + path;
+      return out;
+    }
+  } catch (const std::exception& e) {
+    out.found = false;
+    out.detail = std::string("凭据文件不是合法 JSON：") + e.what();
+    return out;
+  }
+
+  out.found = true;
+  out.body = std::move(body);
+  return out;
+}
+
+std::string ControlService::workbuddy_credential_token() {
+  // 1) 配置里显式给了就用它（用户想跨机用同一个令牌时可以自己填）
+  const std::string configured = resolved("capability.workbuddy", "credential_token");
+  if (!configured.empty()) return configured;
+
+  // 2) 否则用 data/control_credential_token.txt 里的，没有就生成一个
+  //
+  // 为什么放文件而不是放 config.toml：它是一个凭据，config.toml 是
+  // 「非密钥配置」且经常被贴到 issue 里。放 data/ 下（.gitignore 已忽略）
+  // 并设 600 权限，和 .env.local 同一套口径。
+  const fs::path path = fs::path(cfg_.data_dir) / "control_credential_token.txt";
+  std::error_code ec;
+  if (fs::exists(path, ec)) {
+    std::ifstream f(path);
+    std::string tok;
+    std::getline(f, tok);
+    tok = trim(tok);
+    if (!tok.empty()) {
+      std::lock_guard<std::mutex> lock(mu_);
+      wb_credential_token_ = tok;
+      return tok;
+    }
+  }
+
+  // 生成：32 字节随机 → hex
+  std::string raw(32, '\0');
+  if (FILE* rf = std::fopen("/dev/urandom", "rb")) {
+    const auto n = std::fread(raw.data(), 1, raw.size(), rf);
+    std::fclose(rf);
+    if (n != raw.size()) raw.resize(n);
+  }
+  if (raw.size() != 32) {
+    std::uint64_t a = static_cast<std::uint64_t>(now_ms());
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+      raw[i] = static_cast<char>((a >> ((i % 8) * 8)) ^ i);
+    }
+  }
+  static const char* hex = "0123456789abcdef";
+  std::string tok;
+  tok.reserve(raw.size() * 2);
+  for (unsigned char c : raw) {
+    tok += hex[c >> 4];
+    tok += hex[c & 0x0F];
+  }
+
+  fs::create_directories(cfg_.data_dir, ec);
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (f) {
+    f << tok << "\n";
+    f.close();
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+  } else {
+    // 写不下去就退回进程内临时值：本次运行仍然能用（桥接层重启后
+    // 需要重新读文件，那时用户会看到明确报错）。
+    ::fish::log::log_line(::fish::log::LogLevel::kWarn, "control",
+                          "credential_token_write_failed")
+        .field("path", path.string());
+  }
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    wb_credential_token_ = tok;
+  }
+  return tok;
+}
+
+fish::core::Result<std::string> ControlService::workbuddy_test() {
+  // 桥接层是本机的 OpenAI 兼容端点：问一次 /v1/models 就知道它活着没有，
+  // 顺便确认模型名还在目录里。不消耗任何额度。
+  json out;
+  const std::string base = resolved("capability.chat", "base_url");
+  const std::string url =
+      (base.empty() ? std::string("http://127.0.0.1:18091/v1") : base) + "/models";
+
+  fish::capability::HttpRequest req;
+  req.method = "GET";
+  req.url = url;
+  req.headers = {{"Accept", "application/json"}};
+  req.timeout_ms = 8000;
+  req.max_retries = 0;
+  auto r = fish::capability::HttpClient::instance().perform(req);
+  if (!r.ok()) {
+    out["ok"] = false;
+    out["error"] = "bridge_unreachable";
+    out["detail"] = "桥接层没响应（" + url + "），先启动 WorkBuddy 桥接";
+    return fish::core::Result<std::string>::ok(out.dump());
+  }
+  try {
+    const auto j = json::parse(r.value->body);
+    json ids = json::array();
+    for (const auto& m : j.value("data", json::array())) {
+      if (m.is_object() && m.contains("id")) ids.push_back(m["id"]);
+    }
+    out["ok"] = true;
+    out["models"] = ids;
+    // 登录状态：问桥的 /v1/whoami（只读诊断端点，回答「桥现在实际拿谁在发请求」，
+    // 可能还会热重载 cred-file），而不是看 data/workbuddy.json 文件存在与否。
+    fish::capability::HttpRequest who;
+    who.method = "GET";
+    who.url = (base.empty() ? std::string("http://127.0.0.1:18091/v1") : base) + "/whoami";
+    who.headers = {{"Accept", "application/json"}};
+    who.timeout_ms = 8000;
+    who.max_retries = 0;
+    auto w = fish::capability::HttpClient::instance().perform(who);
+    if (w.ok()) {
+      try {
+        const auto wj = json::parse(w.value->body);
+        for (const char* k : {"region", "domain", "nickname", "source", "expires_in"}) {
+          if (wj.contains(k)) out[k] = wj[k];
+        }
+        out["logged_in"] = wj.value("logged_in", false);
+      } catch (const std::exception&) {
+        out["logged_in"] = false;
+        out["source"] = "none";
+      }
+    } else {
+      out["logged_in"] = false;
+      out["source"] = "none";
+    }
+  } catch (const std::exception& e) {
+    out["ok"] = false;
+    out["error"] = "parse_failed";
+    out["detail"] = e.what();
+  }
+  return fish::core::Result<std::string>::ok(out.dump());
+}
+
 // ── QQ 扫码 ─────────────────────────────────────────────
 
 fish::core::Result<std::string> ControlService::qq_qr_create(const std::string& source) {
@@ -1301,18 +2314,32 @@ fish::core::Result<std::string> ControlService::qq_qr_status(const std::string& 
         return fish::core::Result<std::string>::ok(out.dump());
       }
 
-      // 扫码成功即落盘：用户扫完就该能用，不该再让他手抄两串密钥
-      if (auto e = set_secret("channel.qq_official", "app_id", app_id); !e.ok()) {
-        json out{{"status", "error"}, {"detail", "save_app_id:" + e.detail}};
-        return fish::core::Result<std::string>::ok(out.dump());
-      }
-      if (auto e = set_secret("channel.qq_official", "app_secret", *secret.value); !e.ok()) {
-        json out{{"status", "error"}, {"detail", "save_secret:" + e.detail}};
-        return fish::core::Result<std::string>::ok(out.dump());
-      }
+      // 扫码成功即落盘：用户扫完就该能用，不该再让他手抄两串密钥。
+      //
+      // 整段（config.toml + .env.local）必须在 mu_ 里：apply_config_json
+      // 也持 mu_ 写同一份文件，两处并发会各自基于旧快照 save，后写的
+      // 把前一次改动整段覆盖掉。本函数入口只在读 qq_task_ 时短暂持锁，
+      // 这里重新加锁不会自锁。
       {
+        std::lock_guard<std::mutex> lock(mu_);
         ConfigFile cf(cfg_.config_path);
-        cf.load();
+        if (auto e = cf.load(); !e.ok()) {
+          json out{{"status", "error"}, {"detail", "load_config:" + e.detail}};
+          return fish::core::Result<std::string>::ok(out.dump());
+        }
+        bool cf_changed = false;
+        if (auto e = set_secret(cf, "channel.qq_official", "app_id", app_id,
+                                &cf_changed);
+            !e.ok()) {
+          json out{{"status", "error"}, {"detail", "save_app_id:" + e.detail}};
+          return fish::core::Result<std::string>::ok(out.dump());
+        }
+        if (auto e = set_secret(cf, "channel.qq_official", "app_secret",
+                                *secret.value, &cf_changed);
+            !e.ok()) {
+          json out{{"status", "error"}, {"detail", "save_secret:" + e.detail}};
+          return fish::core::Result<std::string>::ok(out.dump());
+        }
         cf.set("channel.qq_official", "enabled", "true");
         if (auto e = cf.save(); !e.ok()) {
           ::fish::log::log_line(::fish::log::LogLevel::kWarn, "control", "enable_qq_failed")
@@ -1414,13 +2441,21 @@ fish::core::Result<std::string> ControlService::wechat_qr_status(const std::stri
         json out{{"status", "error"}, {"detail", "confirmed_without_token"}};
         return fish::core::Result<std::string>::ok(out.dump());
       }
-      if (auto e = set_secret("channel.wechat", "bot_token", token); !e.ok()) {
-        json out{{"status", "error"}, {"detail", "save_token:" + e.detail}};
-        return fish::core::Result<std::string>::ok(out.dump());
-      }
+      // 同 qq_qr_status：整段落盘持 mu_，避免与 apply_config_json 并发
+      // 各自基于旧快照 save 互相覆盖。
       {
+        std::lock_guard<std::mutex> lock(mu_);
         ConfigFile cf(cfg_.config_path);
-        cf.load();
+        if (auto e = cf.load(); !e.ok()) {
+          json out{{"status", "error"}, {"detail", "load_config:" + e.detail}};
+          return fish::core::Result<std::string>::ok(out.dump());
+        }
+        bool cf_changed = false;
+        if (auto e = set_secret(cf, "channel.wechat", "bot_token", token, &cf_changed);
+            !e.ok()) {
+          json out{{"status", "error"}, {"detail", "save_token:" + e.detail}};
+          return fish::core::Result<std::string>::ok(out.dump());
+        }
         cf.set("channel.wechat", "enabled", "true");
         if (!base.empty()) cf.set("channel.wechat", "bot_base_url", base);
         if (auto e = cf.save(); !e.ok()) {

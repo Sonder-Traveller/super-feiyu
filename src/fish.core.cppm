@@ -21,7 +21,7 @@ using TimePoint = Clock::time_point;
 // ── 领域类型 ────────────────────────────────────────────
 enum class Channel : std::uint8_t { kQQ, kWeChat };
 enum class ChatKind : std::uint8_t { kPrivate, kGroup };
-enum class BlockKind : std::uint8_t { kText, kImage, kVoice };
+enum class BlockKind : std::uint8_t { kText, kImage, kVoice, kFile };
 
 // 发言人信息：让模型知道「谁在说」。
 // 群聊里这一点尤其重要——同一个人可能换昵称、多个人的观点要区分。
@@ -47,6 +47,8 @@ struct ContentBlock {
   std::string text;
   std::string media_url;
   std::string mime;
+  // 文件名（kFile 用）。上游靠扩展名选解析器，必须带。
+  std::string filename;
   // 说话人角色："user"（对方）| "assistant"（自己）。
   // 必须显式携带：只靠「对方: / 我:」文字前缀区分，
   // 模型会把双方的话混为一谈（身份混淆、把自己说的话当成对方的要求）。
@@ -91,6 +93,19 @@ struct OutboundMessage {
   std::string reply_to_message_id;
   std::vector<ContentBlock> blocks;
   std::string context_token;
+  // 会话类型（群 / 私聊）。
+  //
+  // 为什么要显式携带：渠道层的 conversation_id 只放原始 openid /
+  // group_id（"g:" 前缀只属于会话键），出站时没法从 id 本身判断出
+  // 群还是私聊。以前靠「收到消息时把群 id 记进集合」反推，于是：
+  //   - 服务重启后、群里还没发过消息时，机器人主动往群里发消息 →
+  //     走 /v2/users/<group_id> → 消息发到了私聊；
+  //   - QQ 官方与 QQ 小号各有一份集合，跨通道不共享。
+  // 群/私聊是**消息的属性**，必须随消息一起传下去。
+  //
+  // 默认私聊：所有构造点都是「回复一条已知 incoming 消息」，
+  // 编排层会显式填上 msg.kind。
+  ChatKind kind{ChatKind::kPrivate};
 };
 
 struct ChannelCapability {
@@ -164,6 +179,14 @@ class IChatModel {
     double temperature{-1.0};
     // 可用工具的 OpenAI tools JSON 数组（空 = 不启用工具）
     std::string tools_json;
+    // 历史里每条 assistant 消息对应的 server_tool_calls 原始 JSON。
+    //
+    // DeepSeek 服务端联网工具（deepseek_web_search / deepseek_read_url）
+    // 的调用记录必须**原样回传**，否则之前读过的网页正文（signature）
+    // 不在上下文里。按顺序一一对应 history 里的 assistant 消息：
+    // 第 i 项对应第 i 条 assistant 消息，空串表示那条消息没有
+    // 服务端工具调用。
+    std::vector<std::string> assistant_server_tools_json;
   };
   struct Response {
     std::string text;
@@ -173,6 +196,11 @@ class IChatModel {
     // 模型要求调用的工具（可能多个）
     std::vector<ToolCall> tool_calls;
     [[nodiscard]] bool wants_tools() const { return !tool_calls.empty(); }
+    // DeepSeek 服务端联网工具（deepseek_web_search / deepseek_read_url）的
+    // 原始调用记录与引用，多轮回传时必须原样发回，否则之前读过的网页
+    // 不在上下文里。JSON 数组文本，空 = 本轮未用。
+    std::string server_tool_calls_json;
+    std::string annotations_json;
   };
   virtual ~IChatModel() = default;
   virtual Result<Response> complete(const Request& req) = 0;

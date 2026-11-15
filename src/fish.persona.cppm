@@ -31,6 +31,11 @@ namespace fs = std::filesystem;
 //
 // 查找顺序：会话覆盖 → 全局默认 → 空。
 // 空就是「没人设」，模型以裸状态说话，由用户自己填。
+//
+// 注意：persona_for() 在「该会话没有覆盖」时会回退到全局默认（通常非空），
+// 所以调用方**不能**用它的返回值判空来区分「有没有会话级覆盖」——
+// 那会让「无覆盖 → 退到 bot 级」的分支永远走不到。
+// 判断有没有覆盖请用 has_override()。
 class PersonaStore {
  public:
   struct Config {
@@ -49,6 +54,7 @@ class PersonaStore {
   fish::core::Error set_default_persona(const std::string& text);
 
   // 某会话的人格。没有覆盖时返回全局默认。
+  // 想区分「有覆盖」和「回退到默认」，用 has_override()。
   fish::core::Result<std::string> persona_for(const std::string& conv_id) const;
 
   // 设某会话的人格覆盖。空串 = 取消覆盖。
@@ -86,8 +92,20 @@ namespace {
 // 会话 id → 安全文件名。
 // conv_id 可能是 "g:123456" 这种带冒号的，也可能是 QQ openid 长串，
 // 直接当文件名跨平台不安全。用 FNV-1a 哈希，稳定且无依赖。
+//
+// ⚠ 偏移基是**项目自定义的 FNV-1a 变体**，不是标准值：
+//   这里   1469598103934665603   （19 位，少一位）
+//   标准   14695981039346656037  （20 位）
+// 故意保持现状，**不要"顺手修正"**：conv_id → 文件名的映射只在本项目内部用，
+// 读写走同一个函数、自洽即可，没有任何外部工具依赖这个哈希值。
+// 一旦改成标准值，已有的 data/persona/sessions/*.md 会**全部命中不到** ——
+// 用户之前存的人格会静默回退到全局默认人格，界面上看不出任何异常。
+//
+// 真要改，必须同时实现「旧名 → 新名」迁移：读时先试新名，没有再回退旧名。
+// 同样的偏移基也用在 src/fish.media.cppm（内容寻址去重）和
+// src/fish.memory.cppm（内容哈希），改动需一并评估。
 std::string safe_filename(const std::string& conv_id) {
-  std::uint64_t h = 1469598103934665603ULL;
+  std::uint64_t h = 1469598103934665603ULL;  // 非标准偏移基，见上方说明：不要改
   for (const unsigned char c : conv_id) {
     h ^= c;
     h *= 1099511628211ULL;

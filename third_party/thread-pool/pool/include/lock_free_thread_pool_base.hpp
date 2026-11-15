@@ -387,6 +387,14 @@ private:
         Derived* derived = static_cast<Derived*>(this);
         ThreadStatSlot& my_stats = worker_stats_[worker_id];
 
+        // 空闲退避计数。队列连续空转时递增，拿到任务时清零。
+        //
+        // 为什么需要它：原来队列空时只调 yield()，而没有其他线程可调度时
+        // yield 会立刻返回，于是 24 个线程变成纯自旋。实测 9 个线程跑到
+        // 99.9% CPU，12 分钟烧掉 4 小时 46 分 CPU 时间，却一条消息都没处理。
+        // 现在改成阶梯退避：先自旋几次（覆盖突发任务），再逐级加大 sleep。
+        int idle_spin = 0;
+
         while (POOL_UNLIKELY(
                    !stop_.load(std::memory_order_acquire))
                || active_tasks_.load(std::memory_order_acquire) > 0)
@@ -394,6 +402,7 @@ private:
             Task task{};
             if (POOL_LIKELY(task_queue_.dequeue(task)))
             {
+                idle_spin = 0;   // 有活干，重置退避
                 try
                 {
                     derived->execute_task(std::move(task));
@@ -412,8 +421,31 @@ private:
             }
             else
             {
-                // 队列空，退避
-                std::this_thread::yield();
+                // 队列空：阶梯退避，避免纯自旋烧 CPU。
+                //
+                // 注意 sleep 不能太短。第一版用 100µs，结果每个线程每秒
+                // 醒来一万次，8 个线程仍占 55% CPU——sleep 本身也是成本
+                // （陷入内核 + 定时器 + 调度）。
+                // 现在最长睡 5ms：任务入队后最坏多等 5ms，
+                // 而一次模型调用要几百毫秒，5ms 完全不影响体验。
+                ++idle_spin;
+                if (idle_spin < 64)
+                {
+                    std::this_thread::yield();
+                }
+                else if (idle_spin < 512)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                else if (idle_spin < 4096)
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+                else
+                {
+                    // 长期空闲：睡 5ms。CPU 占用应降到接近 0。
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
             }
         }
 

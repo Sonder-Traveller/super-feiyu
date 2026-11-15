@@ -7,6 +7,7 @@ cmake-build-*/
 
 # 二维码 / 绑定日志（含临时凭据痕迹）
 .qq_*.png
+.wechat_qr.png
 .qq_*.log
 .qq_*.err
 .bridge.log

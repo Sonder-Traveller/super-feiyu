@@ -127,7 +127,7 @@ struct Attachment {
 struct Event {
   std::string type;              // GROUP_AT_MESSAGE_CREATE / C2C_MESSAGE_CREATE / READY
   std::string message_id;        // 被动回复凭证
-  std::string conversation_id;   // "g:<openid>" 或 "<openid>"
+  std::string conversation_id;   // 群：group_openid；私聊：user_openid（不带 "g:" 前缀）
   std::string sender_id;
   std::string sender_name;
   // 群名片（群内昵称，可能与全局昵称不同）
@@ -475,7 +475,9 @@ void Client::parse_dispatch(const std::string& type, const json& d) {
     ev.mentioned = true;  // 该事件本身就是 @ 机器人
     ev.message_id = d.value("id", "");
     const std::string group = d.value("group_openid", "");
-    ev.conversation_id = "g:" + group;
+    // 只放原始 openid：群聊前缀 "g:" 由 fish.session::session_key() 统一加，
+    // 这里再加一次会得到 "g:g:<openid>"，与记忆/人格用的键错位。
+    ev.conversation_id = group;
     if (d.contains("author") && d["author"].is_object()) {
       const auto& a = d["author"];
       ev.sender_id = a.value("id", "");

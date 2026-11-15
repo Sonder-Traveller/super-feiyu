@@ -11,10 +11,11 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 | 项 | 状态 |
 |---|---|
-| 构建 | ✅ clang 20 个 C++20 模块，一次通过 |
+| 构建 | ✅ clang 22 个 C++20 模块，一次通过 |
 | 测试 | ✅ 258 项断言（5 个套件，全绿） |
 | 通道 | ✅ QQ 官方 WS / QQ 小号 OneBot WS / 微信 / 本地 |
 | 记忆 | ✅ 三层 + 巩固 + 检索 + 索引重建 |
+| 文档输入 | ✅ PDF / Office / 图片 / 表格解析（`fish.doc` 独立层） |
 | 部署 | ✅ systemd 用户服务，已实测启动/停止/重连 |
 | 真实 API | ✅ 硅基流动免费模型（embedding/STT）已验证 |
 
@@ -44,7 +45,7 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 
 ---
 
-## 架构：20 个 C++20 模块
+## 架构：22 个 C++20 模块
 
 ```
               main.cpp (runtime)
@@ -59,6 +60,7 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
   qq_ws    DeepSeek     L2 短时
  onebot_ws 硅基流动     L3 长时（旁路文件 + 索引）
     │      Edge-TTS
+    │      文档解析（fish.doc）
     ws (libcurl WebSocket 底层)
 ```
 
@@ -71,12 +73,14 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 | `fish.config` | TOML + 环境变量展开 |
 | `fish.memory` | **三层记忆**（核心） |
 | `fish.capability` | 多 provider 统一接口 + 熔断 |
+| `fish.doc` | **文档解析层**（PDF/Office/图片/表格） |
 | `fish.probe` | 上游能力探测与缓存 |
 | `fish.media` | 媒体去重缓存（内容哈希） |
 | `fish.image` | 立绘库（manifest 权威 + 目录扫描） |
 | `fish.meme` | 热梗库（本地优先 + 命中计数） |
 | `fish.session` | 会话注册表 + 每会话互斥 |
 | `fish.persona` | 人格分层拼装（稳定前缀 / 动态后缀） |
+| `fish.control` | 配置 / 凭据 / 扫码绑定的控制面服务实现 |
 | `fish.api` | 控制面 HTTP API（人格管理，带鉴权） |
 | `fish.tool` | 工具注册表（记忆/图片/搜索/抓取/梗） |
 | `fish.guard` | 输入注入防护 + 输出脱敏 + 限流 |
@@ -87,7 +91,8 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 | `fish.dispatcher` | 线程池调度，通道线程只投递 |
 | `fish.orchestrator` | 流水线、被动策略、预算、去重 |
 
-> 模块必须按依赖顺序编译，见 `build.sh` 里的 `MODULES` 数组。
+> 模块必须按依赖顺序编译，见 `build.sh` 里的 `MODULES` 数组；
+> `CMakeLists.txt` 的 `fish_modules` 源文件列表与它保持同一顺序。
 
 ---
 
@@ -136,8 +141,23 @@ C++20 实现的「大肥鱼」机器人内核 —— DeepSeek 拟人化鲸鱼娘
 | 语音识别 | `siliconflow/SenseVoiceSmall` | **免费** |
 | 语音合成 | `edge` | **免费，无需 key** |
 | 搜索 | `none` | — |
+| 文档 | `none` | 按页计费（启用后） |
+| 生图 | `none` | — |
+
+各能力的 provider 清单（**只列真托管 DeepSeek 的厂商**）：
+
+| 能力 | 可选 provider |
+|---|---|
+| 对话 | `deepseek` `workbuddy` |
+| 向量 | `ark` `dashscope` `qianfan` `siliconflow` `workbuddy` |
+| 语音识别 | `dashscope` `deepseek` `siliconflow` `volcengine` |
+| 语音合成 | `dashscope` `deepseek` `edge` `siliconflow` `volcengine` |
+| 搜索 | `bocha` `brave` `deepseek` `exa` `generic` `google` `jina` `none` `searxng` `serper` `tavily` `zhipu` |
+| 文档 | `deepseek` `none` |
+| 生图 | `bridge` `openai` `siliconflow` |
 
 > DeepSeek 没有 embeddings 接口，向量必须另配。见 [ADR-008](docs/decisions/008-two-vendor-keys.md)。
+> 清单以 `src/fish.capability.cppm` 的 `*_provider_list()` 为准。
 
 ---
 
@@ -172,6 +192,7 @@ curl -fsSL https://raw.githubusercontent.com/nlohmann/json/v3.11.3/single_includ
 ./deploy/install.sh
 
 # 填配置与密钥
+cp config.example.toml ~/super-feiyu/config.toml   # 先复制模板再改
 vim ~/super-feiyu/config.toml    # 启用通道
 vim ~/super-feiyu/.env           # 填 key
 
@@ -180,7 +201,28 @@ systemctl --user start super-feiyu
 journalctl --user -u super-feiyu -f
 ```
 
+配置模板见 [config.example.toml](config.example.toml)：它是**出厂模板**，
+实际运行的配置在 `config.toml`（已 gitignore，不入库）。
+密钥一律用 `${VAR}` 引用，不写明文。
+
 详见 [deploy/README.md](deploy/README.md)。
+
+---
+
+## GUI 控制台
+
+`gui/app.py`（Flet）连控制面 API，管人格与通道：
+
+```powershell
+pip install flet
+python gui\app.py
+```
+
+「人格」页从 `GET /v1/conversations` 拉会话登记表，渲染成**卡片列表**
+（群名 / 昵称 / 渠道图标），**点卡片**直接进该会话的人格编辑——
+不需要手工输会话 ID。扫码绑定 QQ / 微信、扫码登录 WorkBuddy 也在这里。
+
+详见 [docs/GUI_ANDROID.md](docs/GUI_ANDROID.md)。
 
 ---
 
@@ -194,7 +236,7 @@ journalctl --user -u super-feiyu -f
 实测输出：
 
 ```
-✓ 构建（20 个模块）
+✓ 构建（22 个模块）
 ✓ 单元测试        (173 项)
 ✓ 协议测试        ( 24 项)
 ✓ 生命周期测试    ( 21 项)
@@ -227,16 +269,24 @@ journalctl --user -u super-feiyu -f
 把本机已登录的 WorkBuddy 接入，**独立进程，本体零改动**：
 
 ```bash
-python3 bridge/workbuddy_bridge.py --port 18081
+# 启动命令必须带 --cred-file，否则 GUI「扫码登录 WorkBuddy」
+# 写入的凭据（data/workbuddy.json）不会被桥读取，登录等于白发
+python3 bridge/workbuddy_bridge.py --port 18091 \
+    --cred-file ~/super-feiyu/data/workbuddy.json
 ```
 
 ```toml
 [capability.chat]
-provider = "openai"
-base_url = "http://127.0.0.1:18081/v1"
+provider = "workbuddy"
+base_url = "http://127.0.0.1:18091/v1"
+api_key = "bridge-local"   # 桥接层不校验 key，非空即可
+model = "deep-model"
 ```
 
-详见 [bridge/README.md](bridge/README.md)。
+诊断登录状态：`curl http://127.0.0.1:18091/v1/whoami`
+（`source` = `cred-file` / `vault` / `none`）。
+
+详见 [bridge/README.md](bridge/README.md) 与 [deploy/README.md](deploy/README.md)。
 
 ---
 
@@ -244,11 +294,16 @@ base_url = "http://127.0.0.1:18081/v1"
 
 | 文档 | 内容 |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | 总览 |
+| [docs/architecture.md](docs/architecture.md) | 总览 + 模块清单 |
 | [docs/modules/memory.md](docs/modules/memory.md) | **三层记忆**（重点） |
 | [docs/modules/capability.md](docs/modules/capability.md) | 多 provider |
+| [docs/modules/doc.md](docs/modules/doc.md) | 文档解析层 |
 | [docs/modules/transport.md](docs/modules/transport.md) | 通道与协议 |
 | [docs/modules/orchestrator.md](docs/modules/orchestrator.md) | 流水线 |
+| [docs/CONTROL_API.md](docs/CONTROL_API.md) | 控制面 API 契约 |
+| [docs/API.md](docs/API.md) | 控制面 API 速查 |
+| [docs/GUI_ANDROID.md](docs/GUI_ANDROID.md) | GUI / Android APP |
+| [config.example.toml](config.example.toml) | **配置模板**（复制成 config.toml） |
 | [deploy/README.md](deploy/README.md) | 生产部署与排查 |
 | [bridge/README.md](bridge/README.md) | 桥接层 |
 | [docs/decisions/](docs/decisions/) | 8 条 ADR |

@@ -48,9 +48,8 @@ provider = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
 model = "deepseek-flash"
-max_tokens = 512
-temperature = 1.0
-timeout_ms = 15000
+# max_tokens / temperature 不写 = 不发送 = 用上游默认值
+timeout_ms = 30000
 
 [capability.embedding]
 provider = "siliconflow"

@@ -25,6 +25,82 @@ git clone <repo> && cd super-feiyu
 └── bridge/                  WorkBuddy 桥接层（可选）
 ```
 
+## WorkBuddy 桥接层（手动启动）
+
+桥不是 super-feiyu 拉起的，是独立进程、手动启动。
+
+### 同机部署：--cred-file
+
+```bash
+# data_dir 的解析口径与 fish.control.cppm 一致：相对 "data" 按 config.toml
+# 所在目录解析，部署后即 ~/super-feiyu/data
+cd ~/super-feiyu
+python3 bridge/workbuddy_bridge.py --port 18091 \
+    --cred-file ~/super-feiyu/data/workbuddy.json
+```
+
+- 文件暂时不存在不是错误：还没点「登录 WorkBuddy」时桥会提示并在
+  下一次请求时自动重载（登录后无需重启桥）。
+- 诊断登录状态：`curl http://127.0.0.1:18091/v1/whoami`
+  （`source` = `control` / `cred-file` / `vault` / `none`）。
+
+### 跨平台部署：--control-url（控制面在 WSL、桥在 Windows）
+
+**这是「GUI 扫码登录对对话零效果」的根因所在**：两个环境共享同一个
+Windows 仓库目录，但**看到的路径不是同一个**——
+
+| | 控制面（WSL）写入 | 桥接层（Windows）读取 |
+|---|---|---|
+| 路径 | `~/super-feiyu/data/workbuddy.json` | `C:\Users\Assistant\projects\super-feiyu\data\workbuddy.json` |
+| 同一个文件吗 | ❌ 不是 | ❌ 不是 |
+
+所以必须让桥**通过 HTTP 向控制面要凭据**，绕开文件系统视图：
+
+```bash
+# Windows 宿主上启动桥接层
+# 控制面在 WSL 里跑，WSL2 mirrored networking 下 Windows → WSL 的
+# 127.0.0.1 是通的（反之亦然）。
+$env:FEIYU_CREDENTIAL_TOKEN = (Get-Content \\wsl$\Ubuntu\home\Assistant\super-feiyu\data\control_credential_token.txt).Trim()
+
+python bridge/workbuddy_bridge.py --port 18091 `
+    --control-url http://127.0.0.1:8765 `
+    --control-token $env:FEIYU_CREDENTIAL_TOKEN
+```
+
+也可以用环境变量省掉 `--control-token`：
+
+```cmd
+set FEIYU_CREDENTIAL_TOKEN=<令牌>
+python bridge\workbuddy_bridge.py --port 18091 --control-url http://127.0.0.1:8765
+```
+
+**令牌从哪来**：控制面首次访问凭据端点时自动生成，写在
+`data/control_credential_token.txt`（权限 600）。也可以在 `config.toml`
+的 `capability.workbuddy.credential_token` 里显式指定（此时它按密钥
+处理，值写 `${VAR}` 引用 `.env.local` 里的变量）。
+
+**控制面侧配置**（`config.toml`）：
+
+```toml
+[capability.workbuddy]
+# 凭据落盘路径。留空 = data/workbuddy.json（控制面自己读）。
+# 跨平台时可以让控制面直接写到桥接层能读到的路径：
+cred_file = "/mnt/c/Users/Assistant/projects/super-feiyu/data/workbuddy.json"
+# 桥接层拉凭据用的独立令牌。留空 = 自动生成到 data/control_credential_token.txt
+credential_token = ""
+```
+
+**优先级**：`control`（控制面拉的）> `cred-file`（本地文件）> `vault`。
+控制面拉不到（不可达 / 还没登录）时自动退回 `--cred-file`，再退回 vault，
+日志里会写明当前用的是哪一个。
+
+**安全**：凭据端点返回明文 token，只认凭据专用令牌（对白名单路径生效）。
+`api.bind = "0.0.0.0"` 时它对整个局域网可达——请确保令牌足够强，或把
+`bind` 改回 `127.0.0.1`。控制面启动时会打一条
+`credential_endpoint_exposed` 警告。
+
+详细文档见 `bridge/README.md`。
+
 ## 最小可用配置
 
 ### 只跑 QQ 小号（推荐给个人）

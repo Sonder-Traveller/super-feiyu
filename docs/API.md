@@ -1,7 +1,9 @@
 # 控制面 API
 
-只暴露 HTTP 接口，不带界面，由另一个进程调用。
-用于管理人格（全局默认 + 每会话覆盖）。
+只暴露 HTTP 接口，不带界面，由另一个进程（GUI）调用。
+用于管理人格（全局默认 + 每会话覆盖）、通道配置与凭据绑定。
+
+完整的端点契约见 [CONTROL_API.md](CONTROL_API.md)（本文只列常用部分）。
 
 ## 开启
 
@@ -42,11 +44,37 @@ Authorization: Bearer <FEIYU_API_TOKEN>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 探活，免鉴权 |
+| GET | `/v1/status` | 运行时状态 |
+| GET | `/v1/config` | 读当前生效配置 |
+| PUT | `/v1/config` | 部分更新配置 |
+| POST | `/v1/restart` | 优雅退出并重启 |
+| GET | `/v1/conversations` | 会话登记表（GUI 卡片列表数据源） |
 | GET | `/v1/persona/default` | 读全局默认人格 |
 | PUT | `/v1/persona/default` | 写全局默认人格 |
+| GET | `/v1/persona/list` | 人格清单（全局 + 各会话） |
 | GET | `/v1/persona/session?conv_id=X` | 读某会话人格 |
 | PUT | `/v1/persona/session?conv_id=X` | 设某会话人格 |
 | DELETE | `/v1/persona/session?conv_id=X` | 清除会话覆盖，回落到全局 |
+| POST | `/v1/capability/workbuddy/login` | 发起 WorkBuddy 扫码登录 |
+| GET | `/v1/capability/workbuddy/login/status?login_id=X` | WorkBuddy 登录状态 |
+| POST | `/v1/capability/workbuddy/test` | 测桥接层连通性 |
+
+### 会话列表：点选，不手输
+
+会话人格的 `conv_id` **不需要用户手工输入**。GUI 从 `GET /v1/conversations`
+拉会话登记表，渲染成卡片列表（群名 / 昵称 / 渠道图标），点卡片直接进入该会话的人格编辑。
+
+```bash
+# 列出机器人见过的所有会话
+curl -H "Authorization: Bearer $TOKEN" $B/v1/conversations
+# → {"conversations":[
+#      {"key":"g:123456","channel":"qq","kind":"group",
+#       "title":"测试群","sender_name":"张三","sender_id":"oABC...",
+#       "last_active_ms":1730000000000,"handled":12}]}
+```
+
+返回的 `key` 就是 `conv_id`（群聊带 `g:` 前缀，私聊是原始 openid），
+直接拿它填 `/v1/persona/session?conv_id=`。
 
 ### 示例
 
@@ -56,6 +84,9 @@ B=http://127.0.0.1:8765
 
 # 探活
 curl $B/healthz
+
+# 列出会话（拿 conv_id 的正常途径）
+curl -H "Authorization: Bearer $TOKEN" $B/v1/conversations
 
 # 读全局人格
 curl -H "Authorization: Bearer $TOKEN" $B/v1/persona/default
@@ -114,3 +145,4 @@ data/persona/sessions/<hash>.md     会话覆盖
 | 401 | 未授权 |
 | 404 | 路径不存在 |
 | 500 | 存储读写失败 |
+| 502 | 上游（q.qq.com / ilinkai / WorkBuddy 上游）返回异常 |

@@ -57,7 +57,8 @@ using Handler = std::function<int(Task&)>;
 class Dispatcher {
  public:
   struct Config {
-    // 工作线程数。0 表示按硬件并发数（但至少 2）。
+    // 工作线程数。0 = 自动：min(核数, 8)，至少 2。
+    // 任务以等网络为主，线程开太多没收益，反而每个线程的调度都是成本。
     std::size_t threads{0};
     // 队列容量，必须是 2 的幂。满了会阻塞提交方（背压），
     // 这是有意的：宁可让通道线程等一下，也不要丢消息。
@@ -118,9 +119,18 @@ class Dispatcher {
 Dispatcher::Dispatcher(Config cfg) : cfg_(cfg) {
   threads_ = cfg.threads;
   if (threads_ == 0) {
+    // 默认线程数 = 核数，上限 4。
+    //
+    // 目标任务机是 2 核 1G，所以默认就是 2 个。
+    // 之前直接 hardware_concurrency()，24 核机器上起 24 个线程，
+    // 每个都空转，纯属浪费。
+    //
+    // 上限 4 而不是 8：线程只负责「等模型返回 + 本地 IO」，
+    // 2 核上 4 个线程已经能并发处理多个会话，再多只是增加调度成本。
+    // 要更多可以在配置里写 dispatcher.threads。
     const auto hw = std::thread::hardware_concurrency();
     threads_ = hw == 0 ? 2 : static_cast<std::size_t>(hw);
-    // 至少 2 个，保证一个慢会话不拖死所有其他会话
+    if (threads_ > 4) threads_ = 4;
     if (threads_ < 2) threads_ = 2;
   }
 

@@ -42,13 +42,15 @@ add_library(fish_modules OBJECT
   src/fish.config.cppm
   src/fish.memory.cppm
   src/fish.capability.cppm
+  src/fish.doc.cppm
   src/fish.probe.cppm
   src/fish.media.cppm
   src/fish.image.cppm
   src/fish.meme.cppm
   src/fish.persona.cppm
-  src/fish.api.cppm
   src/fish.session.cppm
+  src/fish.control.cppm
+  src/fish.api.cppm
   src/fish.tool.cppm
   src/fish.guard.cppm
   src/fish.ws.cppm

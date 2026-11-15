@@ -3,6 +3,10 @@
 > 职责：把"调用某类远程能力"抽象成统一接口，
 > **配置哪一家的 key 都能用**，上层代码零改动。
 
+> **文档解析不在本模块**：文档有自己的失败模式（页数超限、加密、解析超时）
+> 和成本模型（按页计费），已独立成 `fish.doc` 层。
+> 见 [doc.md](doc.md)。
+
 ---
 
 ## 1. 核心设计：能力 × 厂商 二维解耦
@@ -86,8 +90,8 @@ struct ChatParams {
   std::string system_prompt;              // 稳定前缀
   std::vector<ContentBlock> history;
   std::vector<ContentBlock> user_blocks;
-  int max_tokens = 512;
-  double temperature = 1.0;
+  int max_tokens = 0;                      // 0 = 不发送，用上游默认值
+  double temperature = -1.0;               // 负数 = 不发送，用上游默认值
   bool json_mode = false;                 // 结构化输出
 };
 
@@ -96,6 +100,11 @@ struct ChatResult {
   Usage usage;   // prompt / cached / output
 };
 ```
+
+> **不主动设上限**：`max_tokens` / `temperature` 默认不发送，
+> 让上游用自己的默认值。写死等于替上游设一个它没要求的限制——
+> 模型该输出多长、多随机，交给上游和提示词决定。
+> 见 [docs/PROMPTS.md](../PROMPTS.md)。
 
 **统一处理要点**：
 
@@ -135,16 +144,21 @@ struct SttParams {
 };
 ```
 
-**免费预设**（按推荐序）：
+**可用 provider**（`stt_provider_list()`）：
 
 | Provider | 模型 | 免费额度 | Base URL |
 |---|---|---|---|
 | `siliconflow` | `FunAudioLLM/SenseVoiceSmall` | 免费（需实名） | `https://api.siliconflow.cn/v1` |
-| `groq` | `whisper-large-v3-turbo` | 有免费额度 | `https://api.groq.com/openai/v1` |
-| `openai` | `whisper-1` | 无（付费） | `https://api.openai.com/v1` |
-| `local` | 任意 OpenAI 兼容 | 自建 | 可配 |
+| `deepseek` | DeepSeek 语音接口 | 按量 | `https://api.deepseek.com` |
+| `dashscope` | 阿里 Paraformer | 按量 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `volcengine` | 火山引擎录音文件识别 | 按量 | 火山控制台 |
 
 **推荐 siliconflow**：与 embedding 共用一把 key，一个账号解决两项。
+
+各家差异只有三处：**路径 / 模型名 / 是否强制 WAV**，按 provider 自动套用：
+
+- `need_wav16k = true` —— 强制转 16k 单声道 WAV（百度需要）
+- `max_upload_bytes` —— 上传大小上限，0 = 不限（DeepSeek 是 8388608）
 
 ### 3.4 语音合成 ITextToSpeech
 
@@ -156,16 +170,20 @@ struct TtsParams {
 };
 ```
 
-**免费预设**：
+**可用 provider**（`tts_provider_list()`）：
 
 | Provider | 说明 | key |
 |---|---|---|
-| `edge` | 微软 Edge 在线语音 | **不需要** |
-| `siliconflow` | 付费（CosyVoice 等） | 需要 |
-| `openai` | `tts-1`，付费 | 需要 |
-| `doubao` | 火山豆包语音，约 1 元/分钟 | 需要 |
+| `edge` | 本机 edge-tts（微软音色） | **不需要** |
+| `siliconflow` | CosyVoice2（voice 要带前缀） | 需要 |
+| `dashscope` | CosyVoice（非流式返回音频 URL，两跳） | 需要 |
+| `volcengine` | 火山引擎，**用 v1 接口**（v3 是流式的，没有「一次返回完整文件」的形态） | app_id + access_token 两套 |
+| `deepseek` | DeepSeek 语音接口 | 需要 |
 
 **默认 edge**：零成本、零配置。风险是非官方接口，需可降级。
+
+火山专用字段：`app_id`（appid）、`cluster`（一般 `volcano_tts`）；
+`extra_json` 可覆盖 `audio` 段的 `speed_ratio` / `volume_ratio` 等。
 
 ### 3.5 搜索 IWebSearch
 
@@ -182,15 +200,21 @@ struct SearchHit {
 };
 ```
 
-**预设**：
+**可用 provider**（`search_provider_list()`）：
+`bocha` `brave` `deepseek` `exa` `generic` `google` `jina` `none` `searxng` `serper` `tavily` `zhipu`
+
+常用几家：
 
 | Provider | 价格 | 说明 |
 |---|---|---|
-| `deepseek` | 5 元/1000 次 | 与对话同 key |
+| `deepseek` | 5 元/1000 次 | 官方独立接口（`/v1/tools/search` + `/v1/tools/fetch`），与对话同 key |
 | `tavily` | 免费 1000 次/月 | 海外内容好 |
 | `bocha` | 0.036 元/次 | 国内网页全 |
 | `searxng` | 免费 | 需自建实例 |
+| `generic` | 取决于对方 | 任意 HTTP 端点（自建服务 / 本地桥接） |
 | `none` | — | 关闭搜索 |
+
+各家字段差异（url vs link、title vs name）已在实现里适配，不用为每家准备不同的端点格式。
 
 **默认 none**：被动对话场景搜索用得少，先关。需要时再开。
 
@@ -207,8 +231,8 @@ provider = "deepseek"          # ← 换这里就能换厂商
 base_url = "https://api.deepseek.com"
 api_key  = "${DEEPSEEK_API_KEY}"
 model    = "deepseek-flash"
-max_tokens = 512
-temperature = 1.0
+# max_tokens / temperature 不写 = 不发送 = 用上游默认值
+# reasoning_effort 锁死 high（产品要求），控制面也拒绝修改
 
 [capability.embedding]
 provider = "siliconflow"
@@ -235,6 +259,22 @@ provider = "none"                        # 默认关闭
 api_key  = "${TAVILY_API_KEY}"
 max_results = 5
 ```
+
+各能力的 provider 清单（**只列真托管 DeepSeek 的厂商**）：
+
+| 能力 | 可选 provider |
+|---|---|
+| 对话 | `deepseek` `workbuddy` |
+| 向量 | `ark` `dashscope` `qianfan` `siliconflow` `workbuddy` |
+| 语音识别 | `dashscope` `deepseek` `siliconflow` `volcengine` |
+| 语音合成 | `dashscope` `deepseek` `edge` `siliconflow` `volcengine` |
+| 搜索 | `bocha` `brave` `deepseek` `exa` `generic` `google` `jina` `none` `searxng` `serper` `tavily` `zhipu` |
+| 生图 | `bridge` `openai` `siliconflow` |
+| 文档 | `deepseek` `none`（独立 `fish.doc` 层，见 [doc.md](doc.md)） |
+
+> 底层模型锁死 DeepSeek，所以「能选哪家」等价于「哪家真能出 DeepSeek」——
+> 列一家不托管 DeepSeek 的厂商，用户选了也只会拿到别的模型，
+> 等于绕过了锁定，所以干脆不列。
 
 ### 4.2 切换厂商只改两行
 
@@ -274,22 +314,31 @@ class CapabilityFactory {
 
 ### 5.1 Provider 注册
 
-```cpp
-struct ChatProviderSpec {
-  std::string name;                    // "deepseek"
-  ChatDialect dialect;                 // OpenAICompat / AnthropicCompat
-  std::string default_base_url;
-  std::string default_model;
-};
+实现上不是注册表，而是一份**白名单字符串**（`chat_provider_list()` 等），
+`make_xxx` 按同一字符串 split 校验：
 
-const std::map<std::string, ChatProviderSpec> kChatProviders = {
-  {"deepseek",    {OpenAICompat,   "https://api.deepseek.com",          "deepseek-flash"}},
-  {"siliconflow", {OpenAICompat,   "https://api.siliconflow.cn/v1",     "deepseek-ai/DeepSeek-V3"}},
-  {"openai",      {OpenAICompat,   "https://api.openai.com/v1",         "gpt-4o-mini"}},
-  {"anthropic",   {AnthropicCompat,"https://api.anthropic.com",         "claude-sonnet-4-5"}},
-  {"ollama",      {OpenAICompat,   "http://127.0.0.1:11434/v1",         "qwen2.5"}},
-};
+```cpp
+const char* chat_provider_list() {
+  return "deepseek,workbuddy";
+}
+const char* embedding_provider_list() {
+  return "ark,dashscope,qianfan,siliconflow,workbuddy";
+}
+const char* stt_provider_list() {
+  return "dashscope,deepseek,siliconflow,volcengine";
+}
+const char* tts_provider_list() {
+  return "dashscope,deepseek,edge,siliconflow,volcengine";
+}
+const char* search_provider_list() {
+  return "bocha,brave,deepseek,exa,generic,google,jina,none,searxng,serper,tavily,zhipu";
+}
+const char* image_provider_list() { return "bridge,openai,siliconflow"; }
 ```
+
+> **清单只有一份**，`make_search` 的白名单直接 split `search_provider_list()`。
+> 曾经三处各写一份，结果不一致——要么「配置里写了 provider 就启动失败」，
+> 要么「分支写好了但永远走不到」。
 
 **默认值自动补全**：配置里只写 `provider`，`base_url` 和 `model` 用默认，
 减少必填项。显式写了就用显式的。
@@ -299,7 +348,7 @@ const std::map<std::string, ChatProviderSpec> kChatProviders = {
 启动时报错退出，并列出支持的 provider：
 
 ```
-Unknown chat provider "claude2". Supported: anthropic, deepseek, ollama, openai, siliconflow
+unknown chat provider 'claude2'. supported: deepseek,workbuddy
 ```
 
 **不允许静默降级到默认值** —— 那会让人以为配好了，实际没用。
@@ -355,6 +404,7 @@ class CircuitBreaker {
 | stt | 占位文本 `[语音转写失败]` | 知道没听清 |
 | tts | 只发文本 | 没有语音 |
 | search | 跳过搜索直接回答 | 回答可能不够新 |
+| document | 占位文本「[收到文件：xxx，解析失败]」 | 知道收到了文件，读不到正文 |
 
 ### 7.1 embedding 失败的连锁影响
 
@@ -438,14 +488,22 @@ WorkBuddy 桌面端的模型通过**独立桥接进程**接入，不在本模块
 
 配置：
 
-``toml
+```toml
 [capability.chat]
-provider = "openai"                      # 走 OpenAI 兼容
-base_url = "http://127.0.0.1:18081/v1"   # 桥接层地址
-api_key  = "bridge-local"
-model    = "fast-model"
+provider = "workbuddy"                    # 桥接层专用 provider
+base_url = "http://127.0.0.1:18091/v1"   # 桥接层地址
+api_key  = "bridge-local"                # 桥接层不校验 key，非空即可
+model    = "deep-model"
 timeout_ms = 90000
-``
+```
+
+`provider = "workbuddy"` 与 `provider = "openai"` 的区别：
+`workbuddy` 会带上 DeepSeek 服务端联网工具相关的处理，
+并接受桥接层的抽象模型名（`fast-model` / `balanced-model` / `deep-model` / `auto`）。
+
+> **桥接层启动必须带 `--cred-file`**，否则 GUI「扫码登录 WorkBuddy」
+> 写入的凭据（`data/workbuddy.json`）不会被桥读取，登录等于白发。
+> 见 [deploy/README.md](../../deploy/README.md)。
 
 **为什么不在 capability 里直接实现**：
 

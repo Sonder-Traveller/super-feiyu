@@ -26,6 +26,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 
 import flet as ft
@@ -175,6 +176,19 @@ class Api:
         q = urllib.parse.quote(qrcode, safe="")
         return self._req("GET", f"/v1/channel/wechat/qr/status?qrcode={q}", timeout=45)
 
+    # WorkBuddy 链接登录：拿授权链接 + 轮询结果 + 桥接层测试
+    def workbuddy_login(self) -> dict:
+        return self._req("POST", "/v1/capability/workbuddy/login", {}, timeout=35)
+
+    def workbuddy_login_status(self, login_id: str) -> dict:
+        q = urllib.parse.quote(login_id, safe="")
+        return self._req("GET",
+                         f"/v1/capability/workbuddy/login/status?login_id={q}",
+                         timeout=45)
+
+    def workbuddy_test(self) -> dict:
+        return self._req("POST", "/v1/capability/workbuddy/test", {}, timeout=15)
+
     # 人格
     def get_default(self) -> str:
         return self._req("GET", "/v1/persona/default").get("persona", "")
@@ -196,6 +210,9 @@ class Api:
 
     def persona_list(self) -> dict:
         return self._req("GET", "/v1/persona/list")
+
+    def conversations(self) -> dict:
+        return self._req("GET", "/v1/conversations", timeout=15)
 
 
 # ── 本地存储 ────────────────────────────────────────────
@@ -305,6 +322,7 @@ def main(page: ft.Page) -> None:
         "connected": False,
         "config": None,          # GET /v1/config 的原始 dict
         "qr_polling": False,     # 扫码轮询开关
+        "conv_req_id": 0,        # 会话列表请求序号（丢弃过期回调）
     }
 
     # ═══ 顶部：品牌 + 状态 ═══════════════════════════════
@@ -428,11 +446,6 @@ def main(page: ft.Page) -> None:
                             color=TEXT_MAIN)
     persona_sub = ft.Text("所有会话默认使用这份设定", size=12, color=TEXT_SUB)
     session_list = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO)
-    new_conv = ft.TextField(
-        label="会话 ID", hint_text="群聊 g:群号 / 私聊 openid",
-        dense=True, expand=True, text_size=13, border_color=BORDER,
-        on_submit=lambda e: _add_session(),
-    )
 
     def _mark_dirty() -> None:
         state["dirty"] = True
@@ -520,42 +533,62 @@ def main(page: ft.Page) -> None:
     def _persist() -> None:
         save_config({"url": state["url"], "sessions": state["sessions"]})
 
-    def _add_session() -> None:
-        value = (new_conv.value or "").strip()
-        if not value:
-            return
-        if value not in state["sessions"]:
-            state["sessions"].append(value)
-            _persist()
-        new_conv.value = ""
-        _rebuild_session_list()
-        _select(value)
-
-    def _remove_session(conv_id: str) -> None:
-        if conv_id in state["sessions"]:
-            state["sessions"].remove(conv_id)
-            _persist()
-        if state["editing"] == conv_id:
-            state["editing"] = "default"
-            _load_current()
-        _rebuild_session_list()
-
     def _rebuild_session_list() -> None:
+        """人格页左侧列表：bot/群卡片（头像 + 名称 + 唯一标识小字）。
+
+        数据来自服务端会话登记表（/v1/conversations）——机器人见过的
+        每个会话都在里面，不需要用户手工输会话 ID。点卡片直接进入
+        该会话的人格编辑。服务端拉不到时退回本地保存的会话列表。
+        """
+        # 请求序号：这个函数在切页、保存人格后都会调，异步回调回来的
+        # 先后顺序没有保证。两个回调都往 controls 里 append 就会叠出
+        # 重复卡片，所以回调里比对序号，过期的直接丢弃。
+        state["conv_req_id"] = (state.get("conv_req_id") or 0) + 1
+        req_id = state["conv_req_id"]
+
         session_list.controls.clear()
 
-        def item(key: str, is_default: bool = False) -> ft.Control:
+        def avatar(label: str) -> ft.Control:
+            # 头像：名字首字符画在圆里。取不到字符就用对话气泡图标。
+            ch = (label or "").strip()[:1]
+            if not ch:
+                return ft.Container(
+                    width=34, height=34, border_radius=17,
+                    bgcolor=BRAND_TINT,
+                    content=ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=16, color=BRAND),
+                )
+            return ft.Container(
+                width=34, height=34, border_radius=17,
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment(-1, -1), end=ft.Alignment(1, 1),
+                    colors=[BRAND, "#7C6FF0"],
+                ),
+                alignment=ft.Alignment(0, 0),
+                content=ft.Text(ch, size=15, weight=ft.FontWeight.W_600,
+                                color="#FFFFFF"),
+            )
+
+        def card(title: str, ident: str, key: str, icon: bool = False) -> ft.Control:
             selected = state["editing"] == key
-            row = ft.Container(
+            name_line = title if title else (ident or key)
+            id_line = "" if icon else (ident or key)
+            return ft.Container(
                 content=ft.Row([
-                    ft.Icon(ft.Icons.HOME if is_default else ft.Icons.CHAT_BUBBLE_OUTLINE,
-                            size=15,
-                            color=BRAND if selected else TEXT_SUB),
-                    ft.Text("全局默认" if is_default else key, size=12.5, expand=True,
-                            max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
-                            color=TEXT_MAIN if selected else "#4A4A55"),
-                ], spacing=8),
-                padding=ft.Padding.symmetric(horizontal=10, vertical=9),
-                border_radius=8,
+                    avatar(name_line if not icon else ""),
+                    ft.Column([
+                        ft.Text(("全局默认" if icon else name_line),
+                                size=13, weight=ft.FontWeight.W_500,
+                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
+                                color=TEXT_MAIN if selected else "#3A3A45"),
+                        ft.Text(("所有会话的兜底设定" if icon else id_line),
+                                size=11, color=TEXT_HINT,
+                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    ], spacing=1, expand=True),
+                    ft.Icon(ft.Icons.CHEVRON_RIGHT, size=14, color=TEXT_HINT),
+                ], spacing=10),
+                padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                border_radius=10,
+                border=ft.Border.all(1, BRAND if selected else BORDER),
                 gradient=(ft.LinearGradient(
                     begin=ft.Alignment(-1, 0), end=ft.Alignment(1, 0),
                     colors=[BRAND_TINT, "#B8F5F2FF"],
@@ -563,31 +596,48 @@ def main(page: ft.Page) -> None:
                 on_click=lambda e, k=key: _select(k),
                 ink=True,
             )
-            if is_default:
-                return row
-            return ft.Row([
-                ft.Container(content=row, expand=True),
-                ft.IconButton(ft.Icons.CLOSE, icon_size=13, icon_color=TEXT_HINT,
-                              tooltip="从列表移除（不影响服务端）",
-                              on_click=lambda e, k=key: _remove_session(k)),
-            ], spacing=0)
 
-        session_list.controls.append(item("default", is_default=True))
-        for s in state["sessions"]:
-            session_list.controls.append(item(s))
-        page.update()
+        session_list.controls.append(card("", "", "default", icon=True))
+        api = state["api"]
+        if api is None:
+            page.update()
+            return
+
+        def do():
+            return api.conversations()
+
+        def done(err, result):
+            if state.get("conv_req_id") != req_id:
+                return   # 已有更新的请求，丢弃这次的结果
+            if err or not result:
+                # 服务端拉不到 → 退回本地列表，至少能用
+                for s in state["sessions"]:
+                    session_list.controls.append(card(s, s, s))
+                page.update()
+                return
+            convs = result.get("conversations", []) or []
+            for c in convs:
+                key = c.get("key", "")
+                if not key:
+                    continue
+                title = c.get("title", "") or key
+                # 小字：唯一标识；群聊带渠道前缀更清楚
+                ident = key
+                ch = c.get("channel", "")
+                if ch:
+                    ident = f"{ch} · {key}"
+                session_list.controls.append(card(title, ident, key))
+            page.update()
+
+        _run_async(do, done)
 
     def persona_view() -> ft.Control:
         return ft.Column([
             section_title("人格", "persona"),
             ft.Container(height=6),
             ft.Row([
-                ft.Container(width=240, content=ft.Column([
+                ft.Container(width=250, content=ft.Column([
                     session_list,
-                    ft.Row([new_conv,
-                            ft.IconButton(ft.Icons.ADD, icon_size=18, icon_color=BRAND,
-                                          tooltip="添加会话", on_click=lambda e: _add_session())],
-                           spacing=4),
                 ], spacing=8),
                             visible=(page.width or 1000) >= 700),
                 ft.Container(width=12, visible=(page.width or 1000) >= 700),
@@ -968,6 +1018,131 @@ def main(page: ft.Page) -> None:
     )
     chat_key = field("API Key", "", password=True)
     chat_key_hint = ft.Text("", size=11.5, color=TEXT_SUB)
+    # ── WorkBuddy 链接登录 ──
+    # 不用填 Key：点「登录」拿一个授权链接，在浏览器/手机里完成登录，
+    # 服务端轮询到凭据后自动落盘。与 dsh-connect-workbuddy 同一套 OAuth。
+    wb_login_status_text = ft.Text("", size=12, color=TEXT_SUB)
+
+    def _wb_login_done(r: dict) -> None:
+        nick = r.get("nickname", "")
+        _toast(f"WorkBuddy 登录成功（{nick or '账号'}）", ok=True)
+        wb_login_status_text.value = f"已登录：{nick or r.get('uid', '')}"
+        page.update()
+
+    def _wb_poll(login_id: str) -> None:
+        # 轮询条件就是 state["qr_polling"]：点「取消」时 _close_qr() 把它置
+        # False，循环下一轮就退出。原来写的是 while True，取消后线程还要
+        # 一直跑到 done 或服务端超时（最长 10 分钟），白白占着连接。
+        state["qr_polling"] = True
+
+        def loop():
+            api = state["api"]
+            while state["qr_polling"]:
+                if api is None:
+                    return
+                try:
+                    r = api.workbuddy_login_status(login_id)
+                except Exception:
+                    threading.Event().wait(3.0)
+                    continue
+                if r.get("done"):
+                    state["qr_polling"] = False
+                    try:
+                        page.close_dialog()
+                    except Exception:
+                        pass
+                    if r.get("success"):
+                        _wb_login_done(r)
+                    else:
+                        qr_tip_global.value = f"登录失败：{r.get('error', '未知')}"
+                        qr_img_global.src = ""
+                        page.update()
+                    return
+                threading.Event().wait(3.0)
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _wb_login() -> None:
+        api = state["api"]
+        if api is None:
+            _toast("还没连接", ok=False)
+            return
+        qr_img_global.src = ""
+        qr_tip_global.value = "正在获取授权链接…"
+        dlg = ft.AlertDialog(
+            title=ft.Text("WorkBuddy 登录", size=16, weight=ft.FontWeight.BOLD),
+            content=ft.Column([
+                qr_img_global, qr_tip_global,
+                ft.Text("手机扫码，或在电脑上打开链接完成登录。\n"
+                        "登录后凭据自动写入服务端，无需填 Key。",
+                        size=11, color=TEXT_HINT, text_align=ft.TextAlign.CENTER),
+            ], spacing=12, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            actions=[ft.TextButton("取消", on_click=lambda e: _close_qr())],
+        )
+        page.show_dialog(dlg)
+
+        def do():
+            return api.workbuddy_login()
+
+        def done(err, result):
+            if err or not result or not result.get("ok"):
+                qr_tip_global.value = f"获取失败：{err or (result or {}).get('detail', '未知错误')}"
+                page.update()
+                return
+            auth_url = result.get("auth_url", "")
+            qr_img_global.src = ("data:image/png;base64," +
+                                 result.get("qr_png_base64", ""))
+            qr_tip_global.value = ""
+            qr_link_btn.value = auth_url
+            qr_link_btn.visible = True
+            page.update()
+            _wb_poll(result.get("login_id", ""))
+
+        _run_async(do, done)
+
+    qr_link_btn = ft.TextButton(
+        "在浏览器打开授权页",
+        icon=ft.Icons.OPEN_IN_BROWSER,
+        visible=False,
+        on_click=lambda e: webbrowser.open(qr_link_btn.value or ""),
+    )
+
+    wb_login_btn = ft.FilledButton(
+        "登录 WorkBuddy", icon=ft.Icons.LINK,
+        on_click=lambda e: _wb_login(),
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
+    )
+    wb_test_btn = ft.OutlinedButton(
+        "测试桥接", icon=ft.Icons.NETWORK_CHECK,
+        on_click=lambda e: _wb_test(),
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)),
+    )
+
+    def _wb_test() -> None:
+        api = state["api"]
+        if api is None:
+            _toast("还没连接", ok=False)
+            return
+        wb_login_status_text.value = "测试中…"
+        page.update()
+
+        def do():
+            return api.workbuddy_test()
+
+        def done(err, result):
+            if err or not result:
+                wb_login_status_text.value = f"测试失败：{err or '未知错误'}"
+            elif result.get("ok"):
+                models = result.get("models", [])
+                wb_login_status_text.value = (
+                    f"桥接正常，可用模型：{', '.join(models) or '（空）'}"
+                    + ("，已登录" if result.get("logged_in") else "，未登录"))
+            else:
+                wb_login_status_text.value = f"桥接异常：{result.get('detail', '')}"
+            page.update()
+
+        _run_async(do, done)
+
     chat_workbuddy_row = ft.Column([], spacing=8)
     chat_lock_note = ft.Text("", size=12, color=TEXT_HINT)
 
@@ -976,40 +1151,78 @@ def main(page: ft.Page) -> None:
                                color=TEXT_HINT)
 
     # ── 其他能力：也简化成下拉 ──
-    emb_provider_dd = ft.Dropdown(
-        label="向量提供方", dense=True, expand=True, text_size=13,
-        border_color=BORDER, options=[
-            ft.dropdown.Option("siliconflow", "硅基流动（免费 bge-m3）"),
-            ft.dropdown.Option("openai", "OpenAI 兼容"),
-        ],
-    )
+    # 选项由 GET /v1/config 的 capability.providers 驱动——
+    # 后端加一家厂商，这里自动多一项，前端不硬编码。
+    #
+    # base_url 不在界面上出现（用户不该记域名），但保存时必须一起发：
+    # 后端拿到 provider 变化后会按 capability.defaults 改写 base_url，
+    # 这里显式带上可以让「用户自己改过的地址」优先于默认表。
+    # 记录每个能力「用户刚选中的 provider」，保存时据此查 defaults。
+    state["cap_base_url"] = {}
+    # 每个能力「用户当前选中的 provider」，用来判断这次保存是不是
+    # 换了提供方（换了就要清掉旧提供方留下的 key 绑定）。
+    state["cap_provider"] = {}
+    # 每个能力当前选的 provider → 它的 key 输入框。切提供方时要把
+    # 输入框清空并提示：旧 key 是旧提供方的，留着会拿错 key 去请求。
+    _cap_key_fields: dict[str, object] = {}
+
+    def _on_cap_provider(cap_name: str, dd) -> None:
+        defaults = ((state.get("config") or {}).get("capability", {})
+                    .get("defaults", {}) or {})
+        url = (defaults.get(cap_name, {}) or {}).get(dd.value or "", "")
+        if url:
+            state["cap_base_url"][cap_name] = url
+        else:
+            state["cap_base_url"].pop(cap_name, None)
+
+        # 换提供方 → 清空该能力的 key 输入框。
+        #
+        # 为什么必须清：config.toml 里 capability.stt.api_key 写的是
+        # ${SILICONFLOW_API_KEY}，切到 deepseek 后这个 ${VAR} 展开的仍是
+        # 硅基流动那把真 key。后端已经在「provider 变化且没带新 key」时
+        # 把该能力的 api_key 字段清空了，但 GUI 这边的输入框里若还留着
+        # 用户先前抄进去的旧 key，保存时会被原样发回去 → 又绑回旧提供方。
+        old = state["cap_provider"].get(cap_name)
+        new = dd.value or ""
+        if old and old != new:
+            key_field = _cap_key_fields.get(cap_name)
+            if key_field is not None:
+                key_field.value = ""
+                key_field.hint_text = "已切换提供方，如需单独填 Key 请重新输入"
+        state["cap_provider"][cap_name] = new
+        page.update()
+
+    def _mk_provider_dd(label: str, key: str, cap_name: str) -> ft.Dropdown:
+        return ft.Dropdown(
+            label=label, dense=True, expand=True, text_size=13,
+            border_color=BORDER, options=[],
+            hint_text="加载中…", key=key,
+            on_select=lambda e: _on_cap_provider(cap_name, e.control),
+        )
+
+    emb_provider_dd = _mk_provider_dd("向量提供方", "emb_provider", "embedding")
     emb_key = field("API Key", "", password=True)
 
-    stt_provider_dd = ft.Dropdown(
-        label="语音识别提供方", dense=True, expand=True, text_size=13,
-        border_color=BORDER, options=[
-            ft.dropdown.Option("siliconflow", "硅基流动（SenseVoice 免费）"),
-        ],
-    )
+    stt_provider_dd = _mk_provider_dd("语音识别提供方", "stt_provider", "stt")
     stt_key = field("API Key", "", password=True)
 
-    tts_provider_dd = ft.Dropdown(
-        label="语音合成提供方", dense=True, expand=True, text_size=13,
-        border_color=BORDER, options=[
-            ft.dropdown.Option("edge", "Edge TTS（免费）"),
-            ft.dropdown.Option("siliconflow", "硅基流动"),
-        ],
-    )
+    tts_provider_dd = _mk_provider_dd("语音合成提供方", "tts_provider", "tts")
+    tts_key = field("API Key", "", password=True)
 
-    search_provider_dd = ft.Dropdown(
-        label="搜索提供方", dense=True, expand=True, text_size=13,
-        border_color=BORDER, options=[
-            ft.dropdown.Option("none", "不启用"),
-            ft.dropdown.Option("deepseek", "DeepSeek 官方"),
-            ft.dropdown.Option("tavily", "Tavily"),
-        ],
-    )
+    search_provider_dd = _mk_provider_dd("搜索提供方", "search_provider", "search")
     search_key = field("API Key", "", password=True)
+
+    doc_provider_dd = _mk_provider_dd("文档解析提供方", "doc_provider", "document")
+    doc_key = field("API Key", "", password=True)
+
+    # key 输入框 ↔ 能力的对应表：切提供方时要按能力找到对应输入框清空。
+    _cap_key_fields.update({
+        "embedding": emb_key,
+        "stt": stt_key,
+        "tts": tts_key,
+        "search": search_key,
+        "document": doc_key,
+    })
 
     # provider 字符串 → 下拉显示。chat 当前是 openai（桥接）时映射回 workbuddy
     CHAT_PROVIDER_ALIAS = {"openai": "workbuddy", "workbuddy": "workbuddy",
@@ -1028,12 +1241,42 @@ def main(page: ft.Page) -> None:
                 hint = preset.get("api_key_hint", "")
                 break
         chat_key_hint.value = hint
+
+        # 换提供方 → 清空 key 输入框。
+        #
+        # chat 的 key 在 config.toml 里是单值，切提供方后它就是旧提供方的
+        # 那把（workbuddy 的 "bridge-local" 之类），拿去请求新提供方必然
+        # 401。清掉输入框并提示用户重新填。
+        #
+        # 后端**不会**自动清 config.toml 里的 chat.api_key：chat 的 key 是
+        # 直读的（不走共享密钥），一清空 make_chat 就失败，机器人会静默
+        # 退回 EchoChat 桩（只复读不报错），比 401 更难查。所以由用户显式
+        # 重新填。
+        old = state.get("chat_provider") or ""
+        if old and old != p:
+            chat_key.value = ""
+            chat_key.hint_text = "已切换提供方，如需单独填 Key 请重新输入"
+        state["chat_provider"] = p
         page.update()
+
+    # 把后端暴露的 provider 清单灌进下拉。加一家厂商只改后端，
+    # 这里自动多一项——前端不再硬编码任何厂商名。
+    def _apply_provider_list(cap: dict, key: str, dd) -> None:
+        spec = (cap.get("providers") or {}).get(key) or {}
+        raw = spec.get("values") or ""
+        labels = spec.get("labels") or {}
+        vals = [v for v in str(raw).split(",") if v]
+        if not vals:
+            return
+        dd.options = [ft.dropdown.Option(v, labels.get(v, v)) for v in vals]
+        dd.hint_text = "选择提供方"
 
     def _fill_models_from_config() -> None:
         c = state["config"]
         if not c:
             return
+        # 配置重新拉取后，之前记下的「用户切过哪个 provider」就过期了
+        state["cap_base_url"] = {}
         cap = c.get("capability", {})
         chat = cap.get("chat", {})
 
@@ -1057,17 +1300,20 @@ def main(page: ft.Page) -> None:
         # 当前 provider → 下拉值（openai 是桥接的 dialect 名，映射回 workbuddy）
         cur = CHAT_PROVIDER_ALIAS.get(chat.get("provider", ""), "")
         chat_provider_dd.value = cur or None
+        # 记下当前选中的 provider，作为「用户切下拉时是否换了提供方」的基准
+        state["chat_provider"] = cur
         chat_lock_note.value = f"底层模型：{model_locked}（锁定，不可更换）"
         chat_effort_note.value = "思考强度：high（锁定，不可调）"
 
-        # workbuddy 特殊：显示桥接状态
+        # workbuddy 特殊：显示桥接状态 + 登录入口
         wb = chat.get("base_url", "")
         is_wb = (cur == "workbuddy")
         chat_key.visible = not is_wb
         chat_workbuddy_row.controls = [
             ft.Text(f"桥接地址：{wb}", size=12, color=TEXT_SUB),
-            ft.Text("桥接层由 super-feiyu 启动脚本管理，无需填 Key。",
-                    size=12, color=TEXT_SUB),
+            ft.Row([wb_login_btn, wb_test_btn], spacing=10),
+            wb_login_status_text,
+            qr_link_btn,
         ]
         chat_workbuddy_row.visible = is_wb
         hint = ""
@@ -1077,26 +1323,56 @@ def main(page: ft.Page) -> None:
         chat_key_hint.value = hint
 
         # 其余能力
+        _apply_provider_list(cap, "embedding", emb_provider_dd)
+        _apply_provider_list(cap, "stt", stt_provider_dd)
+        _apply_provider_list(cap, "tts", tts_provider_dd)
+        _apply_provider_list(cap, "search", search_provider_dd)
+        _apply_provider_list(cap, "document", doc_provider_dd)
+
         emb = cap.get("embedding", {})
         emb_provider_dd.value = emb.get("provider") or None
         emb_key.value = ""
+        emb_key.visible = not emb.get("key_ready", emb.get("api_key_set", False))
         stt = cap.get("stt", {})
         stt_provider_dd.value = stt.get("provider") or None
         stt_key.value = ""
+        stt_key.visible = not stt.get("key_ready", stt.get("api_key_set", False))
         tts = cap.get("tts", {})
         tts_provider_dd.value = tts.get("provider") or None
+        tts_key.value = ""
+        tts_key.visible = not tts.get("key_ready", tts.get("api_key_set", False))
         s = cap.get("search", {})
         search_provider_dd.value = s.get("provider") or None
         search_key.value = ""
+        search_key.visible = not s.get("key_ready", s.get("api_key_set", False))
+        doc = cap.get("document", {})
+        doc_provider_dd.value = doc.get("provider") or None
+        doc_key.value = ""
+        doc_key.visible = not doc.get("key_ready", doc.get("api_key_set", False))
+
+        # 记录「当前每个能力选中的 provider」作为下次比较的基准：
+        # 用户切下拉时若和这里记的不同，就说明换了提供方 → 清 key 绑定。
+        state["cap_provider"] = {
+            "embedding": emb.get("provider") or "",
+            "stt": stt.get("provider") or "",
+            "tts": tts.get("provider") or "",
+            "search": s.get("provider") or "",
+            "document": doc.get("provider") or "",
+        }
 
         chat_key.hint_text = ("已设置，留空不动" if chat.get("api_key_set")
                               else "未设置")
-        emb_key.hint_text = ("已设置，留空不动" if emb.get("api_key_set")
-                             else "未设置")
-        stt_key.hint_text = ("已设置，留空不动" if stt.get("api_key_set")
-                             else "未设置")
-        search_key.hint_text = ("已设置，留空不动" if s.get("api_key_set")
-                                else "未设置")
+        def key_hint(sec: dict) -> str:
+            if sec.get("api_key_set"):
+                return "已设置，留空不动"
+            if sec.get("key_ready"):
+                return "已复用同一提供方在别处填过的密钥"
+            return "未设置"
+        emb_key.hint_text = key_hint(emb)
+        stt_key.hint_text = key_hint(stt)
+        tts_key.hint_text = key_hint(tts)
+        search_key.hint_text = key_hint(s)
+        doc_key.hint_text = key_hint(doc)
         page.update()
 
     def _save_models() -> None:
@@ -1116,20 +1392,36 @@ def main(page: ft.Page) -> None:
         if chat_payload:
             payload["capability"]["chat"] = chat_payload
 
-        if emb_provider_dd.value:
-            payload["capability"]["embedding"] = {"provider": emb_provider_dd.value}
-        if (emb_key.value or "").strip():
-            payload["capability"].setdefault("embedding", {})["api_key"] = emb_key.value.strip()
-        if stt_provider_dd.value:
-            payload["capability"]["stt"] = {"provider": stt_provider_dd.value}
-        if (stt_key.value or "").strip():
-            payload["capability"].setdefault("stt", {})["api_key"] = stt_key.value.strip()
-        if tts_provider_dd.value:
-            payload["capability"]["tts"] = {"provider": tts_provider_dd.value}
-        if search_provider_dd.value:
-            payload["capability"]["search"] = {"provider": search_provider_dd.value}
-        if (search_key.value or "").strip():
-            payload["capability"].setdefault("search", {})["api_key"] = search_key.value.strip()
+        # 五个非 chat 能力：provider + （用户这次切过才带的）base_url + key。
+        # base_url 只在用户真的动过下拉时才发（state["cap_base_url"] 只由
+        # on_select 写入），这样「用户手改过 config.toml 的地址」不会被
+        # 一次无意义的保存覆盖回默认值。
+        #
+        # provider **每次都发**（只要下拉有值）：后端靠「请求里的 provider
+        # 和 config.toml 里现值不同」判断用户换了提供方，进而把该能力
+        # 绑在旧提供方上的 api_key 解绑。不发的话后端看不到变化，
+        # ${SILICONFLOW_API_KEY} 就还绑着 → 切到 deepseek 后拿错 key → 401。
+        #
+        # api_key 只在用户这次真的填了才发：留空 = 不动后端的 key。
+        # 切过提供方时 key 输入框已被清空（_on_cap_provider），
+        # 这时「不发 api_key」+「后端解绑」= 落到共享密钥逻辑，正确。
+        def cap_payload(name: str, dd, key_field) -> None:
+            sec: dict = {}
+            if dd.value:
+                sec["provider"] = dd.value
+            url = state.get("cap_base_url", {}).get(name, "")
+            if url:
+                sec["base_url"] = url
+            if (key_field.value or "").strip():
+                sec["api_key"] = key_field.value.strip()
+            if sec:
+                payload["capability"][name] = sec
+
+        cap_payload("embedding", emb_provider_dd, emb_key)
+        cap_payload("stt", stt_provider_dd, stt_key)
+        cap_payload("tts", tts_provider_dd, tts_key)
+        cap_payload("search", search_provider_dd, search_key)
+        cap_payload("document", doc_provider_dd, doc_key)
 
         if not payload["capability"]:
             _toast("没有改动", ok=True)
@@ -1145,6 +1437,17 @@ def main(page: ft.Page) -> None:
             if err:
                 _toast(f"保存失败：{err}", ok=False)
                 return
+            # 已经写进配置了，别让下一次保存又把同一个 base_url 发一遍
+            state.get("cap_base_url", {}).clear()
+            # 保存后把「当前 provider」更新成实际生效的值：否则下次再切
+            # 同一个下拉会被误判成「没换提供方」，key 输入框不清空。
+            state["chat_provider"] = chat_provider_dd.value or ""
+            for cap_name, dd in (("embedding", emb_provider_dd),
+                                 ("stt", stt_provider_dd),
+                                 ("tts", tts_provider_dd),
+                                 ("search", search_provider_dd),
+                                 ("document", doc_provider_dd)):
+                state["cap_provider"][cap_name] = dd.value or ""
             _toast("已保存，服务正在重启（约 5 秒）…")
             # 等几秒后重新连接并刷新
             def later():
@@ -1184,12 +1487,19 @@ def main(page: ft.Page) -> None:
             glass(ft.Column([
                 section_title("语音合成", ""),
                 tts_provider_dd,
+                tts_key,
             ], spacing=10)),
             ft.Container(height=14),
             glass(ft.Column([
                 section_title("网络搜索", ""),
                 search_provider_dd,
                 search_key,
+            ], spacing=10)),
+            ft.Container(height=14),
+            glass(ft.Column([
+                section_title("文档解析", "对方发来 PDF / Word / PPT 时自动解析"),
+                doc_provider_dd,
+                doc_key,
             ], spacing=10)),
             ft.Container(height=14),
             ft.Row([
