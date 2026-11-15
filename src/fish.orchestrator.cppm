@@ -600,13 +600,27 @@ Result<std::vector<fish::core::ContentBlock>> Pipeline::normalize_input(
         note.text = "[语音消息，未启用转写]";
       } else {
         auto stt = deps_.stt->transcribe(block.media_url);
-        if (stt.ok()) {
+        if (stt.ok() && !stt.value->empty()) {
           note.text = std::move(*stt.value);
+        } else if (stt.ok()) {
+          // 上游返回了 200 但文本为空：多半是音频里没有可识别的人声
+          //（静音、噪声、纯背景音）。空字符串直接进上下文模型会自由发挥，
+          // 必须明确告知「没听清」。
+          note.text = "[语音消息转写结果为空——对方可能没说话或只有背景音]";
+          ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "stt_empty_result");
         } else {
           note.text = "[语音消息转写失败]";
           ::fish::log::log_line(fish::log::LogLevel::kWarn, "pipeline", "stt_failed")
               .field("detail", stt.error.detail);
         }
+        // 转写结果（成功与失败都记）：排查「模型答非所问」时，
+        // 必须知道 ASR 到底输出了什么——之前成功时不打日志，
+        // 模型胡说时根本分不清是 ASR 识别错还是模型发挥。
+        ::fish::log::log_line(
+            stt.ok() ? fish::log::LogLevel::kInfo : fish::log::LogLevel::kWarn,
+            "pipeline", "stt_result")
+            .field("text", note.text.substr(0, 120))
+            .field("bytes", static_cast<long long>(note.text.size()));
       }
       out.push_back(std::move(note));
     }
