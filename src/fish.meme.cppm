@@ -69,6 +69,13 @@ struct Entry {
 // 规范化：全角→半角、ASCII 小写、去掉所有空白。
 std::string normalize_text(const std::string& s);
 
+// 按**字符**数截断（不是字节）。
+//
+// 为什么必须按字符：中文一个字 3 字节，按字节切会把最后一个字切成半个，
+// 产生非法 UTF-8。这类损坏会一路写进 memes.tsv，之后整个文件都读不出来
+// （实测：一条释义被按字节截断后，库里出现半个汉字，整个 TSV 解析失败）。
+std::string truncate_chars(const std::string& s, std::size_t max_chars);
+
 // 名字相似度（0~100 的百分比）。
 //
 // 算法：字符二元组 Dice 系数。
@@ -512,6 +519,29 @@ bool Entry::matches(const std::string& name, int* percent_out) const {
   }
   if (percent_out != nullptr) *percent_out = best;
   return best >= kMatchThreshold;
+}
+
+std::string truncate_chars(const std::string& s, std::size_t max_chars) {
+  if (max_chars == 0) return {};
+  // 按 UTF-8 码点走：每个码点 1~4 字节，逐个推进，
+  // 落在字符边界上就不会切出半个字。
+  std::size_t chars = 0;
+  std::size_t i = 0;
+  while (i < s.size()) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    std::size_t len = 1;
+    if ((c & 0xE0) == 0xC0) {
+      len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+    }
+    if (chars == max_chars) return s.substr(0, i);
+    ++chars;
+    i += len;
+  }
+  return s;
 }
 
 bool is_relevant(const std::string& query, const std::string& text,

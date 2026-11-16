@@ -654,9 +654,14 @@ int main(int argc, char** argv) {
           // **不自己编释义**——原文里是什么就是什么。
           hit.meaning = h.snippet;
           if (hit.meaning.empty() && !h.title.empty()) {
-            hit.meaning = h.title.substr(0, 300);
+            hit.meaning = fish::meme::truncate_chars(h.title, 300);
           }
-          if (hit.meaning.size() > 600) hit.meaning.resize(600);
+          if (hit.meaning.size() > 600) {
+            // 按**字符**截断，不能按字节：中文一个字 3 字节，
+            // 按字节切会把最后一个字切成半个（实测把「扎啤」的释义切成
+            // 非法 UTF-8，写进 memes.tsv 后整个文件都读不出来）。
+            hit.meaning = fish::meme::truncate_chars(hit.meaning, 200);
+          }
           // 用法示例：只从原文里摘已经存在的引号片段，不自己编
           hit.usage = fish::meme::extract_usage_example(h.snippet + " " + h.title, term);
           // 来源：记进 meme 库的 origin 列
